@@ -13,7 +13,7 @@ class SmartChunkSerializer(serializers.ModelSerializer):
             'embedding',
             'created_at',
         ]
-        read_only_fields = ['id', 'created_at']
+        read_only_fields = ['id', 'created_at', "content_norm"]
 
 
 class DocumentCreateSerializer(serializers.ModelSerializer):

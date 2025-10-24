@@ -9,10 +9,10 @@ class DocumentAdmin(admin.ModelAdmin):
         "id",
         "name",
         "chunking_done",
-        "preview_extracted_text",
+        # "preview_extracted_text",
         "owner_email",
         "created",
-        "file",
+        # "file",
     )
     search_fields = ("name", "extracted_text", "extracted_text")
     list_filter = ("chunking_status", "chunking_done", "created_at")
@@ -22,18 +22,18 @@ class DocumentAdmin(admin.ModelAdmin):
     def created(self, obj):
         return obj.created_at.strftime("%Y/%m/%d %H:%M:%S")
 
-    def file(self, obj):
-        if obj.file:
-            return obj.file.url
-        return "No File"
+    # def file(self, obj):
+    #     if obj.file:
+    #         return obj.file.url
+    #     return "No File"
 
     def owner_email(self, obj):
         return obj.owner.email if obj.owner else "No Owner"
 
 
-    def preview_extracted_text(self, obj):
-        return (obj.extracted_text[:50] + "...") if obj.extracted_text and len(obj.extracted_text) > 50 else obj.extracted_text
-    preview_extracted_text.short_extracted_text = "extracted_text"
+    # def preview_extracted_text(self, obj):
+    #     return (obj.extracted_text[:50] + "...") if obj.extracted_text and len(obj.extracted_text) > 50 else obj.extracted_text
+    # preview_extracted_text.short_extracted_text = "extracted_text"
 
 
 @admin.register(SmartChunk)

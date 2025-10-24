@@ -2,12 +2,15 @@ import uuid
 from django.db import models
 from django.db.models import QuerySet
 from django.utils.text import slugify
+from django.db.models import Func, F, TextField, GeneratedField, Q
+from django.db.models.functions import Lower
 
 from pgvector.django import VectorField, CosineDistance
 from django.contrib.postgres.fields import ArrayField
 from django.contrib.auth import get_user_model
 from apps.document.utils.client_openia import embed_text
 import os
+import re
 User = get_user_model()
 
 class ChunkingStatus(models.TextChoices):
@@ -62,7 +65,28 @@ class SmartChunkQuerySet(QuerySet):
         if not text:
             return self.none()
 
-        query_embedding = embed_text(text)  # Your embedding function
+        query_embedding = embed_text(text)
+        if not query_embedding:
+            return self.none()
+        numbers = [num for num in re.findall(r"\d+\.?\d*", text)]
+        qs = self.annotate(
+            distance=CosineDistance("embedding", query_embedding)
+        )
+        if numbers:
+            q = Q()
+            for num in numbers:
+                q |= Q(content_norm__icontains=num)
+            candidates = self.filter(q).only("id")[:1000]
+            qs = qs.filter(id__in=candidates)
+
+        return qs.order_by("distance")[:top_n]
+
+
+    def top_similar2(self, text: str, top_n=5):
+        if not text:
+            return self.none()
+
+        query_embedding = embed_text(text)
         if not query_embedding:
             return self.none()
 
@@ -74,6 +98,12 @@ class SmartChunk(models.Model):
     document = models.ForeignKey(Document, on_delete=models.CASCADE, related_name='chunks')
     chunk_index = models.IntegerField()
     content = models.TextField()
+    content_norm = GeneratedField(
+        expression=Func(Lower(F("content")), function="immutable_unaccent"),
+        output_field=TextField(),
+        db_persist=True,     # matches STORED
+        editable=False
+    )
     token_count = models.IntegerField()
     title = models.CharField(max_length=255, blank=True, null=True)
     summary = models.TextField(blank=True)

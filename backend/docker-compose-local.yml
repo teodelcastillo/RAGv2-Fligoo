@@ -1,0 +1,25 @@
+version: "3.8"
+
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: ./docker/Dockerfile
+    image: backend:latest
+    container_name: backend
+    command: bash -c "sleep 4 && sh ./docker/entrypoint.sh"
+
+    env_file:
+      - ./docker/.env
+    volumes:
+      - .:/code
+    ports:
+      - 80:80
+
+    restart: unless-stopped
+    networks:
+      - app-network
+
+networks:
+  app-network:
+    driver: bridge

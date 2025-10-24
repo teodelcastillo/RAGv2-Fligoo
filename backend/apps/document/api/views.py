@@ -16,8 +16,8 @@ class RAGQueryView(APIView):
     authentication_classes = [SessionAuthentication, BasicAuthentication]
     permission_classes = [IsAuthenticated]
     def get(self, request):
-        query = request.query_params.get("query")
-        if not query:
+        query_text = request.query_params.get("query")
+        if not query_text:
             return Response({"error": "Missing query parameter"}, status=status.HTTP_400_BAD_REQUEST)
 
         
@@ -28,7 +28,7 @@ class RAGQueryView(APIView):
             qs = SmartChunk.objects.filter(
                 Q(document__owner=user) | Q(document__is_public=False)
             )
-        
+
         slugs = request.query_params.getlist("documents")
         if slugs:
             qs = qs.filter(document__slug__in=slugs)
@@ -43,9 +43,9 @@ class RAGQueryView(APIView):
                                 status=status.HTTP_400_BAD_REQUEST)
 
         try:
-            chunks = qs.top_similar(query)
+            chunks = qs.top_similar(query_text)
             serializer = SmartChunkSerializer(chunks, many=True)
-            return Response({"query": query, "results": serializer.data})
+            return Response({"query": query_text, "results": serializer.data})
 
         except Exception as e:
             return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)

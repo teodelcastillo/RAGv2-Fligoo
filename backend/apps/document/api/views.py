@@ -62,7 +62,6 @@ class DocumentCreateAPIView(CreateAPIView):
         serializer.is_valid(raise_exception=True)
         document = serializer.save(owner=request.user)
 
-        # Use output serializer for the response
         response_serializer = DocumentSerializer(document, context=self.get_serializer_context())
         return Response(response_serializer.data, status=status.HTTP_201_CREATED)
     

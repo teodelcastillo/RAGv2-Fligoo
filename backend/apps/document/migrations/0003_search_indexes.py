@@ -19,7 +19,7 @@ $$;
 -- 2) Normalized content (stored/generated column)
 ALTER TABLE document_smartchunk
   ADD COLUMN IF NOT EXISTS content_norm text
-  GENERATED ALWAYS AS (unaccent(lower(content))) STORED;
+  GENERATED ALWAYS AS (immutable_unaccent(lower(content))) STORED;
   
 
 -- 3) Trigram index on normalized text

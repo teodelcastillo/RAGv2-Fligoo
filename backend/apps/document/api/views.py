@@ -2,8 +2,6 @@ from rest_framework.views import APIView
 from rest_framework.generics import CreateAPIView, ListAPIView
 from rest_framework import status
 from rest_framework.response import Response
-from rest_framework.permissions import IsAuthenticated
-from rest_framework.authentication import SessionAuthentication, BasicAuthentication
 
 from django.db.models import Q
 
@@ -13,8 +11,6 @@ from apps.document.api.serializers import SmartChunkSerializer, DocumentSerializ
 
 
 class RAGQueryView(APIView):
-    authentication_classes = [SessionAuthentication, BasicAuthentication]
-    permission_classes = [IsAuthenticated]
     def get(self, request):
         query_text = request.query_params.get("query")
         if not query_text:
@@ -52,7 +48,6 @@ class RAGQueryView(APIView):
 
 
 class DocumentCreateAPIView(CreateAPIView):
-    permission_classes = [IsAuthenticated]
     queryset=Document.objects.all()
     serializer_class=DocumentCreateSerializer
 
@@ -67,7 +62,6 @@ class DocumentCreateAPIView(CreateAPIView):
     
 
 class DocumentListAPIView(ListAPIView):
-    permission_classes = [IsAuthenticated]
     queryset = Document.objects.all()
     serializer_class = DocumentSerializer
     filterset_class = DocumentFilter

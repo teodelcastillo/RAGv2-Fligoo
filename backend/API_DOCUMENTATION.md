@@ -9,6 +9,7 @@ Or replace `localhost` with your actual domain/hostname.
 
 ## Authentication
 All endpoints require authentication. Use either:
+- **Token Authentication** - Recommended for programmatic access: `Authorization: Token <your-token>`
 - **Session Authentication** - For browser-based requests
 - **Basic Authentication** - For programmatic access (username:password)
 
@@ -22,7 +23,7 @@ Perform semantic search queries on document chunks using vector similarity.
 
 **Endpoint:** `GET /api/document/rag/`
 
-**Authentication:** Required (Session or Basic)
+**Authentication:** Required (Token, Session, or Basic)
 
 **Query Parameters:**
 
@@ -37,15 +38,15 @@ Perform semantic search queries on document chunks using vector similarity.
 ```bash
 # Basic query
 curl -X GET "http://localhost/api/document/rag/?query=climate change" \
-  -u username:password
+  -H "Authorization: Token YOUR_TOKEN_HERE"
 
 # Query with document filter
 curl -X GET "http://localhost/api/document/rag/?query=climate change&documents=report-2023&documents=analysis-2024" \
-  -u username:password
+  -H "Authorization: Token YOUR_TOKEN_HERE"
 
 # Query for public documents only
 curl -X GET "http://localhost/api/document/rag/?query=climate change&public=true" \
-  -u username:password
+  -H "Authorization: Token YOUR_TOKEN_HERE"
 ```
 
 **Response:** `200 OK`
@@ -97,7 +98,7 @@ Upload and create a new document. The document will be automatically processed a
 
 **Endpoint:** `POST /api/document/create/`
 
-**Authentication:** Required (Session or Basic)
+**Authentication:** Required (Token, Session, or Basic)
 
 **Request Body:** `multipart/form-data`
 
@@ -109,7 +110,7 @@ Upload and create a new document. The document will be automatically processed a
 
 ```bash
 curl -X POST "http://localhost/api/document/create/" \
-  -u username:password \
+  -H "Authorization: Token YOUR_TOKEN_HERE" \
   -F "file=@/path/to/document.pdf"
 ```
 
@@ -150,7 +151,7 @@ Retrieve a list of documents with optional filtering.
 
 **Endpoint:** `GET /api/document/list/`
 
-**Authentication:** Required (Session or Basic)
+**Authentication:** Required (Token, Session, or Basic)
 
 **Query Parameters (Filters):**
 
@@ -171,35 +172,35 @@ All filters use Django REST Framework's filtering syntax:
 ```bash
 # List all user's documents
 curl -X GET "http://localhost/api/document/list/" \
-  -u username:password
+  -H "Authorization: Token YOUR_TOKEN_HERE"
 
 # Filter by name
 curl -X GET "http://localhost/api/document/list/?name__icontains=report" \
-  -u username:password
+  -H "Authorization: Token YOUR_TOKEN_HERE"
 
 # Filter by category
 curl -X GET "http://localhost/api/document/list/?category__exact=research" \
-  -u username:password
+  -H "Authorization: Token YOUR_TOKEN_HERE"
 
 # Filter by chunking status
 curl -X GET "http://localhost/api/document/list/?chunking_status=done" \
-  -u username:password
+  -H "Authorization: Token YOUR_TOKEN_HERE"
 
 # Search in content
 curl -X GET "http://localhost/api/document/list/?extracted_text__icontains=climate" \
-  -u username:password
+  -H "Authorization: Token YOUR_TOKEN_HERE"
 
 # Filter by date (documents created after 2023)
 curl -X GET "http://localhost/api/document/list/?created_at__year__gt=2023" \
-  -u username:password
+  -H "Authorization: Token YOUR_TOKEN_HERE"
 
 # Filter by public documents only
 curl -X GET "http://localhost/api/document/list/?is_public=true" \
-  -u username:password
+  -H "Authorization: Token YOUR_TOKEN_HERE"
 
 # Combined filters
 curl -X GET "http://localhost/api/document/list/?chunking_status=done&is_public=true&name__icontains=report" \
-  -u username:password
+  -H "Authorization: Token YOUR_TOKEN_HERE"
 ```
 
 **Response:** `200 OK`
@@ -279,13 +280,15 @@ curl -X GET "http://localhost/api/document/list/?chunking_status=done&is_public=
 ### JavaScript/TypeScript (with Fetch)
 
 ```javascript
+const API_TOKEN = 'YOUR_TOKEN_HERE';
+
 // RAG Query
 async function searchDocuments(query) {
   const response = await fetch(
     `http://localhost/api/document/rag/?query=${encodeURIComponent(query)}`,
     {
       headers: {
-        'Authorization': `Basic ${btoa('username:password')}`
+        'Authorization': `Token ${API_TOKEN}`
       }
     }
   );
@@ -302,7 +305,7 @@ async function uploadDocument(file) {
     {
       method: 'POST',
       headers: {
-        'Authorization': `Basic ${btoa('username:password')}`
+        'Authorization': `Token ${API_TOKEN}`
       },
       body: formData
     }
@@ -317,7 +320,7 @@ async function listDocuments(filters = {}) {
     `http://localhost/api/document/list/?${params}`,
     {
       headers: {
-        'Authorization': `Basic ${btoa('username:password')}`
+        'Authorization': `Token ${API_TOKEN}`
       }
     }
   );
@@ -329,17 +332,20 @@ async function listDocuments(filters = {}) {
 
 ```python
 import requests
-from requests.auth import HTTPBasicAuth
 
 BASE_URL = "http://localhost/api/document"
-auth = HTTPBasicAuth('username', 'password')
+API_TOKEN = "YOUR_TOKEN_HERE"
+
+headers = {
+    "Authorization": f"Token {API_TOKEN}"
+}
 
 # RAG Query
 def search_documents(query):
     response = requests.get(
         f"{BASE_URL}/rag/",
         params={"query": query},
-        auth=auth
+        headers=headers
     )
     return response.json()
 
@@ -350,7 +356,7 @@ def upload_document(file_path):
         response = requests.post(
             f"{BASE_URL}/create/",
             files=files,
-            auth=auth
+            headers=headers
         )
     return response.json()
 
@@ -359,7 +365,7 @@ def list_documents(filters=None):
     response = requests.get(
         f"{BASE_URL}/list/",
         params=filters or {},
-        auth=auth
+        headers=headers
     )
     return response.json()
 ```

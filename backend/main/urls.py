@@ -7,6 +7,9 @@ from django.conf.urls.static import static
 urlpatterns = [
     path('admin/', admin.site.urls),
     path('api/document/', include('apps.document.api.urls')),
+    path('api/chat/', include('apps.chat.api.urls')),
+    path('api/projects/', include('apps.project.api.urls')),
+    path('api/evaluations/', include('apps.evaluation.api.urls')),
 ]
 if settings.DEBUG:
     urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)

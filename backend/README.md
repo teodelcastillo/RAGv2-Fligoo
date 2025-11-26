@@ -22,6 +22,9 @@ docker-compose exec backend python manage.py migrate
 
 # 4. Create superuser
 docker-compose exec backend python manage.py createsuperuser
+
+# 5. Start Celery worker (background jobs & evaluations)
+docker-compose exec backend celery -A main worker -l info
 ```
 
 ### Access
@@ -42,11 +45,14 @@ docker-compose exec backend python manage.py createsuperuser
 **Embeddings:** OpenAI API  
 **Containerization:** Docker, Docker Compose
 
+Evaluaciones y procesamiento de documentos se ejecutan como tareas asíncronas, por lo que siempre debe estar corriendo al menos un worker de Celery en producción.
+
 ## Key Features
 
 - 📄 Document upload & processing (PDF, DOCX)
 - 🧠 Automatic text chunking with OpenAI embeddings
 - 🔍 Vector similarity search using pgvector
+- 💬 Secure AI chat sessions powered by RAG context
 - 🔄 Background processing with Celery
 - 🌐 RESTful API with browsable interface
 - ☁️ AWS S3 integration for file storage

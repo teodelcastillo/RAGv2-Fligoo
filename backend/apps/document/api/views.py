@@ -22,7 +22,7 @@ class RAGQueryView(APIView):
             qs = SmartChunk.objects.all()
         else:
             qs = SmartChunk.objects.filter(
-                Q(document__owner=user) | Q(document__is_public=False)
+                Q(document__owner=user) | Q(document__is_public=True)
             )
 
         slugs = request.query_params.getlist("documents")

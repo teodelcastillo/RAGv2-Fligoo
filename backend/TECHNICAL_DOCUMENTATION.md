@@ -9,6 +9,7 @@ Ecofilia is a Django-based document management and retrieval system with RAG (Re
 - Automatic text extraction (PDF, DOCX)
 - Intelligent text chunking with embeddings
 - Semantic search using vector similarity
+- Conversational AI chat with RAG context
 - RESTful API with browsable interface
 - Background task processing with Celery
 - AWS S3 storage integration
@@ -67,6 +68,11 @@ backend/
 │   │       ├── parser.py       # File parsing
 │   │       ├── query_filters.py  # Query filtering
 │   │       └── client_tiktoken.py  # Token counting
+│   ├── chat/              # Conversational RAG app
+│   │   ├── api/           # Session & message endpoints
+│   │   ├── services/      # RAG helpers and OpenAI orchestration
+│   │   ├── models.py      # ChatSession & ChatMessage models
+│   │   └── tests/         # API tests
 │   └── user/              # Custom user app
 │       └── models.py      # Custom User model
 ├── main/                   # Django project root
@@ -119,6 +125,7 @@ backend/
   - Text extraction
   - Chunking
   - Embedding generation
+  - Evaluaciones (tarea `run_evaluation_task`)
 
 #### 4. Storage
 - **AWS S3** for file storage (production)
@@ -557,6 +564,15 @@ See `API_DOCUMENTATION.md` for complete API reference.
 - `GET /api/document/rag/` - Semantic search
 - `POST /api/document/create/` - Upload document
 - `GET /api/document/list/` - List documents
+- `POST /api/chat/sessions/` - Create chat session scoped to selected documents
+- `POST /api/chat/messages/` - Send a message and receive RAG-powered responses
+
+### Chat Module (`apps/chat/`)
+
+- `ChatSession` / `ChatMessage` models guard chat ownership and document scope.
+- `services/rag.py` limits retrieval to the session's approved documents and formats context.
+- `api/views.py` exposes `/api/chat/sessions/` and `/api/chat/messages/`, orchestrating RAG + OpenAI Responses.
+- Security: users can only reference their own or public documents; staff can access all sessions.
 
 ---
 
@@ -586,6 +602,9 @@ SQS_QUEUE_URL           # Celery queue URL
 ```bash
 DJANGO_SETTINGS_MODULE  # Settings module (auto-set)
 CELERY_BROKER_URL       # Override broker URL
+MODEL_COMPLETION        # Chat completion model (default gpt-4o-mini)
+CHAT_CONTEXT_CHUNKS     # Max chunks sent per chat turn (default 4)
+CHAT_HISTORY_MESSAGES   # Number of historic messages to send to OpenAI (default 10)
 ```
 
 ---

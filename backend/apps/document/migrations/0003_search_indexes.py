@@ -17,10 +17,20 @@ AS $$
 $$;
 
 -- 2) Normalized content (stored/generated column)
-ALTER TABLE document_smartchunk
-  ADD COLUMN IF NOT EXISTS content_norm text
-  GENERATED ALWAYS AS (immutable_unaccent(lower(content))) STORED;
-  
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1
+    FROM information_schema.columns
+    WHERE table_name = 'document_smartchunk'
+      AND column_name = 'content_norm'
+      AND table_schema = current_schema()
+  ) THEN
+    ALTER TABLE document_smartchunk
+      ADD COLUMN content_norm text
+      GENERATED ALWAYS AS (immutable_unaccent(lower(content))) STORED;
+  END IF;
+END$$;
 
 -- 3) Trigram index on normalized text
 CREATE INDEX IF NOT EXISTS document_smartchunk_content_norm_trgm

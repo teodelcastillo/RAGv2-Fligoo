@@ -1,0 +1,4 @@
+"""
+Project app initialization.
+"""
+

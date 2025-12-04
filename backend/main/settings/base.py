@@ -9,6 +9,7 @@ def _env_bool(name: str, default: str = "False") -> bool:
 def _env_list(name: str, default: str = "") -> list[str]:
     return [item.strip() for item in os.environ.get(name, default).split(",") if item.strip()]
 
+
 # Build paths inside the project like this: os.path.join(BASE_DIR, ...)
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -24,16 +25,24 @@ JWT_SIGNING_KEY = os.environ.get("JWT_SIGNING_KEY", SECRET_KEY)
 DEBUG = _env_bool("DEBUG", "False")
 ENVIRONMENT_NAME = "base"
 
-_raw_hosts = os.environ.get("ALLOWED_HOSTS", "*")
+# Hosts / CSRF / CORS
+# Por defecto usamos los hosts de producción que tenés hoy:
+_raw_hosts = os.environ.get("ALLOWED_HOSTS", "api.ecofilia.site,localhost,127.0.0.1")
 ALLOWED_HOSTS = ["*"] if _raw_hosts == "*" else _env_list("ALLOWED_HOSTS", _raw_hosts)
+
+CSRF_TRUSTED_ORIGINS = _env_list(
+    "CSRF_TRUSTED_ORIGINS",
+    "https://ecofilia.site,https://api.ecofilia.site,http://ecofilia.site,http://api.ecofilia.site",
+)
 
 WSGI_APPLICATION = "main.wsgi.application"
 SITE_ID = 1
 STATIC_ROOT = "/django-static/"
+
 # Additional configuration settings
-LOGIN_REDIRECT_URL = '/'
+LOGIN_REDIRECT_URL = "/"
 SOCIALACCOUNT_QUERY_EMAIL = True
-ACCOUNT_LOGOUT_ON_GET= True
+ACCOUNT_LOGOUT_ON_GET = True
 ACCOUNT_UNIQUE_EMAIL = True
 ACCOUNT_EMAIL_REQUIRED = True
 
@@ -52,7 +61,7 @@ DJANGO_APPS = [
 
 THIRD_PARTY_APPS = [
     "corsheaders",
-    'pgvector',
+    "pgvector",
     "rest_framework",
     "django_filters",
     "rest_framework.authtoken",
@@ -73,7 +82,6 @@ LOCAL_APPS = [
 
 INSTALLED_APPS = DJANGO_APPS + THIRD_PARTY_APPS + LOCAL_APPS
 
-SITE_ID = 1
 AUTH_USER_MODEL = "user.User"
 
 ###############################################################################
@@ -92,17 +100,24 @@ MIDDLEWARE = [
     "django.middleware.clickjacking.XFrameOptionsMiddleware",
 ]
 
-_cors_origins = _env_list("CORS_ALLOWED_ORIGINS")
+# CORS: por defecto usamos los orígenes de producción actuales,
+# pero se pueden sobreescribir con la env CORS_ALLOWED_ORIGINS
+_cors_origins = _env_list(
+    "CORS_ALLOWED_ORIGINS",
+    "https://ecofilia.site,https://ecofilia.host,https://ecofilia.vercel.app,http://localhost:3000",
+)
 if _cors_origins:
     CORS_ALLOWED_ORIGINS = _cors_origins
     CORS_ALLOW_ALL_ORIGINS = False
 else:
     CORS_ALLOW_ALL_ORIGINS = True
+
 CORS_ALLOW_CREDENTIALS = True
+
 _custom_cors_headers = _env_list("CORS_ALLOW_HEADERS")
 if _custom_cors_headers:
     CORS_ALLOW_HEADERS = _custom_cors_headers
-CSRF_TRUSTED_ORIGINS = _env_list("CSRF_TRUSTED_ORIGINS")
+
 ###############################################################################
 #  TEMPLATES CONFIG
 ###############################################################################
@@ -145,6 +160,7 @@ DATABASES = {
 ###############################################################################
 #  DRF CONFIG
 ###############################################################################
+
 REST_FRAMEWORK = {
     "DEFAULT_AUTHENTICATION_CLASSES": (
         "rest_framework_simplejwt.authentication.JWTAuthentication",
@@ -189,9 +205,15 @@ AUTH_PASSWORD_VALIDATORS = [
     {
         "NAME": "django.contrib.auth.password_validation.UserAttributeSimilarityValidator",
     },
-    {"NAME": "django.contrib.auth.password_validation.MinimumLengthValidator",},
-    {"NAME": "django.contrib.auth.password_validation.CommonPasswordValidator",},
-    {"NAME": "django.contrib.auth.password_validation.NumericPasswordValidator",},
+    {
+        "NAME": "django.contrib.auth.password_validation.MinimumLengthValidator",
+    },
+    {
+        "NAME": "django.contrib.auth.password_validation.CommonPasswordValidator",
+    },
+    {
+        "NAME": "django.contrib.auth.password_validation.NumericPasswordValidator",
+    },
 ]
 
 
@@ -239,8 +261,7 @@ SECURE_REFERRER_POLICY = "same-origin"
 X_FRAME_OPTIONS = "DENY"
 
 
-
 # Default primary key field type
 # https://docs.djangoproject.com/en/5.2/ref/settings/#default-auto-field
 
-DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
+DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"

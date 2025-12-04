@@ -1,13 +1,4 @@
 import os
-from datetime import timedelta
-
-
-def _env_bool(name: str, default: str = "False") -> bool:
-    return os.environ.get(name, default).strip().lower() in ("1", "true", "yes", "on")
-
-
-def _env_list(name: str, default: str = "") -> list[str]:
-    return [item.strip() for item in os.environ.get(name, default).split(",") if item.strip()]
 
 # Build paths inside the project like this: os.path.join(BASE_DIR, ...)
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -18,14 +9,23 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # SECURITY WARNING: keep the secret key used in production secret!
 SECRET_KEY = os.environ["SECRET_KEY"]
-JWT_SIGNING_KEY = os.environ.get("JWT_SIGNING_KEY", SECRET_KEY)
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = _env_bool("DEBUG", "False")
+DEBUG = eval(os.environ["DEBUG"])
 ENVIRONMENT_NAME = "base"
 
-_raw_hosts = os.environ.get("ALLOWED_HOSTS", "*")
-ALLOWED_HOSTS = ["*"] if _raw_hosts == "*" else _env_list("ALLOWED_HOSTS", _raw_hosts)
+ALLOWED_HOSTS = [
+    "api.ecofilia.site",
+    "localhost",
+    "127.0.0.1",
+]
+
+CSRF_TRUSTED_ORIGINS = [
+    "https://ecofilia.site",
+    "https://api.ecofilia.site",
+    "http://ecofilia.site",
+    "http://api.ecofilia.site",
+]
 
 WSGI_APPLICATION = "main.wsgi.application"
 SITE_ID = 1
@@ -55,20 +55,16 @@ THIRD_PARTY_APPS = [
     'pgvector',
     "rest_framework",
     "django_filters",
-    "rest_framework.authtoken",
-    "rest_framework_simplejwt.token_blacklist",
-    "django_otp",
-    "django_otp.plugins.otp_totp",
+        "rest_framework.authtoken",
 ]
 
 LOCAL_APPS = [
     "main",
     "apps.user",
-    "apps.document",
-    "apps.chat",
-    "apps.project",
-    "apps.evaluation",
-    "apps.authentication",
+    'apps.document',
+    'apps.chat',
+    'apps.project',
+    'apps.evaluation',
 ]
 
 INSTALLED_APPS = DJANGO_APPS + THIRD_PARTY_APPS + LOCAL_APPS
@@ -87,22 +83,20 @@ MIDDLEWARE = [
     "django.middleware.common.CommonMiddleware",
     "django.middleware.csrf.CsrfViewMiddleware",
     "django.contrib.auth.middleware.AuthenticationMiddleware",
-    "django_otp.middleware.OTPMiddleware",
-    "django.contrib.messages.middleware.MessageMiddleware",
+        "django.contrib.messages.middleware.MessageMiddleware",
     "django.middleware.clickjacking.XFrameOptionsMiddleware",
 ]
 
-_cors_origins = _env_list("CORS_ALLOWED_ORIGINS")
-if _cors_origins:
-    CORS_ALLOWED_ORIGINS = _cors_origins
-    CORS_ALLOW_ALL_ORIGINS = False
-else:
-    CORS_ALLOW_ALL_ORIGINS = True
+CORS_ORIGIN_ALLOW_ALL = False
+
+CORS_ALLOWED_ORIGINS = [
+    "https://ecofilia.site",
+    "https://ecofilia.host",
+    "https://ecofilia.vercel.app",
+    "http://localhost:3000",
+]
+
 CORS_ALLOW_CREDENTIALS = True
-_custom_cors_headers = _env_list("CORS_ALLOW_HEADERS")
-if _custom_cors_headers:
-    CORS_ALLOW_HEADERS = _custom_cors_headers
-CSRF_TRUSTED_ORIGINS = _env_list("CSRF_TRUSTED_ORIGINS")
 ###############################################################################
 #  TEMPLATES CONFIG
 ###############################################################################
@@ -117,7 +111,7 @@ TEMPLATES = [
         "APP_DIRS": True,
         "OPTIONS": {
             "context_processors": [
-                "django.template.context_processors.debug",
+                                "django.template.context_processors.debug",
                 "django.template.context_processors.request",
                 "django.contrib.auth.context_processors.auth",
                 "django.contrib.messages.context_processors.messages",
@@ -145,39 +139,16 @@ DATABASES = {
 ###############################################################################
 #  DRF CONFIG
 ###############################################################################
+
 REST_FRAMEWORK = {
     "DEFAULT_AUTHENTICATION_CLASSES": (
-        "rest_framework_simplejwt.authentication.JWTAuthentication",
-        "rest_framework.authentication.SessionAuthentication",
         "rest_framework.authentication.BasicAuthentication",
+        'rest_framework.authentication.SessionAuthentication',
+        "rest_framework.authentication.TokenAuthentication",
     ),
     "DEFAULT_PERMISSION_CLASSES": ("rest_framework.permissions.IsAuthenticated",),
     "DEFAULT_FILTER_BACKENDS": ("django_filters.rest_framework.DjangoFilterBackend",),
     "DEFAULT_SCHEMA_CLASS": "rest_framework.schemas.coreapi.AutoSchema",
-    "DEFAULT_THROTTLE_CLASSES": (
-        "rest_framework.throttling.AnonRateThrottle",
-        "rest_framework.throttling.UserRateThrottle",
-    ),
-    "DEFAULT_THROTTLE_RATES": {
-        "anon": os.environ.get("DRF_THROTTLE_RATE_ANON", "30/min"),
-        "user": os.environ.get("DRF_THROTTLE_RATE_USER", "120/min"),
-    },
-}
-
-SIMPLE_JWT = {
-    "ACCESS_TOKEN_LIFETIME": timedelta(
-        minutes=int(os.environ.get("JWT_ACCESS_TTL_MINUTES", "15"))
-    ),
-    "REFRESH_TOKEN_LIFETIME": timedelta(
-        days=int(os.environ.get("JWT_REFRESH_TTL_DAYS", "7"))
-    ),
-    "ROTATE_REFRESH_TOKENS": True,
-    "BLACKLIST_AFTER_ROTATION": True,
-    "ALGORITHM": os.environ.get("JWT_ALGORITHM", "HS256"),
-    "SIGNING_KEY": JWT_SIGNING_KEY,
-    "AUTH_HEADER_TYPES": ("Bearer",),
-    "AUTH_TOKEN_CLASSES": ("rest_framework_simplejwt.tokens.AccessToken",),
-    "UPDATE_LAST_LOGIN": True,
 }
 
 
@@ -215,28 +186,9 @@ USE_TZ = True
 STATIC_URL = "/static/"
 
 
-AUTHENTICATION_BACKENDS = ("django.contrib.auth.backends.ModelBackend",)
-
-DEFAULT_FROM_EMAIL = os.environ.get("DEFAULT_FROM_EMAIL", "no-reply@example.com")
-FRONTEND_BASE_URL = os.environ.get("FRONTEND_BASE_URL", "http://localhost:3000")
-MFA_ISSUER_NAME = os.environ.get("MFA_ISSUER_NAME", "Ecofilia")
-
-SECURE_SSL_REDIRECT = _env_bool("SECURE_SSL_REDIRECT", "False")
-SESSION_COOKIE_SECURE = _env_bool("SESSION_COOKIE_SECURE", "False")
-CSRF_COOKIE_SECURE = _env_bool("CSRF_COOKIE_SECURE", "False")
-SECURE_HSTS_SECONDS = int(os.environ.get("SECURE_HSTS_SECONDS", "0"))
-SECURE_HSTS_INCLUDE_SUBDOMAINS = SECURE_HSTS_SECONDS > 0
-SECURE_HSTS_PRELOAD = SECURE_HSTS_SECONDS > 0
-SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
-SESSION_COOKIE_HTTPONLY = True
-CSRF_COOKIE_HTTPONLY = True
-SESSION_COOKIE_SAMESITE = os.environ.get("SESSION_COOKIE_SAMESITE", "Lax")
-CSRF_COOKIE_SAMESITE = os.environ.get("CSRF_COOKIE_SAMESITE", "Lax")
-CSRF_USE_SESSIONS = True
-SECURE_BROWSER_XSS_FILTER = True
-SECURE_CONTENT_TYPE_NOSNIFF = True
-SECURE_REFERRER_POLICY = "same-origin"
-X_FRAME_OPTIONS = "DENY"
+AUTHENTICATION_BACKENDS = (
+    "django.contrib.auth.backends.ModelBackend",
+)
 
 
 
@@ -244,3 +196,8 @@ X_FRAME_OPTIONS = "DENY"
 # https://docs.djangoproject.com/en/5.2/ref/settings/#default-auto-field
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
+
+
+
+
+

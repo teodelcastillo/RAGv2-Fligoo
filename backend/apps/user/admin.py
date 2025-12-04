@@ -7,8 +7,22 @@ from .models import User
 
 class UserAdmin(DjUserAdmin):
     fieldsets = (
-        (None, {"fields": ("email", "password",)}),
-        (_("Personal info"), {"fields": ("first_name", "last_name", "username",)},),
+        (None, {"fields": ("email", "password")}),
+        (_("Personal info"), {"fields": ("first_name", "last_name", "username")}),
+        (
+            _("Security"),
+            {
+                "fields": (
+                    "role",
+                    "approved",
+                    "email_verified",
+                    "email_verified_at",
+                    "mfa_enabled",
+                    "mfa_secret",
+                    "last_password_change",
+                )
+            },
+        ),
         (
             _("Permissions"),
             {
@@ -24,10 +38,26 @@ class UserAdmin(DjUserAdmin):
         (_("Important dates"), {"fields": ("last_login", "date_joined")}),
     )
     add_fieldsets = (
-        (None, {"classes": ("wide",), "fields": ("email", "password1", "password2"),}),
+        (
+            None,
+            {
+                "classes": ("wide",),
+                "fields": ("email", "role", "password1", "password2"),
+            },
+        ),
     )
-    list_display = ("id", "email")
+    list_display = (
+        "id",
+        "email",
+        "role",
+        "email_verified",
+        "mfa_enabled",
+        "is_active",
+    )
+    list_filter = ("role", "email_verified", "mfa_enabled", "is_active")
+    search_fields = ("email", "first_name", "last_name")
     ordering = ("email",)
+    readonly_fields = ("email_verified_at", "last_password_change")
 
 
-admin.site.register(User, DjUserAdmin)
+admin.site.register(User, UserAdmin)

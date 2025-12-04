@@ -10,6 +10,7 @@ urlpatterns = [
     path('api/chat/', include('apps.chat.api.urls')),
     path('api/projects/', include('apps.project.api.urls')),
     path('api/evaluations/', include('apps.evaluation.api.urls')),
+    path('api/auth/', include('apps.authentication.api.urls')),
 ]
 if settings.DEBUG:
     urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)

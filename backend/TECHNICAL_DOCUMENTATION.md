@@ -10,6 +10,7 @@ Ecofilia is a Django-based document management and retrieval system with RAG (Re
 - Intelligent text chunking with embeddings
 - Semantic search using vector similarity
 - Conversational AI chat with RAG context
+- JWT authentication with optional MFA (TOTP)
 - RESTful API with browsable interface
 - Background task processing with Celery
 - AWS S3 storage integration
@@ -45,6 +46,8 @@ Ecofilia is a Django-based document management and retrieval system with RAG (Re
 - `openai` - Embeddings API
 - `psycopg2-binary` - PostgreSQL adapter
 - `django-storages` - S3 storage backend
+- `djangorestframework-simplejwt[crypto]` - JWT issuance & blacklist
+- `django-otp` / `pyotp` - TOTP-based MFA
 
 ---
 
@@ -73,6 +76,10 @@ backend/
 │   │   ├── services/      # RAG helpers and OpenAI orchestration
 │   │   ├── models.py      # ChatSession & ChatMessage models
 │   │   └── tests/         # API tests
+│   ├── authentication/    # JWT, refresh tokens, MFA
+│   │   ├── api/           # Auth endpoints (register/login/profile/mfa)
+│   │   ├── services/      # Email, tokens, MFA helpers
+│   │   └── signals.py     # Token blacklist invalidation hooks
 │   └── user/              # Custom user app
 │       └── models.py      # Custom User model
 ├── main/                   # Django project root
@@ -556,6 +563,19 @@ celery -A main worker -l info --concurrency=4
 
 ---
 
+### Authentication Module (`apps/authentication/`)
+
+- **`api/views.py`** exposes `/api/auth/*` endpoints (register, login, refresh, logout, profile, password reset, MFA flows). All responses are tailored for the Next.js frontend (JSON only, no HTML redirects).
+- **`api/serializers.py`** extends `TokenObtainPairSerializer` to enforce email verification + MFA challenges and provides serializers for password resets, logout, and MFA.
+- **`services/tokens.py`** wraps Django's `PasswordResetTokenGenerator` to issue/validate UID + token pairs shared via email links.
+- **`services/email.py`** centralizes transactional messages (verification, password reset) and builds URLs using `FRONTEND_BASE_URL`.
+- **`services/mfa.py`** manages TOTP secrets/provisioning URIs using `pyotp`.
+- **`signals.py`** listens to `pre_save` on `User` and blacklists every outstanding JWT whenever passwords change or accounts are deactivated, ensuring stale tokens are unusable.
+
+SimpleJWT is configured in `main/settings/base.py` with short-lived access tokens (15 minutes), refresh rotation + blacklist, secure cookies, and DRF throttling (`30/min` anonymous, `120/min` authenticated by default). Environment variables (`JWT_SIGNING_KEY`, `JWT_ACCESS_TTL_MINUTES`, `JWT_REFRESH_TTL_DAYS`, `FRONTEND_BASE_URL`, `MFA_ISSUER_NAME`, etc.) control runtime behavior without code changes.
+
+---
+
 ## API Endpoints
 
 See `API_DOCUMENTATION.md` for complete API reference.
@@ -582,6 +602,9 @@ See `API_DOCUMENTATION.md` for complete API reference.
 ```bash
 SECRET_KEY           # Django secret key
 DEBUG               # Boolean (True/False)
+ALLOWED_HOSTS       # Comma separated hostnames (* for dev)
+CORS_ALLOWED_ORIGINS  # Frontend origins allowed to call the API
+CSRF_TRUSTED_ORIGINS  # Origins allowed to send CSRF tokens
 POSTGRES_USER       # Database user
 POSTGRES_PASSWORD   # Database password
 POSTGRES_NAME       # Database name
@@ -589,6 +612,9 @@ POSTGRES_HOST       # Database host
 POSTGRES_PORT       # Database port
 OPENAI_API_KEY      # OpenAI API key
 MODEL_EMBEDDING     # Embedding model name
+JWT_SIGNING_KEY     # Secret used to sign JWTs (rotate independently)
+FRONTEND_BASE_URL   # Used to craft email links (Next.js site)
+DEFAULT_FROM_EMAIL  # Sender used for transactional emails
 ```
 
 ### Production Variables
@@ -605,6 +631,16 @@ CELERY_BROKER_URL       # Override broker URL
 MODEL_COMPLETION        # Chat completion model (default gpt-4o-mini)
 CHAT_CONTEXT_CHUNKS     # Max chunks sent per chat turn (default 4)
 CHAT_HISTORY_MESSAGES   # Number of historic messages to send to OpenAI (default 10)
+JWT_ACCESS_TTL_MINUTES  # Minutes for access tokens (default 15)
+JWT_REFRESH_TTL_DAYS    # Days for refresh tokens (default 7)
+JWT_ALGORITHM           # JWT signing algorithm (default HS256)
+MFA_ISSUER_NAME         # Label displayed in authenticator apps
+DRF_THROTTLE_RATE_ANON  # Anonymous rate limit (default 30/min)
+DRF_THROTTLE_RATE_USER  # Authenticated rate limit (default 120/min)
+SESSION_COOKIE_SECURE   # Force secure cookie in HTTPS (True/False)
+CSRF_COOKIE_SECURE      # Force secure cookie in HTTPS (True/False)
+SESSION_COOKIE_SAMESITE # Lax/Strict/None
+CSRF_COOKIE_SAMESITE    # Lax/Strict/None
 ```
 
 ---
@@ -700,11 +736,11 @@ docker-compose restart celery-worker
 - [ ] Monitor for security issues
 
 ### API Security
-- All endpoints require authentication
-- Session + Basic auth for browser
-- Token auth for programmatic access
-- Staff users have broader access
-- Regular users see only their documents
+- All protected endpoints expect `Authorization: Bearer <access>` header
+- Refresh tokens rotate and are blacklisted on logout/password change/deactivation
+- Optional MFA (TOTP) enforces an extra factor on `/api/auth/login/`
+- Rate limiting enforced via DRF throttles (configurable)
+- Staff users retain elevated scopes; regular users are isolated to their own data
 
 ---
 
@@ -804,6 +840,6 @@ git push origin feature/my-feature
 - ✅ RESTful API
 - ✅ Background processing
 - ✅ AWS integration
-- 🚧 Authentication improvements
+- ✅ Authentication improvements (JWT + MFA)
 - 🚧 Advanced search features
 - 🚧 Analytics and monitoring

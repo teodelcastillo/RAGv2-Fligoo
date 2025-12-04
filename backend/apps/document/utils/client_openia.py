@@ -39,12 +39,21 @@ def generate_chat_completion(
     )
 
     text_fragments = []
-    for message in response.output:
-        for item in message.content:
-            if item.type == "text":
-                text_fragments.append(item.text)
+    if getattr(response, "output_text", None):
+        text_fragments.extend(response.output_text)
+    else:
+        for block in getattr(response, "output", []) or []:
+            content_items = getattr(block, "content", None)
+            # Some SDK versions nest content under block.message.content
+            if not content_items and hasattr(block, "message"):
+                content_items = getattr(block.message, "content", None)
+            if not content_items:
+                continue
+            for item in content_items:
+                if getattr(item, "type", None) in ("output_text", "text"):
+                    text_fragments.append(getattr(item, "text", ""))
 
-    completion_text = "\n".join(text_fragments).strip()
+    completion_text = "\n".join(fragment for fragment in text_fragments if fragment).strip()
     usage = {
         "input_tokens": getattr(response.usage, "input_tokens", 0),
         "output_tokens": getattr(response.usage, "output_tokens", 0),

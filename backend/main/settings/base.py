@@ -32,7 +32,7 @@ ALLOWED_HOSTS = ["*"] if _raw_hosts == "*" else _env_list("ALLOWED_HOSTS", _raw_
 
 CSRF_TRUSTED_ORIGINS = _env_list(
     "CSRF_TRUSTED_ORIGINS",
-    "https://ecofilia.site,https://api.ecofilia.site,http://ecofilia.site,http://api.ecofilia.site",
+    "https://ecofilia.site,https://api.ecofilia.site,http://ecofilia.site,http://api.ecofilia.site,http://localhost:3000,https://www.ecofilia.site,https://www.ecofilia.host",
 )
 
 WSGI_APPLICATION = "main.wsgi.application"

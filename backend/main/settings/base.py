@@ -104,7 +104,7 @@ MIDDLEWARE = [
 # pero se pueden sobreescribir con la env CORS_ALLOWED_ORIGINS
 _cors_origins = _env_list(
     "CORS_ALLOWED_ORIGINS",
-    "https://ecofilia.site,https://ecofilia.host,https://ecofilia.vercel.app,http://localhost:3000",
+    "https://ecofilia.site,https://ecofilia.host,https://ecofilia.vercel.app,http://localhost:3000,https://www.ecofilia.site,https://www.ecofilia.host",
 )
 if _cors_origins:
     CORS_ALLOWED_ORIGINS = _cors_origins

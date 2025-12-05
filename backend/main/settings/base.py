@@ -114,9 +114,27 @@ else:
 
 CORS_ALLOW_CREDENTIALS = True
 
-_custom_cors_headers = _env_list("CORS_ALLOW_HEADERS")
-if _custom_cors_headers:
-    CORS_ALLOW_HEADERS = _custom_cors_headers
+CORS_ALLOW_METHODS = [
+    "DELETE",
+    "GET",
+    "OPTIONS",
+    "PATCH",
+    "POST",
+    "PUT",
+]
+
+CORS_ALLOW_HEADERS = [
+    "accept",
+    "accept-encoding",
+    "authorization",
+    "content-type",
+    "dnt",
+    "origin",
+    "user-agent",
+    "x-csrftoken",
+    "x-requested-with",
+]
+
 
 ###############################################################################
 #  TEMPLATES CONFIG

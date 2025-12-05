@@ -3,4 +3,4 @@
 
 # poetry install --dev
 
-./manage.py runserver 0:80
+./manage.py runserver 0:8000

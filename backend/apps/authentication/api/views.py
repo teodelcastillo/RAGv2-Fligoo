@@ -1,3 +1,4 @@
+import logging
 from urllib.parse import urlencode
 
 from django.conf import settings
@@ -6,8 +7,10 @@ from django.utils.translation import gettext_lazy as _
 from rest_framework import generics, status
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
+from rest_framework.throttling import AnonRateThrottle
 from rest_framework.views import APIView
-from rest_framework_simplejwt.views import TokenObtainPairView
+from rest_framework_simplejwt.views import TokenObtainPairView, TokenRefreshView
+from rest_framework_simplejwt.serializers import TokenRefreshSerializer
 
 from apps.authentication.api.serializers import (
     LogoutSerializer,
@@ -27,6 +30,7 @@ from apps.authentication.services.mfa import MFAService
 from apps.authentication.services.tokens import TokenService
 
 User = get_user_model()
+logger = logging.getLogger(__name__)
 
 
 def build_frontend_url(path: str, params: dict[str, str]) -> str:
@@ -76,6 +80,80 @@ class VerifyEmailView(APIView):
 class TokenObtainPairWithMFAView(TokenObtainPairView):
     serializer_class = TokenObtainPairWithMFASerializer
     permission_classes = [AllowAny]
+
+
+class StrictRefreshThrottle(AnonRateThrottle):
+    """
+    Throttle específico para el endpoint de refresh token.
+    Más estricto que el throttle anónimo general para prevenir ataques de fuerza bruta.
+    """
+    scope = "strict_refresh"  # Usa el rate configurado en DRF_THROTTLE_RATES
+
+
+class CustomTokenRefreshView(TokenRefreshView):
+    """
+    Custom token refresh view optimized for production security.
+    
+    Security features:
+    - Explicit rate limiting (20/min) to prevent brute force attacks
+    - Ensures refresh token rotation is properly handled
+    - No information disclosure in error responses
+    - Proper logging without exposing sensitive data
+    
+    With ROTATE_REFRESH_TOKENS=True and BLACKLIST_AFTER_ROTATION=True:
+    - When a refresh token is used, SimpleJWT automatically rotates it
+    - The old refresh token is blacklisted
+    - A new refresh token is returned in the response
+    """
+    serializer_class = TokenRefreshSerializer
+    permission_classes = [AllowAny]
+    throttle_classes = [StrictRefreshThrottle]
+
+    def post(self, request, *args, **kwargs):
+        """
+        Handle token refresh with security best practices.
+        
+        - Validates input through serializer (handles invalid/expired tokens)
+        - Ensures refresh token rotation works correctly
+        - Logs security events without exposing sensitive data
+        - Returns standardized responses
+        """
+        try:
+            serializer = self.get_serializer(data=request.data)
+            serializer.is_valid(raise_exception=True)
+            
+            # With ROTATE_REFRESH_TOKENS=True, the serializer should include 'refresh' in validated_data
+            response_data = serializer.validated_data
+            
+            # Verify that refresh token is included when rotation is enabled
+            # This is a safety check to ensure the frontend always gets the new refresh token
+            if settings.SIMPLE_JWT.get("ROTATE_REFRESH_TOKENS", False):
+                if "refresh" not in response_data:
+                    # This should never happen with proper SimpleJWT configuration
+                    # Log as error for monitoring, but don't expose to client
+                    logger.error(
+                        "Refresh token rotation enabled but 'refresh' not in response. "
+                        "Check SIMPLE_JWT configuration. User may be affected."
+                    )
+                    # Still return access token to avoid breaking the client
+                    # The client will need to re-authenticate on next refresh attempt
+            
+            # Log successful refresh (without exposing tokens)
+            logger.debug("Token refresh successful")
+            
+            return Response(response_data, status=status.HTTP_200_OK)
+            
+        except Exception as exc:
+            # Log security-relevant errors without exposing sensitive information
+            # SimpleJWT serializer will handle validation errors appropriately
+            logger.warning(
+                "Token refresh failed: %s",
+                type(exc).__name__,
+                exc_info=settings.DEBUG  # Only log full traceback in DEBUG mode
+            )
+            # Re-raise to let DRF handle the error response
+            # SimpleJWT will return appropriate error messages without exposing internals
+            raise
 
 
 class LogoutView(APIView):

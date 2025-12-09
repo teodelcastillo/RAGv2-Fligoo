@@ -1,7 +1,7 @@
 from django.urls import path
-from rest_framework_simplejwt.views import TokenRefreshView
 
 from apps.authentication.api.views import (
+    CustomTokenRefreshView,
     LogoutView,
     MFASetupView,
     MFAVerifyView,
@@ -19,7 +19,7 @@ urlpatterns = [
     path("register/", RegisterView.as_view(), name="auth-register"),
     path("verify-email/", VerifyEmailView.as_view(), name="auth-verify-email"),
     path("login/", TokenObtainPairWithMFAView.as_view(), name="auth-login"),
-    path("token/refresh/", TokenRefreshView.as_view(), name="auth-token-refresh"),
+    path("token/refresh/", CustomTokenRefreshView.as_view(), name="auth-token-refresh"),
     path("logout/", LogoutView.as_view(), name="auth-logout"),
     path("password/reset/", PasswordResetRequestView.as_view(), name="auth-password-reset"),
     path(

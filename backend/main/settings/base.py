@@ -195,6 +195,8 @@ REST_FRAMEWORK = {
     "DEFAULT_THROTTLE_RATES": {
         "anon": os.environ.get("DRF_THROTTLE_RATE_ANON", "30/min"),
         "user": os.environ.get("DRF_THROTTLE_RATE_USER", "120/min"),
+        # Throttle específico para refresh token (más estricto por seguridad)
+        "strict_refresh": os.environ.get("DRF_THROTTLE_RATE_REFRESH", "20/min"),
     },
 }
 

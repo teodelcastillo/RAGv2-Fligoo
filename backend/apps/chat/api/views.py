@@ -82,29 +82,31 @@ class ChatMessageViewSet(
         content = serializer.validated_data["content"]
 
         allowed_docs = session.allowed_documents.all()
-        if not allowed_docs.exists():
-            return Response(
-                {"detail": "La sesión no tiene documentos asociados."},
-                status=status.HTTP_400_BAD_REQUEST,
+        chunks = []
+        context_block = None
+
+        # Si hay documentos disponibles, buscar chunks relevantes
+        if allowed_docs.exists():
+            chunks = fetch_relevant_chunks(
+                user=request.user,
+                query_text=content,
+                allowed_documents=allowed_docs,
             )
+            context_block = build_context_block(chunks)
 
-        chunks = fetch_relevant_chunks(
-            user=request.user,
-            query_text=content,
-            allowed_documents=allowed_docs,
-        )
-        context_block = build_context_block(chunks)
-
+        # Construir mensajes base
         base_messages = [
             {"role": MessageRole.SYSTEM, "content": session.system_prompt.strip()},
         ]
+        
+        # Si hay contexto de documentos, agregarlo con prioridad
         if context_block:
             base_messages.append(
                 {
                     "role": MessageRole.SYSTEM,
                     "content": (
                         "Utiliza exclusivamente el siguiente contexto para responder. "
-                        "Si no hay suficiente información, responde que no se encontró."
+                        "Si no hay suficiente información en el contexto, responde que no se encontró."
                         f"\n\n{context_block}"
                     ),
                 }

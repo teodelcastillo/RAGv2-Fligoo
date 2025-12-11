@@ -445,7 +445,7 @@ curl -X DELETE "http://localhost/api/document/research-paper-2024/" \
 
 ### 7. Chat Sessions Endpoint
 
-Create and manage chat sessions that define which documents can be used as context.
+Create and manage chat sessions. Sessions can optionally include documents as context, but can also function without documents for general conversations.
 
 **Create Session:** `POST /api/chat/sessions/`
 
@@ -456,15 +456,16 @@ Create and manage chat sessions that define which documents can be used as conte
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `title` | string | Yes | Display name for the session |
-| `document_slugs` | string[] | Yes | Slugs of documents the assistant may use |
+| `document_slugs` | string[] | No | Slugs of documents the assistant may use as context (optional, can be empty) |
 | `system_prompt` | string | No | Override default assistant instructions |
 | `model` | string | No | OpenAI model (defaults to `MODEL_COMPLETION`) |
 | `temperature` | float | No | Creativity (0-1, default `0.1`) |
 | `language` | string | No | Session language hint |
 
-**Example Request:**
+**Example Requests:**
 
 ```bash
+# Session with documents as context
 curl -X POST "http://localhost/api/chat/sessions/" \
   -H "Authorization: Token YOUR_TOKEN_HERE" \
   -H "Content-Type: application/json" \
@@ -472,6 +473,16 @@ curl -X POST "http://localhost/api/chat/sessions/" \
         "title": "Reporte de sostenibilidad",
         "document_slugs": ["reporte-2024"],
         "temperature": 0.2
+      }'
+
+# Session without documents (general conversation)
+curl -X POST "http://localhost/api/chat/sessions/" \
+  -H "Authorization: Token YOUR_TOKEN_HERE" \
+  -H "Content-Type: application/json" \
+  -d '{
+        "title": "Asistente general",
+        "document_slugs": [],
+        "temperature": 0.7
       }'
 ```
 
@@ -494,15 +505,17 @@ curl -X POST "http://localhost/api/chat/sessions/" \
 
 **List Sessions:** `GET /api/chat/sessions/` – returns only the sessions owned by the authenticated user (staff users can see all sessions).
 
-**Security Notes:**
-- Users can only attach documents they own or documents marked as public.
-- Once created, every message in the session is restricted to the pre-approved documents.
+**Notes:**
+- `document_slugs` is optional and can be an empty array `[]` or omitted entirely
+- When documents are provided, they will be used as context for all messages in the session
+- When no documents are provided, the session functions as a general-purpose chat without document context
+- Users can only attach documents they own or documents marked as public
 
 ---
 
 ### 8. Chat Messages Endpoint
 
-Send a message within a session and receive the AI response enriched with document chunks.
+Send a message within a session and receive the AI response. If the session has documents associated, the response will be enriched with relevant document chunks as context. If no documents are associated, the chat functions as a general conversation.
 
 **Endpoint:** `POST /api/chat/messages/`
 
@@ -514,6 +527,10 @@ Send a message within a session and receive the AI response enriched with docume
 |-------|------|----------|-------------|
 | `session` | integer | Yes | ID of an existing chat session |
 | `content` | string | Yes | User message/question |
+
+**Behavior:**
+- **With documents:** The system searches for relevant chunks from the session's allowed documents and uses them as context. The assistant prioritizes information from these documents.
+- **Without documents:** The chat functions normally without document context, allowing general conversations.
 
 **Example Request:**
 

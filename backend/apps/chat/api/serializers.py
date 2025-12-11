@@ -34,8 +34,9 @@ class ChatSessionSerializer(serializers.ModelSerializer):
 class ChatSessionCreateSerializer(serializers.ModelSerializer):
     document_slugs = serializers.ListField(
         child=serializers.SlugField(),
-        allow_empty=False,
+        allow_empty=True,
         write_only=True,
+        required=False,
     )
 
     class Meta:
@@ -50,6 +51,10 @@ class ChatSessionCreateSerializer(serializers.ModelSerializer):
         )
 
     def validate_document_slugs(self, slugs: List[str]) -> List[str]:
+        # Si la lista está vacía, es válido (sesión sin documentos)
+        if not slugs:
+            return slugs
+        
         user = self.context["request"].user
         available_docs = accessible_documents_for(user, slugs)
         found_slugs = set(available_docs.values_list("slug", flat=True))
@@ -61,10 +66,11 @@ class ChatSessionCreateSerializer(serializers.ModelSerializer):
         return slugs
 
     def create(self, validated_data):
-        slugs = validated_data.pop("document_slugs")
+        slugs = validated_data.pop("document_slugs", [])
         session = ChatSession.objects.create(**validated_data)
-        docs = Document.objects.filter(slug__in=slugs)
-        session.allowed_documents.set(docs)
+        if slugs:
+            docs = Document.objects.filter(slug__in=slugs)
+            session.allowed_documents.set(docs)
         return session
 
 

@@ -22,41 +22,33 @@ def generate_chat_completion(
     temperature: float = 0.1,
 ) -> Tuple[str, dict]:
     """
-    Wrapper for the Responses API that returns text + token usage.
+    Wrapper for the Chat Completions API that returns text + token usage.
     """
-    formatted_input = [
+    # Format messages for OpenAI Chat Completions API
+    formatted_messages = [
         {
             "role": message["role"],
-            "content": [{"type": "text", "text": message["content"]}],
+            "content": message["content"],
         }
         for message in messages
     ]
 
-    response = client.responses.create(
+    response = client.chat.completions.create(
         model=model or MODEL_COMPLETION,
         temperature=temperature,
-        input=formatted_input,
+        messages=formatted_messages,
     )
 
-    text_fragments = []
-    if getattr(response, "output_text", None):
-        text_fragments.extend(response.output_text)
-    else:
-        for block in getattr(response, "output", []) or []:
-            content_items = getattr(block, "content", None)
-            # Some SDK versions nest content under block.message.content
-            if not content_items and hasattr(block, "message"):
-                content_items = getattr(block.message, "content", None)
-            if not content_items:
-                continue
-            for item in content_items:
-                if getattr(item, "type", None) in ("output_text", "text"):
-                    text_fragments.append(getattr(item, "text", ""))
-
-    completion_text = "\n".join(fragment for fragment in text_fragments if fragment).strip()
+    # Extract the completion text from the response
+    if not response.choices or not response.choices[0].message.content:
+        raise ValueError("OpenAI API returned an empty response")
+    
+    completion_text = response.choices[0].message.content.strip()
+    
+    # Extract usage information
     usage = {
-        "input_tokens": getattr(response.usage, "input_tokens", 0),
-        "output_tokens": getattr(response.usage, "output_tokens", 0),
-        "total_tokens": getattr(response.usage, "total_tokens", 0),
+        "input_tokens": response.usage.prompt_tokens,
+        "output_tokens": response.usage.completion_tokens,
+        "total_tokens": response.usage.total_tokens,
     }
     return completion_text, usage

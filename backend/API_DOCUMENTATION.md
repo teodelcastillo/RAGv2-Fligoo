@@ -291,7 +291,159 @@ curl -X GET "http://localhost/api/document/list/?chunking_status=done&is_public=
 
 ---
 
-### 4. Chat Sessions Endpoint
+### 4. Document Detail Endpoint
+
+Retrieve a single document by its slug.
+
+**Endpoint:** `GET /api/document/<slug>/`
+
+**Authentication:** Required (Token, Session, or Basic)
+
+**Example Request:**
+
+```bash
+curl -X GET "http://localhost/api/document/research-paper-2024/" \
+  -H "Authorization: Token YOUR_TOKEN_HERE"
+```
+
+**Response:** `200 OK`
+
+```json
+{
+  "slug": "research-paper-2024",
+  "name": "research-paper-2024",
+  "category": "research",
+  "description": "Annual research findings",
+  "file": "/media/documents/research-paper-2024.pdf",
+  "created_at": "2024-01-15T10:30:00Z",
+  "chunking_status": "done",
+  "chunking_done": true,
+  "is_public": false,
+  "owner_email": "user@example.com"
+}
+```
+
+**Error Responses:**
+
+- `401 Unauthorized` - Authentication required
+- `404 Not Found` - Document not found or user doesn't have access
+
+**Permission Rules:**
+- **Regular users:** Can only retrieve their own documents
+- **Staff users:** Can retrieve any document
+
+---
+
+### 5. Update Document Endpoint
+
+Update document metadata (name, category, description). Only superadmins can modify the `is_public` field.
+
+**Endpoint:** `PATCH /api/document/<slug>/` or `PUT /api/document/<slug>/`
+
+**Authentication:** Required (Token, Session, or Basic)
+
+**Request Body (JSON):**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `name` | string | No | Document name |
+| `category` | string | No | Document category |
+| `description` | string | No | Document description |
+| `is_public` | boolean | No | Public visibility (superadmins only) |
+
+**Example Request:**
+
+```bash
+# Update name and description
+curl -X PATCH "http://localhost/api/document/research-paper-2024/" \
+  -H "Authorization: Token YOUR_TOKEN_HERE" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "Updated Research Paper 2024",
+    "description": "Updated description with new findings"
+  }'
+
+# Superadmin updating is_public
+curl -X PATCH "http://localhost/api/document/research-paper-2024/" \
+  -H "Authorization: Token SUPERADMIN_TOKEN_HERE" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "is_public": true
+  }'
+```
+
+**Response:** `200 OK`
+
+```json
+{
+  "name": "Updated Research Paper 2024",
+  "category": "research",
+  "description": "Updated description with new findings",
+  "is_public": false
+}
+```
+
+**Error Responses:**
+
+- `400 Bad Request` - Validation error
+  ```json
+  {
+    "is_public": ["Only superadmins can modify the is_public field."]
+  }
+  ```
+
+- `401 Unauthorized` - Authentication required
+- `403 Forbidden` - User is not the owner of the document
+- `404 Not Found` - Document not found
+
+**Permission Rules:**
+- **Regular users:** Can only update their own documents (cannot modify `is_public`)
+- **Staff users:** Can update any document (cannot modify `is_public`)
+- **Superadmins:** Can update any document and modify `is_public` field
+
+**Notes:**
+- Use `PATCH` for partial updates (recommended)
+- Use `PUT` for full updates (all fields must be provided)
+- The `is_public` field is automatically ignored for non-superadmin users
+- Attempting to modify `is_public` as a non-superadmin will result in a validation error
+
+---
+
+### 6. Delete Document Endpoint
+
+Delete a document and all its associated chunks.
+
+**Endpoint:** `DELETE /api/document/<slug>/`
+
+**Authentication:** Required (Token, Session, or Basic)
+
+**Example Request:**
+
+```bash
+curl -X DELETE "http://localhost/api/document/research-paper-2024/" \
+  -H "Authorization: Token YOUR_TOKEN_HERE"
+```
+
+**Response:** `204 No Content` (empty response body)
+
+**Error Responses:**
+
+- `401 Unauthorized` - Authentication required
+- `403 Forbidden` - User is not the owner of the document
+- `404 Not Found` - Document not found
+
+**Permission Rules:**
+- **Regular users:** Can only delete their own documents
+- **Staff users:** Can delete any document
+
+**Notes:**
+- This operation is permanent and cannot be undone
+- All associated chunks will be deleted along with the document
+- The file will be removed from storage
+
+---
+
+### 7. Chat Sessions Endpoint
 
 Create and manage chat sessions that define which documents can be used as context.
 
@@ -348,7 +500,7 @@ curl -X POST "http://localhost/api/chat/sessions/" \
 
 ---
 
-### 5. Chat Messages Endpoint
+### 8. Chat Messages Endpoint
 
 Send a message within a session and receive the AI response enriched with document chunks.
 
@@ -466,7 +618,7 @@ curl -X POST "http://localhost/api/chat/messages/" \
 
 ---
 
-### 4. Evaluations API (nuevo)
+### 9. Evaluations API (nuevo)
 
 Centraliza la definición de pilares/KPIs, control de acceso y ejecución sobre proyectos.
 

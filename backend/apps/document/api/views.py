@@ -1,13 +1,19 @@
 from rest_framework.views import APIView
-from rest_framework.generics import CreateAPIView, ListAPIView
-from rest_framework import status
+from rest_framework.generics import CreateAPIView, ListAPIView, RetrieveUpdateDestroyAPIView
+from rest_framework import status, permissions
 from rest_framework.response import Response
 
 from django.db.models import Q
 
 from apps.document.models import SmartChunk, Document
 from apps.document.api.filters import DocumentFilter
-from apps.document.api.serializers import SmartChunkSerializer, DocumentSerializer,DocumentCreateSerializer
+from apps.document.api.serializers import (
+    SmartChunkSerializer, 
+    DocumentSerializer,
+    DocumentCreateSerializer,
+    DocumentDetailSerializer,
+    DocumentUpdateSerializer
+)
 
 
 class RAGQueryView(APIView):
@@ -73,3 +79,53 @@ class DocumentListAPIView(ListAPIView):
             qs = qs.filter(owner=user)
 
         return qs
+
+
+class DocumentAccessPermission(permissions.BasePermission):
+    """
+    Permission class for document access:
+    - Read: owner or staff users
+    - Write/Delete: only owner or staff users
+    """
+    
+    def has_object_permission(self, request, view, obj):
+        # Staff users have full access
+        if request.user.is_staff:
+            return True
+        
+        # For safe methods (GET, HEAD, OPTIONS), allow if user is owner
+        if request.method in permissions.SAFE_METHODS:
+            return obj.owner == request.user
+        
+        # For write/delete methods, only owner can access
+        return obj.owner == request.user
+
+
+class DocumentDetailAPIView(RetrieveUpdateDestroyAPIView):
+    """
+    Retrieve, update, or delete a document instance.
+    """
+    queryset = Document.objects.all()
+    permission_classes = [permissions.IsAuthenticated, DocumentAccessPermission]
+    lookup_field = 'slug'
+    lookup_url_kwarg = 'slug'
+    
+    def get_serializer_class(self):
+        """Use different serializers for different operations"""
+        if self.request.method == 'GET':
+            return DocumentDetailSerializer
+        elif self.request.method in ['PUT', 'PATCH']:
+            return DocumentUpdateSerializer
+        return DocumentSerializer
+    
+    def get_queryset(self):
+        """Filter queryset based on user permissions"""
+        qs = Document.objects.all()
+        user = self.request.user
+        if not user.is_staff:
+            qs = qs.filter(owner=user)
+        return qs
+    
+    def perform_destroy(self, instance):
+        """Delete the document instance"""
+        instance.delete()

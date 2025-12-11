@@ -136,10 +136,25 @@ class ChatMessageViewSet(
                     temperature=session.temperature,
                 )
             except Exception as exc:  # pragma: no cover - network failure
-                logger.exception("Error al generar respuesta de OpenAI: %s", exc)
-                raise APIException(
-                    "No fue posible generar la respuesta en este momento."
-                ) from exc
+                error_msg = str(exc)
+                logger.exception("Error al generar respuesta de OpenAI: %s", error_msg)
+                # Provide more specific error messages for common issues
+                if "api_key" in error_msg.lower() or "authentication" in error_msg.lower():
+                    raise APIException(
+                        "Error de autenticación con OpenAI. Verifica la configuración de la API key."
+                    ) from exc
+                elif "rate limit" in error_msg.lower() or "quota" in error_msg.lower():
+                    raise APIException(
+                        "Límite de tasa excedido. Por favor, intenta de nuevo en unos momentos."
+                    ) from exc
+                elif "model" in error_msg.lower():
+                    raise APIException(
+                        f"Error con el modelo de OpenAI: {error_msg}"
+                    ) from exc
+                else:
+                    raise APIException(
+                        f"No fue posible generar la respuesta en este momento: {error_msg}"
+                    ) from exc
 
             chunk_ids = [chunk.id for chunk in chunks]
             assistant_message = ChatMessage.objects.create(

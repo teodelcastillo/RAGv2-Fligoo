@@ -1,18 +1,24 @@
 from rest_framework.views import APIView
-from rest_framework.generics import CreateAPIView, ListAPIView, RetrieveUpdateDestroyAPIView
+from rest_framework.generics import CreateAPIView, ListAPIView
 from rest_framework import status, permissions
 from rest_framework.response import Response
+from rest_framework.decorators import action
+from rest_framework.exceptions import PermissionDenied
+from rest_framework import viewsets, mixins
+from django.shortcuts import get_object_or_404
 
 from django.db.models import Q
 
-from apps.document.models import SmartChunk, Document
+from apps.document.models import SmartChunk, Document, DocumentShare
 from apps.document.api.filters import DocumentFilter
 from apps.document.api.serializers import (
     SmartChunkSerializer, 
     DocumentSerializer,
     DocumentCreateSerializer,
     DocumentDetailSerializer,
-    DocumentUpdateSerializer
+    DocumentUpdateSerializer,
+    DocumentShareSerializer,
+    DocumentShareWriteSerializer,
 )
 
 
@@ -27,9 +33,17 @@ class RAGQueryView(APIView):
         if user.is_staff:
             qs = SmartChunk.objects.all()
         else:
+            # Incluir chunks de documentos propios, públicos, compartidos y de proyectos compartidos
+            from apps.project.models import ProjectShare
+            shared_project_ids = ProjectShare.objects.filter(
+                user=user
+            ).values_list('project_id', flat=True)
             qs = SmartChunk.objects.filter(
-                Q(document__owner=user) | Q(document__is_public=True)
-            )
+                Q(document__owner=user) 
+                | Q(document__is_public=True) 
+                | Q(document__shares__user=user)
+                | Q(document__projects__id__in=shared_project_ids)
+            ).distinct()
 
         slugs = request.query_params.getlist("documents")
         if slugs:
@@ -75,8 +89,39 @@ class DocumentListAPIView(ListAPIView):
     def get_queryset(self):
         qs = Document.objects.all()
         user = self.request.user
-        if not user.is_staff:
-            qs = qs.filter(owner=user)
+        scope = self.request.query_params.get('scope', 'all')  # 'all', 'own', 'public', 'shared'
+        
+        if user.is_staff:
+            # Staff puede ver todos, pero puede filtrar por scope
+            if scope == 'own':
+                qs = qs.filter(owner=user)
+            elif scope == 'public':
+                qs = qs.filter(is_public=True)
+            elif scope == 'shared':
+                # Documentos compartidos con el usuario (excluyendo los propios)
+                qs = qs.filter(shares__user=user).exclude(owner=user).distinct()
+            # Si scope == 'all', no filtrar (ver todos)
+        else:
+            # Usuarios no-staff: pueden ver sus propios documentos, los públicos y los compartidos
+            if scope == 'own':
+                qs = qs.filter(owner=user)
+            elif scope == 'public':
+                qs = qs.filter(is_public=True)
+            elif scope == 'shared':
+                # Documentos compartidos con el usuario (excluyendo los propios)
+                qs = qs.filter(shares__user=user).exclude(owner=user).distinct()
+            else:  # scope == 'all'
+                # Incluir documentos propios, públicos, compartidos y de proyectos compartidos
+                from apps.project.models import ProjectShare
+                shared_project_ids = ProjectShare.objects.filter(
+                    user=user
+                ).values_list('project_id', flat=True)
+                qs = qs.filter(
+                    Q(owner=user) 
+                    | Q(is_public=True) 
+                    | Q(shares__user=user)
+                    | Q(projects__id__in=shared_project_ids)
+                ).distinct()
 
         return qs
 
@@ -84,8 +129,8 @@ class DocumentListAPIView(ListAPIView):
 class DocumentAccessPermission(permissions.BasePermission):
     """
     Permission class for document access:
-    - Read: owner or staff users
-    - Write/Delete: only owner or staff users
+    - Read: owner, staff users, public documents, shared documents, or documents in shared projects
+    - Write/Delete: owner, staff, or editor role in share (for public docs, only superuser)
     """
     
     def has_object_permission(self, request, view, obj):
@@ -93,17 +138,32 @@ class DocumentAccessPermission(permissions.BasePermission):
         if request.user.is_staff:
             return True
         
-        # For safe methods (GET, HEAD, OPTIONS), allow if user is owner
+        # For safe methods (GET, HEAD, OPTIONS)
         if request.method in permissions.SAFE_METHODS:
-            return obj.owner == request.user
+            return obj.can_view(request.user)
         
-        # For write/delete methods, only owner can access
-        return obj.owner == request.user
+        # For write/delete methods
+        # - If document is public, only superuser can modify/delete
+        if obj.is_public:
+            return request.user.is_superuser
+        
+        # Owner can always modify/delete
+        if obj.owner == request.user:
+            return True
+        
+        # Check if user has editor role in share
+        return obj.can_edit(request.user)
 
 
-class DocumentDetailAPIView(RetrieveUpdateDestroyAPIView):
+class DocumentViewSet(
+    mixins.RetrieveModelMixin,
+    mixins.UpdateModelMixin,
+    mixins.DestroyModelMixin,
+    viewsets.GenericViewSet,
+):
     """
-    Retrieve, update, or delete a document instance.
+    ViewSet for retrieving, updating, and deleting document instances.
+    Also handles sharing functionality.
     """
     queryset = Document.objects.all()
     permission_classes = [permissions.IsAuthenticated, DocumentAccessPermission]
@@ -112,9 +172,9 @@ class DocumentDetailAPIView(RetrieveUpdateDestroyAPIView):
     
     def get_serializer_class(self):
         """Use different serializers for different operations"""
-        if self.request.method == 'GET':
+        if self.action == 'retrieve':
             return DocumentDetailSerializer
-        elif self.request.method in ['PUT', 'PATCH']:
+        elif self.action in ['update', 'partial_update']:
             return DocumentUpdateSerializer
         return DocumentSerializer
     
@@ -123,9 +183,79 @@ class DocumentDetailAPIView(RetrieveUpdateDestroyAPIView):
         qs = Document.objects.all()
         user = self.request.user
         if not user.is_staff:
-            qs = qs.filter(owner=user)
+            # Incluir documentos propios, públicos, compartidos y de proyectos compartidos
+            from apps.project.models import ProjectShare
+            shared_project_ids = ProjectShare.objects.filter(
+                user=user
+            ).values_list('project_id', flat=True)
+            qs = qs.filter(
+                Q(owner=user) 
+                | Q(is_public=True) 
+                | Q(shares__user=user)
+                | Q(projects__id__in=shared_project_ids)
+            ).distinct()
         return qs
     
     def perform_destroy(self, instance):
         """Delete the document instance"""
         instance.delete()
+    
+    @action(
+        detail=True,
+        methods=["get", "post"],
+        url_path="shares",
+        url_name="shares",
+    )
+    def shares(self, request, slug=None):
+        """List or create document shares"""
+        document = self.get_object()
+        if not document.can_manage_shares(request.user):
+            raise PermissionDenied("No puedes administrar los permisos de este documento.")
+        
+        if request.method == "GET":
+            serializer = DocumentShareSerializer(
+                document.shares.select_related("user"),
+                many=True,
+            )
+            return Response(serializer.data)
+        
+        serializer = DocumentShareWriteSerializer(
+            data=request.data,
+            context={"document": document, "request": request},
+        )
+        serializer.is_valid(raise_exception=True)
+        share, created = DocumentShare.objects.update_or_create(
+            document=document,
+            user=serializer.validated_data["user"],
+            defaults={"role": serializer.validated_data["role"]},
+        )
+        output = DocumentShareSerializer(share)
+        status_code = status.HTTP_201_CREATED if created else status.HTTP_200_OK
+        return Response(output.data, status=status_code)
+    
+    @action(
+        detail=True,
+        methods=["patch", "delete"],
+        url_path=r"shares/(?P<share_id>[^/]+)",
+        url_name="share-detail",
+    )
+    def manage_share(self, request, slug=None, share_id=None):
+        """Update or delete a document share"""
+        document = self.get_object()
+        if not document.can_manage_shares(request.user):
+            raise PermissionDenied("No puedes administrar los permisos de este documento.")
+        
+        share = get_object_or_404(DocumentShare, document=document, pk=share_id)
+        
+        if request.method == "PATCH":
+            serializer = DocumentShareWriteSerializer(
+                data=request.data,
+                context={"document": document, "request": request},
+            )
+            serializer.is_valid(raise_exception=True)
+            share.role = serializer.validated_data["role"]
+            share.save(update_fields=["role"])
+            return Response(DocumentShareSerializer(share).data)
+        
+        share.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)

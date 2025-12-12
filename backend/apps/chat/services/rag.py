@@ -31,7 +31,17 @@ def fetch_relevant_chunks(
 
     qs = SmartChunk.objects.filter(document_id__in=doc_ids)
     if not user.is_staff:
-        qs = qs.filter(Q(document__owner=user) | Q(document__is_public=True))
+        # Incluir chunks de documentos propios, públicos, compartidos y de proyectos compartidos
+        from apps.project.models import ProjectShare
+        shared_project_ids = ProjectShare.objects.filter(
+            user=user
+        ).values_list('project_id', flat=True)
+        qs = qs.filter(
+            Q(document__owner=user) 
+            | Q(document__is_public=True) 
+            | Q(document__shares__user=user)
+            | Q(document__projects__id__in=shared_project_ids)
+        ).distinct()
 
     return list(qs.top_similar(query_text, top_n=top_n))
 

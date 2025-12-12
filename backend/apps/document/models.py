@@ -4,6 +4,7 @@ from django.db.models import QuerySet
 from django.utils.text import slugify
 from django.db.models import Func, F, TextField, GeneratedField, Q
 from django.db.models.functions import Lower
+from django.utils.translation import gettext_lazy as _
 
 from pgvector.django import VectorField, CosineDistance
 from django.contrib.postgres.fields import ArrayField
@@ -56,6 +57,26 @@ class Document(models.Model):
             self.slug = slug
 
         super().save(*args, **kwargs)
+
+    def can_view(self, user) -> bool:
+        """Verifica si el usuario puede ver el documento"""
+        if user.is_staff or self.owner_id == user.id:
+            return True
+        if self.is_public:
+            return True
+        return self.shares.filter(user=user).exists()
+
+    def can_edit(self, user) -> bool:
+        """Verifica si el usuario puede editar el documento"""
+        if user.is_staff or self.owner_id == user.id:
+            return True
+        return self.shares.filter(
+            user=user, role=DocumentShareRole.EDITOR
+        ).exists()
+
+    def can_manage_shares(self, user) -> bool:
+        """Verifica si el usuario puede gestionar los shares del documento"""
+        return user.is_staff or self.owner_id == user.id
 
     def __str__(self):
         return f'{self.id}-{self.name}'
@@ -139,3 +160,34 @@ class SmartChunk(models.Model):
     objects = SmartChunkManager()
     def __str__(self):
         return f"{self.id}-{self.document.name}"
+
+
+class DocumentShareRole(models.TextChoices):
+    VIEWER = "viewer", _("Viewer")
+    EDITOR = "editor", _("Editor")
+
+
+class DocumentShare(models.Model):
+    document = models.ForeignKey(
+        Document,
+        related_name="shares",
+        on_delete=models.CASCADE,
+    )
+    user = models.ForeignKey(
+        User,
+        related_name="document_shares",
+        on_delete=models.CASCADE,
+    )
+    role = models.CharField(
+        max_length=20,
+        choices=DocumentShareRole.choices,
+        default=DocumentShareRole.VIEWER,
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        unique_together = ("document", "user")
+        ordering = ("document", "user")
+
+    def __str__(self):
+        return f"{self.document_id}-{self.user_id}-{self.role}"

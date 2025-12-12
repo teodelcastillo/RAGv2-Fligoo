@@ -1,5 +1,8 @@
 from rest_framework import serializers
-from apps.document.models import SmartChunk, Document
+from django.contrib.auth import get_user_model
+from apps.document.models import SmartChunk, Document, DocumentShare, DocumentShareRole
+
+User = get_user_model()
 
 class SmartChunkSerializer(serializers.ModelSerializer):
     class Meta:
@@ -33,6 +36,10 @@ class DocumentCreateSerializer(serializers.ModelSerializer):
 
 class DocumentSerializer(serializers.ModelSerializer):
     """Serializer for listing documents - read-only fields"""
+    is_public = serializers.BooleanField(read_only=True)
+    is_owner = serializers.SerializerMethodField()
+    owner_email = serializers.EmailField(source='owner.email', read_only=True)
+    
     class Meta:
         model = Document
         fields = [
@@ -40,7 +47,11 @@ class DocumentSerializer(serializers.ModelSerializer):
             'name',
             'category',
             'description',
-            'file'
+            'file',
+            'is_public',
+            'is_owner',
+            'owner_email',
+            'created_at',
         ]
         read_only_fields = [
             'slug',
@@ -57,6 +68,13 @@ class DocumentSerializer(serializers.ModelSerializer):
             'category',
             'description',
         ]
+    
+    def get_is_owner(self, obj):
+        """Indica si el usuario actual es el propietario del documento"""
+        request = self.context.get('request')
+        if request and hasattr(request, 'user'):
+            return obj.owner == request.user
+        return False
 
 
 class DocumentDetailSerializer(serializers.ModelSerializer):
@@ -119,3 +137,29 @@ class DocumentUpdateSerializer(serializers.ModelSerializer):
                 validated_data.pop('is_public')
         
         return super().update(instance, validated_data)
+
+
+class DocumentShareSerializer(serializers.ModelSerializer):
+    """Serializer for reading document shares"""
+    user_email = serializers.EmailField(source="user.email", read_only=True)
+    
+    class Meta:
+        model = DocumentShare
+        fields = ("id", "user", "user_email", "role", "created_at")
+        read_only_fields = ("id", "user_email", "created_at")
+
+
+class DocumentShareWriteSerializer(serializers.Serializer):
+    """Serializer for creating/updating document shares"""
+    user = serializers.PrimaryKeyRelatedField(
+        queryset=User.objects.all()
+    )
+    role = serializers.ChoiceField(choices=DocumentShareRole.choices)
+    
+    def validate_user(self, value):
+        document = self.context.get("document")
+        if document and document.owner == value:
+            raise serializers.ValidationError(
+                "El propietario del documento no puede ser compartido."
+            )
+        return value

@@ -802,6 +802,300 @@ AUTH_COOKIE_MAX_AGE=604800
 - Asegurar que el dominio coincide con el dominio de la aplicación
 - Verificar que `Secure=true` solo en HTTPS
 
+## Cliente API Centralizado para Todas las Apps
+
+### ¿Necesito un token diferente para cada app?
+
+**NO.** Todas las apps de tu API (`/api/auth/`, `/api/document/`, `/api/chat/`, `/api/projects/`, `/api/evaluations/`) comparten el mismo sistema de autenticación JWT. Usa el **mismo access token** para todas las llamadas.
+
+### ¿Necesito variables de entorno separadas para cada módulo?
+
+**NO.** Solo necesitas una variable de entorno para la URL base de la API. Todas las apps están bajo el mismo dominio:
+
+```bash
+# En Vercel: Settings → Environment Variables
+NEXT_PUBLIC_API_URL=https://api.ecofilia.site
+```
+
+### Cliente API Centralizado
+
+Crea un cliente API que maneje automáticamente el token para todas las apps:
+
+**`lib/api/client.ts`**
+
+```typescript
+import { getSession } from '@/lib/auth/auth-service';
+
+const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'https://api.ecofilia.site';
+
+interface RequestOptions extends RequestInit {
+  requireAuth?: boolean;
+}
+
+/**
+ * Cliente API centralizado que maneja automáticamente:
+ * - Autenticación con access token
+ * - Refresh automático si el token expira
+ * - Manejo de errores
+ */
+export async function apiClient(
+  endpoint: string,
+  options: RequestOptions = {}
+): Promise<Response> {
+  const { requireAuth = true, headers = {}, ...fetchOptions } = options;
+
+  // Construir URL completa
+  const url = endpoint.startsWith('http')
+    ? endpoint
+    : `${API_BASE_URL}${endpoint.startsWith('/') ? endpoint : `/${endpoint}`}`;
+
+  // Headers por defecto
+  const defaultHeaders: HeadersInit = {
+    'Content-Type': 'application/json',
+    ...headers,
+  };
+
+  // Agregar token de autenticación si es requerido
+  if (requireAuth) {
+    try {
+      const session = await getSession();
+      if (session?.access) {
+        defaultHeaders['Authorization'] = `Bearer ${session.access}`;
+      }
+    } catch (error) {
+      console.error('Error obteniendo sesión:', error);
+      // Si no hay sesión, la llamada fallará con 401 y el cliente puede manejar
+    }
+  }
+
+  // Realizar petición
+  const response = await fetch(url, {
+    ...fetchOptions,
+    headers: defaultHeaders,
+  });
+
+  // Si el token expiró, intentar refresh y reintentar
+  if (response.status === 401 && requireAuth) {
+    try {
+      const { refreshTokens } = await import('@/lib/auth/auth-service');
+      await refreshTokens();
+      
+      // Reintentar con nuevo token
+      const session = await getSession();
+      if (session?.access) {
+        defaultHeaders['Authorization'] = `Bearer ${session.access}`;
+        return fetch(url, {
+          ...fetchOptions,
+          headers: defaultHeaders,
+        });
+      }
+    } catch (refreshError) {
+      console.error('Error refrescando token:', refreshError);
+      // Si el refresh falla, redirigir a login
+      if (typeof window !== 'undefined') {
+        window.location.href = '/auth/login';
+      }
+    }
+  }
+
+  return response;
+}
+
+/**
+ * Helpers para métodos HTTP comunes
+ */
+export const api = {
+  get: (endpoint: string, options?: RequestOptions) =>
+    apiClient(endpoint, { ...options, method: 'GET' }),
+
+  post: (endpoint: string, data?: unknown, options?: RequestOptions) =>
+    apiClient(endpoint, {
+      ...options,
+      method: 'POST',
+      body: data ? JSON.stringify(data) : undefined,
+    }),
+
+  patch: (endpoint: string, data?: unknown, options?: RequestOptions) =>
+    apiClient(endpoint, {
+      ...options,
+      method: 'PATCH',
+      body: data ? JSON.stringify(data) : undefined,
+    }),
+
+  put: (endpoint: string, data?: unknown, options?: RequestOptions) =>
+    apiClient(endpoint, {
+      ...options,
+      method: 'PUT',
+      body: data ? JSON.stringify(data) : undefined,
+    }),
+
+  delete: (endpoint: string, options?: RequestOptions) =>
+    apiClient(endpoint, { ...options, method: 'DELETE' }),
+};
+```
+
+### Uso del Cliente API
+
+**Ejemplo: Llamar a diferentes apps**
+
+```typescript
+// app/documentos/page.tsx
+import { api } from '@/lib/api/client';
+
+// Llamar a /api/document/list/
+async function getDocuments() {
+  const response = await api.get('/api/document/list/');
+  if (!response.ok) throw new Error('Error al obtener documentos');
+  return response.json();
+}
+
+// Llamar a /api/chat/sessions/
+async function getChatSessions() {
+  const response = await api.get('/api/chat/sessions/');
+  if (!response.ok) throw new Error('Error al obtener sesiones');
+  return response.json();
+}
+
+// Llamar a /api/projects/
+async function getProjects() {
+  const response = await api.get('/api/projects/');
+  if (!response.ok) throw new Error('Error al obtener proyectos');
+  return response.json();
+}
+
+// Llamar a /api/evaluations/
+async function getEvaluations() {
+  const response = await api.get('/api/evaluations/');
+  if (!response.ok) throw new Error('Error al obtener evaluaciones');
+  return response.json();
+}
+
+// Crear un documento
+async function createDocument(file: File) {
+  const formData = new FormData();
+  formData.append('file', file);
+  
+  const response = await api.post('/api/document/create/', formData, {
+    headers: {}, // No incluir Content-Type, el navegador lo hará con FormData
+  });
+  
+  if (!response.ok) throw new Error('Error al crear documento');
+  return response.json();
+}
+```
+
+### Cliente para Server Components (SSR)
+
+Para usar en Server Components, crea una versión que use cookies directamente:
+
+**`lib/api/server-client.ts`**
+
+```typescript
+import { cookies } from 'next/headers';
+import { getRefreshCookie } from '@/lib/auth/cookie-utils';
+
+const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'https://api.ecofilia.site';
+
+/**
+ * Cliente API para Server Components
+ * Obtiene el access token desde la sesión del servidor
+ */
+export async function serverApiClient(
+  endpoint: string,
+  options: RequestInit = {}
+): Promise<Response> {
+  const url = endpoint.startsWith('http')
+    ? endpoint
+    : `${API_BASE_URL}${endpoint.startsWith('/') ? endpoint : `/${endpoint}`}`;
+
+  const headers: HeadersInit = {
+    'Content-Type': 'application/json',
+    ...options.headers,
+  };
+
+  // Obtener access token desde la sesión
+  try {
+    const { getSession } = await import('@/lib/auth/auth-service');
+    const session = await getSession();
+    if (session?.access) {
+      headers['Authorization'] = `Bearer ${session.access}`;
+    }
+  } catch (error) {
+    console.error('Error obteniendo sesión en servidor:', error);
+  }
+
+  return fetch(url, {
+    ...options,
+    headers,
+  });
+}
+
+export const serverApi = {
+  get: (endpoint: string, options?: RequestInit) =>
+    serverApiClient(endpoint, { ...options, method: 'GET' }),
+
+  post: (endpoint: string, data?: unknown, options?: RequestInit) =>
+    serverApiClient(endpoint, {
+      ...options,
+      method: 'POST',
+      body: data ? JSON.stringify(data) : undefined,
+    }),
+
+  patch: (endpoint: string, data?: unknown, options?: RequestInit) =>
+    serverApiClient(endpoint, {
+      ...options,
+      method: 'PATCH',
+      body: data ? JSON.stringify(data) : undefined,
+    }),
+
+  delete: (endpoint: string, options?: RequestInit) =>
+    serverApiClient(endpoint, { ...options, method: 'DELETE' }),
+};
+```
+
+**Uso en Server Component:**
+
+```typescript
+// app/documentos/page.tsx
+import { serverApi } from '@/lib/api/server-client';
+
+export default async function DocumentosPage() {
+  const response = await serverApi.get('/api/document/list/');
+  const documents = await response.json();
+
+  return (
+    <div>
+      {documents.map((doc: any) => (
+        <div key={doc.id}>{doc.title}</div>
+      ))}
+    </div>
+  );
+}
+```
+
+### Resumen: Configuración en Vercel
+
+**Variables de Entorno en Vercel (Settings → Environment Variables):**
+
+```bash
+# Solo necesitas estas variables:
+NEXT_PUBLIC_API_URL=https://api.ecofilia.site
+NEXT_PUBLIC_BACKEND_URL=https://api.ecofilia.site  # Puede ser la misma que API_URL
+AUTH_COOKIE_DOMAIN=.ecofilia.site
+AUTH_COOKIE_NAME=ecofilia_refresh
+AUTH_COOKIE_MAX_AGE=604800
+```
+
+**NO necesitas:**
+- ❌ `NEXT_PUBLIC_DOCUMENT_API_URL`
+- ❌ `NEXT_PUBLIC_CHAT_API_URL`
+- ❌ `NEXT_PUBLIC_PROJECTS_API_URL`
+- ❌ Variables separadas para cada módulo
+
+**Sí necesitas:**
+- ✅ Una sola `NEXT_PUBLIC_API_URL` que apunta a `https://api.ecofilia.site`
+- ✅ El cliente API construye las URLs completas: `${API_URL}/api/document/...`, `${API_URL}/api/chat/...`, etc.
+
 ## Conclusión
 
 Esta implementación:
@@ -811,7 +1105,10 @@ Esta implementación:
 - ✅ Funciona en SSR y cliente
 - ✅ Es segura (cookies HTTP-only)
 - ✅ Maneja errores apropiadamente
+- ✅ **Usa un solo token para todas las apps de la API**
+- ✅ **Requiere solo una variable de entorno para la URL base**
 
 ¡Lista para producción! 🚀
+
 
 

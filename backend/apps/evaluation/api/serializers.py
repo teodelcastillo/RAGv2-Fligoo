@@ -289,19 +289,28 @@ class EvaluationShareSerializer(serializers.ModelSerializer):
 
 
 class EvaluationShareWriteSerializer(serializers.Serializer):
-    user_id = serializers.PrimaryKeyRelatedField(
-        source="user",
-        queryset=User.objects.all(),
-    )
+    user_email = serializers.EmailField()
     role = serializers.ChoiceField(choices=EvaluationShareRole.choices)
 
-    def validate_user(self, user):
-        evaluation = self.context["evaluation"]
-        if user == evaluation.owner:
-            raise serializers.ValidationError(
-                "No puedes compartir la evaluación contigo mismo."
-            )
-        return user
+    def validate(self, attrs):
+        """Valida el email y obtiene el usuario"""
+        email = attrs.get('user_email')
+        try:
+            user = User.objects.get(email=email)
+        except User.DoesNotExist:
+            raise serializers.ValidationError({
+                'user_email': f"No existe un usuario con el email: {email}"
+            })
+        
+        evaluation = self.context.get("evaluation")
+        if evaluation and user == evaluation.owner:
+            raise serializers.ValidationError({
+                'user_email': "No puedes compartir la evaluación contigo mismo."
+            })
+        
+        # Reemplazar user_email con user para que la vista lo use
+        attrs['user'] = user
+        return attrs
 
 
 class MetricEvaluationResultSerializer(serializers.ModelSerializer):

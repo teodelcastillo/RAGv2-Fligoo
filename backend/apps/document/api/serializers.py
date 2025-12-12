@@ -34,6 +34,30 @@ class DocumentCreateSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError("File is required.")
         return value
 
+
+class DocumentBulkCreateSerializer(serializers.Serializer):
+    """Serializer for bulk document upload - accepts multiple files"""
+    files = serializers.ListField(
+        child=serializers.FileField(required=True, allow_null=False, allow_empty_file=False),
+        required=True,
+        min_length=1,
+        max_length=100,  # Limitar a 100 archivos por request para evitar sobrecarga
+    )
+    
+    def validate_files(self, value):
+        """Validate that at least one file is provided and not empty."""
+        if not value or len(value) == 0:
+            raise serializers.ValidationError("At least one file is required.")
+        
+        # Validar que ningún archivo esté vacío
+        for file in value:
+            if not file:
+                raise serializers.ValidationError("All files must be provided and not empty.")
+            if file.size == 0:
+                raise serializers.ValidationError("Files cannot be empty.")
+        
+        return value
+
 class DocumentSerializer(serializers.ModelSerializer):
     """Serializer for listing documents - read-only fields"""
     is_public = serializers.BooleanField(read_only=True)

@@ -4,6 +4,7 @@ from rest_framework.routers import DefaultRouter
 from apps.document.api.views import (
     RAGQueryView, 
     DocumentCreateAPIView,
+    DocumentBulkCreateAPIView,
     DocumentListAPIView,
     DocumentViewSet,
 )
@@ -14,6 +15,7 @@ router.register(r'', DocumentViewSet, basename='document')
 urlpatterns = [
     path("rag/", RAGQueryView.as_view(), name="rag-query"),
     path('create/', DocumentCreateAPIView.as_view(), name='documentcreate'),
+    path('create/bulk/', DocumentBulkCreateAPIView.as_view(), name='documentbulkcreate'),
     path('list/', DocumentListAPIView.as_view(), name='documentlist'),
     path('', include(router.urls)),
 ]

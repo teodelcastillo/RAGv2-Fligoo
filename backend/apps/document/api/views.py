@@ -15,6 +15,7 @@ from apps.document.api.serializers import (
     SmartChunkSerializer, 
     DocumentSerializer,
     DocumentCreateSerializer,
+    DocumentBulkCreateSerializer,
     DocumentDetailSerializer,
     DocumentUpdateSerializer,
     DocumentShareSerializer,
@@ -79,6 +80,78 @@ class DocumentCreateAPIView(CreateAPIView):
 
         response_serializer = DocumentSerializer(document, context=self.get_serializer_context())
         return Response(response_serializer.data, status=status.HTTP_201_CREATED)
+
+
+class DocumentBulkCreateAPIView(APIView):
+    """
+    API View for bulk document upload.
+    Accepts multiple files and creates a document for each one.
+    """
+    permission_classes = [permissions.IsAuthenticated]
+    
+    def post(self, request, *args, **kwargs):
+        """
+        Create multiple documents from multiple files.
+        
+        Expected format: multipart/form-data with multiple 'files' fields
+        Example: files[]=file1.pdf&files[]=file2.pdf
+        """
+        # Handle both 'files' as a list and 'files[]' format
+        files = request.FILES.getlist('files') or request.FILES.getlist('files[]')
+        
+        if not files:
+            return Response(
+                {"error": "No files provided. Use 'files' or 'files[]' field(s)."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Validate files using serializer
+        serializer = DocumentBulkCreateSerializer(data={'files': files})
+        serializer.is_valid(raise_exception=True)
+        validated_files = serializer.validated_data['files']
+        
+        created_documents = []
+        errors = []
+        
+        # Create a document for each file
+        for index, file in enumerate(validated_files):
+            try:
+                # Create document using the same logic as single upload
+                document = Document.objects.create(
+                    owner=request.user,
+                    file=file
+                )
+                created_documents.append(document)
+            except Exception as e:
+                errors.append({
+                    'file_index': index,
+                    'filename': file.name if hasattr(file, 'name') else 'unknown',
+                    'error': str(e)
+                })
+        
+        # Serialize created documents
+        response_serializer = DocumentSerializer(
+            created_documents,
+            many=True,
+            context=self.get_serializer_context()
+        )
+        
+        response_data = {
+            'created': len(created_documents),
+            'failed': len(errors),
+            'documents': response_serializer.data
+        }
+        
+        if errors:
+            response_data['errors'] = errors
+        
+        # Return 201 if all succeeded, 207 (Multi-Status) if some failed, 400 if all failed
+        if len(errors) == 0:
+            return Response(response_data, status=status.HTTP_201_CREATED)
+        elif len(created_documents) > 0:
+            return Response(response_data, status=status.HTTP_207_MULTI_STATUS)
+        else:
+            return Response(response_data, status=status.HTTP_400_BAD_REQUEST)
     
 
 class DocumentListAPIView(ListAPIView):

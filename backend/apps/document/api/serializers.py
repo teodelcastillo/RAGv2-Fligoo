@@ -21,17 +21,35 @@ class SmartChunkSerializer(serializers.ModelSerializer):
 
 class DocumentCreateSerializer(serializers.ModelSerializer):
     file = serializers.FileField(required=True, allow_null=False, allow_empty_file=False)
+    name = serializers.CharField(required=False, allow_blank=True, max_length=255)
+    category = serializers.CharField(required=False, allow_blank=True, allow_null=True, max_length=255)
+    description = serializers.CharField(required=False, allow_blank=True)
+    is_public = serializers.BooleanField(required=False, default=False)
     
     class Meta:
         model = Document
         fields = [
-            'file'
+            'file',
+            'name',
+            'category',
+            'description',
+            'is_public',
         ]
     
     def validate_file(self, value):
         """Ensure the file is provided and not empty."""
         if not value:
             raise serializers.ValidationError("File is required.")
+        return value
+    
+    def validate_is_public(self, value):
+        """Only superusers can set is_public field"""
+        request = self.context.get('request')
+        if request and hasattr(request, 'user'):
+            if value and not request.user.is_superuser:
+                raise serializers.ValidationError(
+                    "Only superadmins can set the is_public field."
+                )
         return value
 
 
@@ -43,6 +61,10 @@ class DocumentBulkCreateSerializer(serializers.Serializer):
         min_length=1,
         max_length=100,  # Limitar a 100 archivos por request para evitar sobrecarga
     )
+    name = serializers.CharField(required=False, allow_blank=True, max_length=255)
+    category = serializers.CharField(required=False, allow_blank=True, allow_null=True, max_length=255)
+    description = serializers.CharField(required=False, allow_blank=True)
+    is_public = serializers.BooleanField(required=False, default=False)
     
     def validate_files(self, value):
         """Validate that at least one file is provided and not empty."""
@@ -56,6 +78,16 @@ class DocumentBulkCreateSerializer(serializers.Serializer):
             if file.size == 0:
                 raise serializers.ValidationError("Files cannot be empty.")
         
+        return value
+    
+    def validate_is_public(self, value):
+        """Only superusers can set is_public field"""
+        request = self.context.get('request')
+        if request and hasattr(request, 'user'):
+            if value and not request.user.is_superuser:
+                raise serializers.ValidationError(
+                    "Only superadmins can set the is_public field."
+                )
         return value
 
 class DocumentSerializer(serializers.ModelSerializer):

@@ -95,6 +95,7 @@ class DocumentBulkCreateAPIView(APIView):
         
         Expected format: multipart/form-data with multiple 'files' fields
         Example: files[]=file1.pdf&files[]=file2.pdf
+        Also accepts: name, category, description, is_public (applied to all documents)
         """
         # Handle both 'files' as a list and 'files[]' format
         files = request.FILES.getlist('files') or request.FILES.getlist('files[]')
@@ -105,10 +106,38 @@ class DocumentBulkCreateAPIView(APIView):
                 status=status.HTTP_400_BAD_REQUEST
             )
         
-        # Validate files using serializer
-        serializer = DocumentBulkCreateSerializer(data={'files': files})
+        # Prepare data for serializer validation
+        data = {'files': files}
+        
+        # Add optional properties if provided
+        if 'name' in request.data:
+            data['name'] = request.data['name']
+        if 'category' in request.data:
+            data['category'] = request.data['category']
+        if 'description' in request.data:
+            data['description'] = request.data['description']
+        if 'is_public' in request.data:
+            data['is_public'] = request.data['is_public']
+        
+        # Validate using serializer
+        serializer = DocumentBulkCreateSerializer(
+            data=data,
+            context={'request': request}
+        )
         serializer.is_valid(raise_exception=True)
-        validated_files = serializer.validated_data['files']
+        validated_data = serializer.validated_data
+        validated_files = validated_data['files']
+        
+        # Extract properties to apply to all documents
+        document_props = {}
+        if 'name' in validated_data:
+            document_props['name'] = validated_data['name']
+        if 'category' in validated_data:
+            document_props['category'] = validated_data['category']
+        if 'description' in validated_data:
+            document_props['description'] = validated_data['description']
+        if 'is_public' in validated_data:
+            document_props['is_public'] = validated_data['is_public']
         
         created_documents = []
         errors = []
@@ -116,10 +145,11 @@ class DocumentBulkCreateAPIView(APIView):
         # Create a document for each file
         for index, file in enumerate(validated_files):
             try:
-                # Create document using the same logic as single upload
+                # Create document with user-provided properties
                 document = Document.objects.create(
                     owner=request.user,
-                    file=file
+                    file=file,
+                    **document_props
                 )
                 created_documents.append(document)
             except Exception as e:

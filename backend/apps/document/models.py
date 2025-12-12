@@ -42,6 +42,7 @@ class Document(models.Model):
     is_public = models.BooleanField(default=False)
 
     def save(self, *args, **kwargs):
+        # Si no hay name ni slug, generar ambos desde el nombre del archivo
         if not self.name and not self.slug:
             name = os.path.basename(self.file.name)
             name = os.path.splitext(name)[0] 
@@ -55,6 +56,22 @@ class Document(models.Model):
                 slug = f"{base_slug}-"+ s_counter
                 counter += 1
             self.slug = slug
+        # Si hay name pero no slug, generar slug desde el name proporcionado
+        elif self.name and not self.slug:
+            base_slug = slugify(self.name[:50])
+            slug = base_slug
+            counter = 1
+            while Document.objects.filter(slug=slug).exists():
+                s_counter = str(counter)
+                slug = base_slug[:49-len(s_counter)]
+                slug = f"{base_slug}-"+ s_counter
+                counter += 1
+            self.slug = slug
+        # Si hay slug pero no name, y hay archivo, generar name desde el archivo
+        elif self.slug and not self.name and self.file:
+            name = os.path.basename(self.file.name)
+            name = os.path.splitext(name)[0] 
+            self.name = name[:255]
 
         super().save(*args, **kwargs)
 

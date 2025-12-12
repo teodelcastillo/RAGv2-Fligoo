@@ -9,6 +9,8 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
 from apps.document.models import Document
+from apps.evaluation.api.serializers import EvaluationRunSerializer
+from apps.evaluation.models import EvaluationRun, PillarEvaluationResult
 from apps.project.api.permissions import ProjectAccessPermission
 from apps.project.api.serializers import (
     ProjectDocumentAttachSerializer,
@@ -160,6 +162,36 @@ class ProjectViewSet(viewsets.ModelViewSet):
 
         share.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
+
+    @action(
+        detail=True,
+        methods=["get"],
+        url_path="evaluation-runs",
+        url_name="evaluation-runs",
+    )
+    def evaluation_runs(self, request, slug=None):
+        """Listar todas las ejecuciones de evaluaciones de un proyecto"""
+        project = self.get_object()
+        
+        # Verificar permisos de visualización del proyecto
+        if not project.can_view(request.user):
+            raise PermissionDenied("No tienes permisos para ver este proyecto.")
+        
+        # Obtener los runs del proyecto con sus relaciones
+        runs = (
+            EvaluationRun.objects.filter(project=project)
+            .select_related("evaluation", "owner", "project")
+            .prefetch_related(
+                Prefetch(
+                    "pillar_results",
+                    queryset=PillarEvaluationResult.objects.prefetch_related("metric_results"),
+                )
+            )
+            .order_by("-created_at")
+        )
+        
+        serializer = EvaluationRunSerializer(runs, many=True)
+        return Response(serializer.data)
 
     def _ensure_editor(self, project: Project):
         if not project.can_edit(self.request.user):

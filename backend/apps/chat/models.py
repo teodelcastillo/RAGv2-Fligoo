@@ -24,6 +24,14 @@ class ChatSession(models.Model):
         related_name="chat_sessions",
         on_delete=models.CASCADE,
     )
+    primary_document = models.ForeignKey(
+        Document,
+        related_name="primary_chat_session",
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        help_text="Documento principal asociado a esta sesión de chat",
+    )
     title = models.CharField(max_length=255)
     system_prompt = models.TextField(
         blank=True,
@@ -48,6 +56,15 @@ class ChatSession(models.Model):
         ordering = ("-created_at",)
         indexes = [
             models.Index(fields=("owner", "created_at")),
+            models.Index(fields=("primary_document",)),
+        ]
+        constraints = [
+            # Asegurar que solo haya una sesión primaria por documento y usuario
+            models.UniqueConstraint(
+                fields=["primary_document", "owner"],
+                condition=models.Q(primary_document__isnull=False),
+                name="unique_primary_document_per_user",
+            ),
         ]
 
     def __str__(self) -> str:

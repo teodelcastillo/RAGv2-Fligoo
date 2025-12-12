@@ -21,6 +21,8 @@ from apps.document.api.serializers import (
     DocumentShareSerializer,
     DocumentShareWriteSerializer,
 )
+from apps.chat.models import ChatSession
+from apps.chat.api.serializers import ChatSessionSerializer
 
 
 class RAGQueryView(APIView):
@@ -362,3 +364,62 @@ class DocumentViewSet(
         
         share.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
+    
+    @action(
+        detail=True,
+        methods=["get", "post"],
+        url_path="chat-session",
+        url_name="chat-session",
+    )
+    def chat_session(self, request, slug=None):
+        """
+        Obtener o crear la sesión de chat asociada a este documento.
+        GET: Retorna la sesión existente o 404 si no existe
+        POST: Crea una nueva sesión si no existe, o retorna la existente
+        """
+        document = self.get_object()
+        
+        # Verificar permisos de visualización
+        if not document.can_view(request.user):
+            raise PermissionDenied("No tienes permisos para ver este documento.")
+        
+        # Buscar sesión existente
+        session = ChatSession.objects.filter(
+            primary_document=document,
+            owner=request.user
+        ).first()
+        
+        if request.method == "GET":
+            if session:
+                serializer = ChatSessionSerializer(
+                    session,
+                    context={"request": request}
+                )
+                return Response(serializer.data)
+            return Response(
+                {"detail": "No hay sesión de chat para este documento."},
+                status=status.HTTP_404_NOT_FOUND
+            )
+        
+        # POST: Crear sesión si no existe
+        if session:
+            serializer = ChatSessionSerializer(
+                session,
+                context={"request": request}
+            )
+            return Response(serializer.data, status=status.HTTP_200_OK)
+        
+        # Crear nueva sesión
+        session = ChatSession.objects.create(
+            owner=request.user,
+            primary_document=document,
+            title=f"Chat: {document.name}",
+        )
+        # Asociar el documento a allowed_documents también
+        session.allowed_documents.add(document)
+        
+        serializer = ChatSessionSerializer(
+            session,
+            context={"request": request}
+        )
+        return Response(serializer.data, status=status.HTTP_201_CREATED)

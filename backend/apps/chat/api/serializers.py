@@ -11,6 +11,11 @@ from apps.document.models import Document, SmartChunk
 
 class ChatSessionSerializer(serializers.ModelSerializer):
     document_slugs = serializers.SerializerMethodField()
+    primary_document_slug = serializers.SlugField(
+        source="primary_document.slug",
+        read_only=True,
+        allow_null=True,
+    )
 
     class Meta:
         model = ChatSession
@@ -25,6 +30,7 @@ class ChatSessionSerializer(serializers.ModelSerializer):
             "created_at",
             "updated_at",
             "document_slugs",
+            "primary_document_slug",
         )
 
     def get_document_slugs(self, obj: ChatSession) -> List[str]:

@@ -151,15 +151,25 @@ class DocumentShareSerializer(serializers.ModelSerializer):
 
 class DocumentShareWriteSerializer(serializers.Serializer):
     """Serializer for creating/updating document shares"""
-    user = serializers.PrimaryKeyRelatedField(
-        queryset=User.objects.all()
-    )
+    user_email = serializers.EmailField()
     role = serializers.ChoiceField(choices=DocumentShareRole.choices)
     
-    def validate_user(self, value):
+    def validate(self, attrs):
+        """Valida el email y obtiene el usuario"""
+        email = attrs.get('user_email')
+        try:
+            user = User.objects.get(email=email)
+        except User.DoesNotExist:
+            raise serializers.ValidationError({
+                'user_email': f"No existe un usuario con el email: {email}"
+            })
+        
         document = self.context.get("document")
-        if document and document.owner == value:
-            raise serializers.ValidationError(
-                "El propietario del documento no puede ser compartido."
-            )
-        return value
+        if document and document.owner == user:
+            raise serializers.ValidationError({
+                'user_email': "El propietario del documento no puede ser compartido."
+            })
+        
+        # Reemplazar user_email con user para que la vista lo use
+        attrs['user'] = user
+        return attrs

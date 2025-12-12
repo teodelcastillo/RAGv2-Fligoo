@@ -170,17 +170,26 @@ class ProjectShareSerializer(serializers.ModelSerializer):
 
 
 class ProjectShareWriteSerializer(serializers.Serializer):
-    user_id = serializers.PrimaryKeyRelatedField(
-        source="user",
-        queryset=User.objects.all(),
-    )
+    user_email = serializers.EmailField()
     role = serializers.ChoiceField(choices=ProjectShareRole.choices)
 
-    def validate_user(self, user):
-        project = self.context["project"]
-        if user == project.owner:
-            raise serializers.ValidationError(
-                "No puedes compartir el proyecto contigo mismo."
-            )
-        return user
+    def validate(self, attrs):
+        """Valida el email y obtiene el usuario"""
+        email = attrs.get('user_email')
+        try:
+            user = User.objects.get(email=email)
+        except User.DoesNotExist:
+            raise serializers.ValidationError({
+                'user_email': f"No existe un usuario con el email: {email}"
+            })
+        
+        project = self.context.get("project")
+        if project and user == project.owner:
+            raise serializers.ValidationError({
+                'user_email': "No puedes compartir el proyecto contigo mismo."
+            })
+        
+        # Reemplazar user_email con user para que la vista lo use
+        attrs['user'] = user
+        return attrs
 

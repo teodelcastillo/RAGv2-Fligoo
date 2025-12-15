@@ -175,11 +175,16 @@ curl -X POST "http://localhost/api/document/create/" \
 
 ```json
 {
+  "id": 5,
   "slug": "my-document-2024",
   "name": "my-document-2024",
   "category": "",
   "description": "",
-  "file": "/media/documents/my-document-2024.pdf"
+  "file": "/media/documents/my-document-2024.pdf",
+  "is_public": false,
+  "is_owner": true,
+  "owner_email": "user@example.com",
+  "created_at": "2024-01-15T10:30:00Z"
 }
 ```
 
@@ -265,18 +270,28 @@ curl -X GET "http://localhost/api/document/list/?chunking_status=done&is_public=
 ```json
 [
   {
+    "id": 5,
     "slug": "research-paper-2024",
     "name": "research-paper-2024",
     "category": "research",
     "description": "Annual research findings",
-    "file": "/media/documents/research-paper-2024.pdf"
+    "file": "/media/documents/research-paper-2024.pdf",
+    "is_public": false,
+    "is_owner": true,
+    "owner_email": "user@example.com",
+    "created_at": "2024-01-15T10:30:00Z"
   },
   {
+    "id": 6,
     "slug": "analysis-q1-2024",
     "name": "analysis-q1-2024",
     "category": "analysis",
     "description": "",
-    "file": "/media/documents/analysis-q1-2024.pdf"
+    "file": "/media/documents/analysis-q1-2024.pdf",
+    "is_public": true,
+    "is_owner": false,
+    "owner_email": "other@example.com",
+    "created_at": "2024-03-10T09:00:00Z"
   }
 ]
 ```
@@ -310,6 +325,7 @@ curl -X GET "http://localhost/api/document/research-paper-2024/" \
 
 ```json
 {
+  "id": 5,
   "slug": "research-paper-2024",
   "name": "research-paper-2024",
   "category": "research",
@@ -600,6 +616,7 @@ curl -X POST "http://localhost/api/chat/messages/" \
 
 ```json
 {
+  "id": 5,
   "slug": "unique-identifier",
   "name": "Document Name",
   "category": "Category",

@@ -99,6 +99,7 @@ class DocumentSerializer(serializers.ModelSerializer):
     class Meta:
         model = Document
         fields = [
+            'id',
             'slug',
             'name',
             'category',
@@ -110,6 +111,7 @@ class DocumentSerializer(serializers.ModelSerializer):
             'created_at',
         ]
         read_only_fields = [
+            'id',
             'slug',
             'created_at',
             'extracted_text',
@@ -140,6 +142,7 @@ class DocumentDetailSerializer(serializers.ModelSerializer):
     class Meta:
         model = Document
         fields = [
+            'id',
             'slug',
             'name',
             'category',
@@ -152,6 +155,7 @@ class DocumentDetailSerializer(serializers.ModelSerializer):
             'owner_email',
         ]
         read_only_fields = [
+            'id',
             'slug',
             'created_at',
             'chunking_status',

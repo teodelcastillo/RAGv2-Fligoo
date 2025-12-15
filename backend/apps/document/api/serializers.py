@@ -25,6 +25,15 @@ class DocumentCreateSerializer(serializers.ModelSerializer):
     category = serializers.CharField(required=False, allow_blank=True, allow_null=True, max_length=255)
     description = serializers.CharField(required=False, allow_blank=True)
     is_public = serializers.BooleanField(required=False, default=False)
+    year = serializers.IntegerField(required=False, allow_null=True)
+    region = serializers.CharField(required=False, allow_blank=True, allow_null=True, max_length=255)
+    topics = serializers.ListField(
+        child=serializers.CharField(),
+        required=False,
+        allow_empty=True,
+        allow_null=True
+    )
+    source = serializers.CharField(required=False, allow_blank=True, allow_null=True, max_length=255)
     
     class Meta:
         model = Document
@@ -34,6 +43,10 @@ class DocumentCreateSerializer(serializers.ModelSerializer):
             'category',
             'description',
             'is_public',
+            'year',
+            'region',
+            'topics',
+            'source',
         ]
     
     def validate_file(self, value):
@@ -65,6 +78,15 @@ class DocumentBulkCreateSerializer(serializers.Serializer):
     category = serializers.CharField(required=False, allow_blank=True, allow_null=True, max_length=255)
     description = serializers.CharField(required=False, allow_blank=True)
     is_public = serializers.BooleanField(required=False, default=False)
+    year = serializers.IntegerField(required=False, allow_null=True)
+    region = serializers.CharField(required=False, allow_blank=True, allow_null=True, max_length=255)
+    topics = serializers.ListField(
+        child=serializers.CharField(),
+        required=False,
+        allow_empty=True,
+        allow_null=True
+    )
+    source = serializers.CharField(required=False, allow_blank=True, allow_null=True, max_length=255)
     
     def validate_files(self, value):
         """Validate that at least one file is provided and not empty."""
@@ -109,6 +131,10 @@ class DocumentSerializer(serializers.ModelSerializer):
             'is_owner',
             'owner_email',
             'created_at',
+            'year',
+            'region',
+            'topics',
+            'source',
         ]
         read_only_fields = [
             'id',
@@ -125,6 +151,10 @@ class DocumentSerializer(serializers.ModelSerializer):
             'name',
             'category',
             'description',
+            'year',
+            'region',
+            'topics',
+            'source',
         ]
     
     def get_is_owner(self, obj):
@@ -153,6 +183,10 @@ class DocumentDetailSerializer(serializers.ModelSerializer):
             'chunking_done',
             'is_public',
             'owner_email',
+            'year',
+            'region',
+            'topics',
+            'source',
         ]
         read_only_fields = [
             'id',
@@ -167,6 +201,12 @@ class DocumentDetailSerializer(serializers.ModelSerializer):
 class DocumentUpdateSerializer(serializers.ModelSerializer):
     """Serializer for updating document metadata"""
     is_public = serializers.BooleanField(required=False)
+    topics = serializers.ListField(
+        child=serializers.CharField(),
+        required=False,
+        allow_empty=True,
+        allow_null=True
+    )
     
     class Meta:
         model = Document
@@ -175,6 +215,10 @@ class DocumentUpdateSerializer(serializers.ModelSerializer):
             'category',
             'description',
             'is_public',
+            'year',
+            'region',
+            'topics',
+            'source',
         ]
     
     def validate_is_public(self, value):

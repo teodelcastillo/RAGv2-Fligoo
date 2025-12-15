@@ -6,7 +6,6 @@ from rest_framework.decorators import action
 from rest_framework.exceptions import PermissionDenied
 from rest_framework import viewsets, mixins
 from django.shortcuts import get_object_or_404
-
 from django.db.models import Q
 
 from apps.document.models import SmartChunk, Document, DocumentShare
@@ -97,7 +96,7 @@ class DocumentBulkCreateAPIView(APIView):
         
         Expected format: multipart/form-data with multiple 'files' fields
         Example: files[]=file1.pdf&files[]=file2.pdf
-        Also accepts: name, category, description, is_public (applied to all documents)
+        Also accepts: name, category, description, is_public, year, region, topics, source (applied to all documents)
         """
         # Handle both 'files' as a list and 'files[]' format
         files = request.FILES.getlist('files') or request.FILES.getlist('files[]')
@@ -120,6 +119,14 @@ class DocumentBulkCreateAPIView(APIView):
             data['description'] = request.data['description']
         if 'is_public' in request.data:
             data['is_public'] = request.data['is_public']
+        if 'year' in request.data:
+            data['year'] = request.data['year']
+        if 'region' in request.data:
+            data['region'] = request.data['region']
+        if 'topics' in request.data:
+            data['topics'] = request.data['topics']
+        if 'source' in request.data:
+            data['source'] = request.data['source']
         
         # Validate using serializer
         serializer = DocumentBulkCreateSerializer(
@@ -140,6 +147,14 @@ class DocumentBulkCreateAPIView(APIView):
             document_props['description'] = validated_data['description']
         if 'is_public' in validated_data:
             document_props['is_public'] = validated_data['is_public']
+        if 'year' in validated_data:
+            document_props['year'] = validated_data['year']
+        if 'region' in validated_data:
+            document_props['region'] = validated_data['region']
+        if 'topics' in validated_data:
+            document_props['topics'] = validated_data['topics']
+        if 'source' in validated_data:
+            document_props['source'] = validated_data['source']
         
         created_documents = []
         errors = []
@@ -423,3 +438,60 @@ class DocumentViewSet(
             context={"request": request}
         )
         return Response(serializer.data, status=status.HTTP_201_CREATED)
+
+
+class TopicsAutocompleteView(APIView):
+    """
+    Endpoint para autocompletado de topics/keywords.
+    Devuelve una lista de topics únicos de los documentos a los que el usuario tiene acceso.
+    """
+    permission_classes = [permissions.IsAuthenticated]
+    
+    def get(self, request):
+        """
+        GET /api/documents/topics/autocomplete/?q=<query>
+        
+        Parámetros:
+        - q (opcional): Query string para filtrar los topics (búsqueda case-insensitive)
+        - limit (opcional): Número máximo de resultados (default: 50)
+        """
+        query = request.query_params.get('q', '').strip()
+        limit = int(request.query_params.get('limit', 50))
+        
+        user = request.user
+        
+        # Obtener documentos accesibles por el usuario
+        if user.is_staff:
+            documents = Document.objects.all()
+        else:
+            # Incluir documentos propios, públicos, compartidos y de proyectos compartidos
+            from apps.project.models import ProjectShare
+            shared_project_ids = ProjectShare.objects.filter(
+                user=user
+            ).values_list('project_id', flat=True)
+            documents = Document.objects.filter(
+                Q(owner=user) 
+                | Q(is_public=True) 
+                | Q(shares__user=user)
+                | Q(projects__id__in=shared_project_ids)
+            ).distinct()
+        
+        # Extraer todos los topics de los documentos accesibles
+        # Recopilar todos los topics de todos los documentos
+        all_topics = set()
+        for doc in documents.exclude(topics__isnull=True).exclude(topics__len=0):
+            if doc.topics:
+                all_topics.update(doc.topics)
+        
+        # Filtrar por query si se proporciona
+        if query:
+            all_topics = {topic for topic in all_topics if query.lower() in topic.lower()}
+        
+        # Ordenar y limitar
+        topics = sorted(all_topics)[:limit]
+        
+        return Response({
+            'query': query,
+            'results': topics,
+            'count': len(topics)
+        })

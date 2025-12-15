@@ -1,0 +1,4 @@
+"""
+Migrations for project app.
+"""
+

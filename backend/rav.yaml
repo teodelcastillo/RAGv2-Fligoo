@@ -1,0 +1,6 @@
+scripts:
+  attach: docker attach backend
+  enter: docker exec -ti backend bash
+  migrate:
+    - docker compose exec backend python manage.py makemigrations
+    - docker compose exec backend python manage.py migrate

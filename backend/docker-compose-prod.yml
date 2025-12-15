@@ -1,0 +1,64 @@
+version: "3.8"
+
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: ./docker/Dockerfile
+    image: backend:latest
+    container_name: backend
+    command: bash -c "sleep 4 && sh ./docker/entrypoint-prod.sh"
+    env_file:
+      - ./docker/.env
+    volumes:
+      - .:/code
+    expose:
+      - "8000"            # internal-only; nginx will proxy to this
+    restart: unless-stopped
+    networks:
+      - app-network
+
+  celery-worker:
+    image: backend:latest          # reuse same image (has Django + Celery)
+    container_name: celery-worker
+    command: bash -lc "celery -A main worker -l info"
+    env_file:
+      - ./docker/.env
+    depends_on:
+      - backend
+    volumes:
+      - .:/code                    # optional; keep if your code mounts at runtime
+    restart: unless-stopped
+    networks:
+      - app-network
+    # Optional healthcheck:
+    # healthcheck:
+    #   test: ["CMD", "bash", "-lc", "python - <<'PY'\nfrom celery.app.control import Control; from proj.celery import app; print('ok')\nPY"]
+    #   interval: 30s
+    #   timeout: 10s
+    #   retries: 3
+
+
+  nginx:
+    image: nginx:latest
+    container_name: nginx
+    env_file:
+      - ./docker/.env
+    ports:
+      - "80:80"           # open this in your EC2 security group
+      # - "443:443"       # add if you configure TLS
+    depends_on:
+      - backend
+    command: /bin/bash -c "sleep 5 && nginx -g 'daemon off;'"
+    volumes:
+      - ./logs/nginx:/var/log/nginx
+      - ./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./main/django-static:/opt/app/django-static
+      - ./media:/opt/app/media
+    restart: unless-stopped
+    networks:
+      - app-network
+
+networks:
+  app-network:
+    driver: bridge

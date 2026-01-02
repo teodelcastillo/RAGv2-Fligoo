@@ -2,6 +2,196 @@
 
 ## Project Overview
 
+Ecofilia es una plataforma Django que combina gestión documental, RAG conversacional y evaluaciones estructuradas. El backend procesa y chunkéa documentos con embeddings de OpenAI, aplica búsqueda vectorial con pgvector y orquesta chat seguro y evaluaciones sobre los documentos permitidos (propios, públicos o compartidos vía documento o proyecto).
+
+### Key Features (implementadas)
+- Carga individual o masiva de documentos (PDF, DOC/DOCX, TXT) con extracción y normalización de texto.
+- Chunking con tiktoken + embeddings OpenAI y almacenamiento vectorial en pgvector.
+- Búsqueda semántica y chat RAG limitado a documentos permitidos (propios/públicos/compartidos/proyectos compartidos).
+- Compartición granular de documentos, proyectos y evaluaciones (roles viewer/editor).
+- Proyectos como contenedores de documentos; evaluaciones que usan snapshots de documentos.
+- Ejecuciones de evaluaciones (LLM) con contexto RAG y persistencia de resultados por pilar/métrica.
+- Autenticación JWT con rotación + blacklist, MFA TOTP, rate limiting y invalidación automática en cambios sensibles.
+- Tareas asíncronas con Celery (procesamiento de documentos y evaluaciones) y SQS en producción.
+- Almacenamiento S3 en producción, filesystem local en desarrollo. Docker-ready.
+
+---
+
+## Technology Stack
+
+### Core Technologies
+- **Python 3.12+**, **Django 5.x**, **Django REST Framework**
+- **PostgreSQL 16** + **pgvector**
+- **Celery 5.x** (SQS en prod, eager/local en DEBUG)
+- **OpenAI API** (embeddings + chat completion)
+- **AWS S3** (media) / filesystem local
+
+### Development / Ops
+- Poetry, Docker & Docker Compose, Gunicorn + Nginx (prod)
+- Boto3, django-storages, django-cors-headers, django-filter
+- pgvector, psycopg2-binary, tiktoken
+- PyMuPDF + PyPDF2 + python-docx (parsers)
+- djangorestframework-simplejwt[crypto], django-otp / pyotp (MFA)
+
+---
+
+## Project Structure
+
+```
+backend/
+├── apps/
+│   ├── document/        # Documentos + SmartChunks + shares + RAG API
+│   ├── chat/            # ChatSession/Message, RAG helpers y endpoints
+│   ├── project/         # Proyectos, shares y agregación de documentos
+│   ├── evaluation/      # Evaluaciones, pilares/métricas, runs y shares
+│   ├── authentication/  # JWT, MFA, password reset, refresh seguro
+│   └── user/            # Custom User (email-first, roles, MFA flags)
+├── main/                # Settings, Celery, URLs, ASGI/WSGI
+├── docker/              # Dockerfile, entrypoints, template.env
+├── docker-compose*.yml  # Dev / local / prod
+└── SECURITY_AUDIT.md    # Notas de hardening
+```
+
+---
+
+## Architecture & Flows
+
+### System Components
+- **Web / API**: Django REST Framework (JWT + optional session/basic), browsable API habilitado en dev.
+- **DB**: PostgreSQL + pgvector (vector cosine distance), índices en slug/owner/embedding.
+- **Task Queue**: Celery; SQS en prod (`celery` queue); eager/local en DEBUG.
+- **Storage**: S3 (prod via django-storages) o filesystem local.
+- **OpenAI**: cliente compartido para embeddings y chat completions.
+
+### Data Flows (reales)
+- **Carga y procesamiento de documento**
+  1. POST `/api/document/create/` o bulk `/api/document/bulk/`.
+  2. Signal `handle_document_post_save` marca `pending` y encola `process_document_chunks` (delay en prod, sync en DEBUG).
+  3. Worker descarga archivo, preserva extensión, extrae texto (PyMuPDF con recorte de headers/footers y fallback PyPDF2 / python-docx / txt).
+  4. Chunking con tiktoken (500 tokens, overlap 50), embeddings OpenAI, bulk insert de `SmartChunk`.
+  5. Marca `chunking_done=True`, guarda `extracted_text`, borra `last_error`.
+  6. Signal aparte crea `ChatSession` primaria y añade el documento a `allowed_documents`.
+
+- **Búsqueda / RAG**
+  - `GET /api/document/rag/` filtra chunks según permisos: staff ve todo; resto solo documentos propios, públicos, compartidos o en proyectos compartidos. Filtros por slug y `public=true/false`.
+  - Similaridad: `SmartChunkQuerySet.top_similar` usa `CosineDistance` y embeddings OpenAI; si hay números en la query se priorizan coincidencias numéricas.
+
+- **Chat**
+  - `POST /api/chat/messages/` arma mensajes con prompt del sistema, contexto documental (hasta `CHAT_CONTEXT_CHUNKS`, default 4) restringido a `allowed_documents`, y último historial (`CHAT_HISTORY_MESSAGES`, default 10).
+  - Genera respuesta OpenAI; guarda `chunk_ids` y `usage` para trazabilidad.
+
+- **Evaluaciones**
+  - Evaluaciones tienen pilares/métricas y documentos asociados (o documentos de proyecto o payload).
+  - `POST /api/evaluations/<slug>/runs/` crea `EvaluationRun` con snapshot de documentos; encola `run_evaluation_task`.
+  - `EvaluationRunner` obtiene chunks relevantes por métrica (respeta permisos del owner del run) y llama OpenAI; persiste resultados por pilar/métrica con fuentes (`chunk_ids`, slug, distancia).
+
+---
+
+## Data Model (resumen)
+- `User`: email como username, roles (`admin/manager/member`), flags `email_verified`, `approved`, `mfa_enabled`, `last_password_change`.
+- `Document`: owner, `slug` autogenerado, `is_public`, `chunking_status/done/last_error`, `extracted_text`, metadata opcional (categoría/desc), shares y relación con proyectos/evaluaciones.
+- `SmartChunk`: `content`, `content_norm` (GeneratedField con `immutable_unaccent(lower)`), `token_count`, `embedding` (1536 dims), `chunk_index`, keywords/summary opcionales.
+- `DocumentShare`: user + role (`viewer/editor`), unique per doc+user.
+- `Project`: owner, slug, `is_active`, M2M documentos vía `ProjectDocument`, shares `ProjectShare` con roles.
+- `Evaluation`: owner, slug, visibility (`private/shared/public`), system_prompt/model/lang/temp, documentos via `EvaluationDocument`, pilares y métricas; shares con roles.
+- `EvaluationRun`: snapshot de documentos, modelo/temperatura/idioma, estado (`pending/running/completed/failed`), resultados por pilar/métrica con fuentes y chunk_ids.
+- `ChatSession`: owner, primary_document opcional, `allowed_documents` M2M, modelo/temperatura/idioma, constraint de una sesión primaria por (documento, usuario).
+- `ChatMessage`: role, content, `chunk_ids` y metadata (usage).
+
+---
+
+## Key Modules & Utilities (código real)
+- `apps/document/utils/parser.py`: PyMuPDF con recorte de header/footer, fallback PyPDF2; DOC/DOCX vía python-docx; normaliza saltos y espacios.
+- `apps/document/utils/chunker.py`: chunking tiktoken (500 tokens, overlap 50), embeddings con OpenAI; crea `SmartChunk` con token_count.
+- `apps/document/utils/client_openia.py`: cliente OpenAI compartido (lazy); `MODEL_EMBEDDING` y `MODEL_COMPLETION` por env.
+- `apps/document/services.py`: `accessible_documents_for` aplica permisos (owner, público, share, proyectos compartidos).
+- `apps/document/tasks.py`: `process_document_chunks` (max_retries=3, retry_delay=30s) lee archivo a tmp, parsea, chunkéa, bulk_create, marca estado o error.
+- `apps/document/signals.py`: en cola chunking on commit (async en prod, sync en DEBUG) y crea `ChatSession` primaria para cada documento nuevo.
+- `apps/chat/services/rag.py`: limita chunks a documentos permitidos, respeta permisos de shares/proyectos; arma bloque de contexto con fuente y chunk_index.
+- `apps/chat/api/views.py`: crea sesiones/mensajes; construye prompts con sistema + contexto + historial; maneja errores típicos de OpenAI.
+- `apps/evaluation/services.py`: `EvaluationRunner` ejecuta run; busca chunks por métrica con RAG, arma prompts con contexto, extrae valor numérico si aplica, guarda resultados con fuentes.
+- `apps/evaluation/tasks.py`: wrapper Celery `run_evaluation_task`.
+- `apps/authentication/api/views.py`: endpoints register/login/refresh/logout/profile/password reset/MFA; `CustomTokenRefreshView` con throttle estricto y verificación de rotación.
+- `apps/authentication/signals.py`: blacklist de JWT en cambio de password o desactivación.
+
+---
+
+## Security & Privacy (implementado)
+- **JWT + MFA**: SimpleJWT con `ROTATE_REFRESH_TOKENS=True` y `BLACKLIST_AFTER_ROTATION=True`; throttle dedicado a refresh (`strict_refresh` 20/min por defecto). MFA TOTP opcional; login bloquea si email no verificado o MFA requerido.
+- **Invalidación de tokens**: señal `invalidate_tokens_on_sensitive_change` blacklistea refresh/Outstanding tokens al cambiar contraseña o desactivar usuario.
+- **Permisos de acceso a datos**: todo RAG/chat/evaluación usa filtros de visibilidad: staff todo; resto solo owner, público, share directo (`DocumentShare/ProjectShare/EvaluationShare`) o documentos de proyectos compartidos. Endpoints tienen permisos DRF + validaciones en serializers de documentos permitidos.
+- **CORS/CSRF/cookies**: CORS restringible por env; `CSRF_COOKIE_HTTPONLY=True`, `SESSION_COOKIE_HTTPONLY=True`, `SAMESITE` configurable, `SECURE_SSL_REDIRECT` y flags `*_SECURE` vía env. CSRF en sesiones; JWT endpoints son stateless.
+- **Rate limiting**: DRF throttles `anon` y `user` configurables; scope `strict_refresh` más estricto para refresh.
+- **Headers/seguridad app**: `X_FRAME_OPTIONS=DENY`, `SECURE_CONTENT_TYPE_NOSNIFF`, `SECURE_REFERRER_POLICY=same-origin`, HSTS configurable.
+- **Logging**: manejo de errores de OpenAI y refresh sin exponer tokens; trazabilidad de chunk_ids/sources para respuestas.
+
+---
+
+## API Surface (resumen)
+- `POST /api/document/create/`, `POST /api/document/bulk/`, `GET /api/document/list/`, `GET/PUT/PATCH/DELETE /api/document/<slug>/`, shares y chat-session por doc.
+- `GET /api/document/rag/` búsqueda semántica con filtros `documents` y `public`.
+- `POST /api/chat/sessions/`, `POST /api/chat/messages/` chat RAG con trazabilidad de chunks.
+- `POST /api/projects/` CRUD + attach/remove docs + shares + listing de runs.
+- `POST /api/evaluations/` CRUD + shares + creación/consulta de runs.
+- `POST /api/auth/*` registro, login (MFA), refresh seguro, logout (blacklist), password reset/change, profile.
+
+---
+
+## Environment Variables
+Required:
+```bash
+SECRET_KEY, JWT_SIGNING_KEY, DEBUG, ALLOWED_HOSTS,
+POSTGRES_USER, POSTGRES_PASSWORD, POSTGRES_NAME, POSTGRES_HOST, POSTGRES_PORT,
+OPENAI_API_KEY, MODEL_EMBEDDING, DEFAULT_FROM_EMAIL, FRONTEND_BASE_URL
+```
+Prod storage/queue:
+```bash
+AWS_STORAGE_BUCKET_NAME, AWS_S3_REGION_NAME, SQS_QUEUE_URL, SQS_REGION
+```
+Optional/tuning:
+```bash
+MODEL_COMPLETION            # default gpt-4o-mini
+CHAT_CONTEXT_CHUNKS         # default 4
+CHAT_HISTORY_MESSAGES       # default 10
+EVALUATION_CONTEXT_CHUNKS   # default CHAT_CONTEXT_CHUNKS
+JWT_ACCESS_TTL_MINUTES      # default 15
+JWT_REFRESH_TTL_DAYS        # default 7
+DRF_THROTTLE_RATE_ANON      # default 30/min
+DRF_THROTTLE_RATE_USER      # default 120/min
+DRF_THROTTLE_RATE_REFRESH   # default 20/min (strict_refresh)
+MFA_ISSUER_NAME             # label TOTP
+SESSION_COOKIE_SECURE, CSRF_COOKIE_SECURE, SESSION_COOKIE_SAMESITE, CSRF_COOKIE_SAMESITE
+CORS_ALLOWED_ORIGINS, CSRF_TRUSTED_ORIGINS
+```
+
+---
+
+## Development & Operations
+- **Setup**: copiar `docker/template.env` a `docker/.env`, ajustar variables. `docker-compose up -d`, luego `docker-compose exec backend python manage.py migrate` y `createsuperuser`.
+- **Celery**: levantar worker `celery -A main worker -l info` (o contenedor `celery-worker` en prod/SQS).
+- **Tests**: `python manage.py test` (o scoped por app).
+- **Rutas**: ver `main/urls.py` (document/chat/projects/evaluations/auth).
+
+### Troubleshooting
+- Documentos sin chunks: revisar logs de worker, campo `last_error`, o reintentar `process_document_chunks(doc_id)`.
+- Vector search vacío: verificar extensión pgvector instalada y embeddings generados.
+- Auth: si cambia password o se desactiva un usuario, refresh tokens previos quedan blacklisted; re-login requerido.
+
+---
+
+## Project Status
+- ✅ Ingesta y chunking de documentos (PDF/DOCX/TXT) con embeddings
+- ✅ Búsqueda vectorial y chat RAG acotado por permisos
+- ✅ Compartición de documentos/proyectos/evaluaciones
+- ✅ Proyectos y evaluaciones con runs y resultados almacenados
+- ✅ Autenticación JWT + MFA + refresh seguro + blacklist en cambios sensibles
+- ✅ Tareas asíncronas con Celery (documentos y evaluaciones)
+- ✅ Integración AWS S3/SQS (prod)
+- 🚧 Métricas/monitoring avanzados y caching
+# Ecofilia - Technical Documentation
+
+## Project Overview
+
 Ecofilia is a Django-based document management and retrieval system with RAG (Retrieval-Augmented Generation) capabilities. It allows users to upload documents, automatically processes and chunks them with OpenAI embeddings, and provides semantic search functionality using PostgreSQL with pgvector extension.
 
 ### Key Features

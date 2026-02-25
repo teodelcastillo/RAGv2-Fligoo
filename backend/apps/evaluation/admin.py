@@ -74,3 +74,60 @@ class MetricEvaluationResultAdmin(admin.ModelAdmin):
     list_display = ("id", "pillar_result", "metric", "position")
     ordering = ("pillar_result", "position")
 
+
+# Template-based evaluation models (dashboards)
+from apps.evaluation.models_template import (
+    EvaluationKPITemplate,
+    EvaluationPillarTemplate,
+    EvaluationTemplate,
+    TemplateEvaluationRun,
+    TemplateEvaluationRunScore,
+)
+
+
+class EvaluationKPITemplateInline(admin.TabularInline):
+    model = EvaluationKPITemplate
+    extra = 0
+    fields = ("code", "name", "max_score")
+
+
+class EvaluationPillarTemplateInline(admin.StackedInline):
+    model = EvaluationPillarTemplate
+    extra = 0
+    show_change_link = True
+    fields = ("code", "name", "weight")
+
+
+@admin.register(EvaluationTemplate)
+class EvaluationTemplateAdmin(admin.ModelAdmin):
+    list_display = ("name", "methodology", "created_at")
+    search_fields = ("name",)
+    inlines = (EvaluationPillarTemplateInline,)
+
+
+@admin.register(EvaluationPillarTemplate)
+class EvaluationPillarTemplateAdmin(admin.ModelAdmin):
+    list_display = ("code", "name", "template", "weight")
+    list_filter = ("template",)
+    inlines = (EvaluationKPITemplateInline,)
+
+
+@admin.register(EvaluationKPITemplate)
+class EvaluationKPITemplateAdmin(admin.ModelAdmin):
+    list_display = ("code", "name", "pillar", "max_score")
+    list_filter = ("pillar__template",)
+
+
+class TemplateEvaluationRunScoreInline(admin.TabularInline):
+    model = TemplateEvaluationRunScore
+    extra = 0
+    readonly_fields = ("kpi", "score", "evidence")
+
+
+@admin.register(TemplateEvaluationRun)
+class TemplateEvaluationRunAdmin(admin.ModelAdmin):
+    list_display = ("id", "project", "template", "status", "executed_at")
+    list_filter = ("status", "template")
+    search_fields = ("project__name",)
+    inlines = (TemplateEvaluationRunScoreInline,)
+

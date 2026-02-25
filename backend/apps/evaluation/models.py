@@ -355,3 +355,14 @@ class MetricEvaluationResult(models.Model):
     def __str__(self) -> str:
         return f"MetricResult {self.id}"
 
+
+# Import template-based evaluation models for dashboards
+from apps.evaluation.models_template import (  # noqa: E402, F401
+    EvaluationKPITemplate,
+    EvaluationPillarTemplate,
+    EvaluationTemplate,
+    TemplateEvaluationRun,
+    TemplateEvaluationRunScore,
+    TemplateEvaluationRunStatus,
+)
+

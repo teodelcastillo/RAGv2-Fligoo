@@ -5,12 +5,14 @@ from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.utils.translation import gettext_lazy as _
 from rest_framework import generics, status
+from rest_framework.exceptions import ValidationError
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.throttling import AnonRateThrottle
 from rest_framework.views import APIView
 from rest_framework_simplejwt.views import TokenObtainPairView, TokenRefreshView
 from rest_framework_simplejwt.serializers import TokenRefreshSerializer
+from rest_framework_simplejwt.tokens import TokenError
 
 from apps.authentication.api.serializers import (
     LogoutSerializer,
@@ -143,16 +145,25 @@ class CustomTokenRefreshView(TokenRefreshView):
             
             return Response(response_data, status=status.HTTP_200_OK)
             
+        except TokenError:
+            logger.warning("Token refresh failed: TokenError (invalid/expired/blacklisted)")
+            return Response(
+                {"detail": _("Token is invalid or expired. Please sign in again.")},
+                status=status.HTTP_401_UNAUTHORIZED,
+            )
+        except ValidationError:
+            # TokenRefreshSerializer raises ValidationError for invalid/expired/blacklisted tokens
+            logger.warning("Token refresh failed: ValidationError")
+            return Response(
+                {"detail": _("Token is invalid or expired. Please sign in again.")},
+                status=status.HTTP_401_UNAUTHORIZED,
+            )
         except Exception as exc:
-            # Log security-relevant errors without exposing sensitive information
-            # SimpleJWT serializer will handle validation errors appropriately
             logger.warning(
                 "Token refresh failed: %s",
                 type(exc).__name__,
-                exc_info=settings.DEBUG  # Only log full traceback in DEBUG mode
+                exc_info=settings.DEBUG,
             )
-            # Re-raise to let DRF handle the error response
-            # SimpleJWT will return appropriate error messages without exposing internals
             raise
 
 

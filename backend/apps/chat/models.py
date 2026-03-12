@@ -8,6 +8,7 @@ from django.db import models
 from django.utils.translation import gettext_lazy as _
 
 from apps.document.models import Document
+from apps.project.models import Project
 
 DEFAULT_CHAT_MODEL = os.environ.get("MODEL_COMPLETION", "gpt-4o-mini")
 
@@ -31,6 +32,14 @@ class ChatSession(models.Model):
         null=True,
         blank=True,
         help_text="Documento principal asociado a esta sesión de chat",
+    )
+    project = models.ForeignKey(
+        Project,
+        related_name="chat_sessions",
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        help_text="Proyecto al que pertenece esta sesión de chat (si aplica)",
     )
     title = models.CharField(max_length=255)
     system_prompt = models.TextField(
@@ -57,6 +66,7 @@ class ChatSession(models.Model):
         indexes = [
             models.Index(fields=("owner", "created_at")),
             models.Index(fields=("primary_document",)),
+            models.Index(fields=("project", "owner", "created_at")),
         ]
         constraints = [
             # Asegurar que solo haya una sesión primaria por documento y usuario

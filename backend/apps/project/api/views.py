@@ -8,6 +8,8 @@ from rest_framework.exceptions import PermissionDenied
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
+from apps.chat.models import ChatSession
+from apps.chat.api.serializers import ChatSessionSerializer, ChatSessionCreateSerializer
 from apps.document.models import Document
 from apps.evaluation.api.serializers import EvaluationRunSerializer
 from apps.evaluation.models import EvaluationRun, PillarEvaluationResult
@@ -192,6 +194,52 @@ class ProjectViewSet(viewsets.ModelViewSet):
         
         serializer = EvaluationRunSerializer(runs, many=True)
         return Response(serializer.data)
+
+    @action(
+        detail=True,
+        methods=["get", "post"],
+        url_path="chat-sessions",
+        url_name="chat-sessions",
+    )
+    def chat_sessions(self, request, slug=None):
+        project = self.get_object()
+
+        if request.method == "GET":
+            qs = (
+                ChatSession.objects
+                .filter(owner=request.user, project=project)
+                .prefetch_related("allowed_documents")
+                .order_by("-updated_at")
+            )
+            serializer = ChatSessionSerializer(
+                qs, many=True, context={"request": request},
+            )
+            return Response(serializer.data)
+
+        create_serializer = ChatSessionCreateSerializer(
+            data=request.data,
+            context={"request": request},
+        )
+        create_serializer.is_valid(raise_exception=True)
+        validated = create_serializer.validated_data
+
+        session = ChatSession.objects.create(
+            owner=request.user,
+            project=project,
+            title=validated.get("title", f"Chat: {project.name}"),
+            system_prompt=validated.get("system_prompt", ""),
+            model=validated.get("model", ChatSession._meta.get_field("model").default),
+            temperature=validated.get("temperature", 0.1),
+            language=validated.get("language", "es"),
+        )
+
+        slugs = validated.get("document_slugs", [])
+        if slugs:
+            docs = Document.objects.filter(slug__in=slugs)
+            session.allowed_documents.set(docs)
+
+        output = ChatSessionSerializer(session, context={"request": request})
+        return Response(output.data, status=status.HTTP_201_CREATED)
 
     def _ensure_editor(self, project: Project):
         if not project.can_edit(self.request.user):

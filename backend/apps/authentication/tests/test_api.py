@@ -104,3 +104,45 @@ class AuthenticationAPITestCase(APITestCase):
         self.user.refresh_from_db()
         self.assertTrue(self.user.check_password("EvenStronger123!"))
 
+    def test_register_duplicate_email_returns_field_error(self):
+        url = reverse("auth-register")
+        payload = {
+            "email": "user@example.com",
+            "password": "StrongPass456!",
+            "first_name": "Dup",
+            "last_name": "User",
+        }
+        response = self.client.post(url, payload, format="json")
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("email", response.data)
+        self.assertTrue(
+            any("already exists" in str(msg).lower() for msg in response.data["email"])
+        )
+
+    def test_register_weak_password_returns_field_error(self):
+        url = reverse("auth-register")
+        payload = {
+            "email": "weak@example.com",
+            "password": "123",
+            "first_name": "Weak",
+            "last_name": "Pass",
+        }
+        response = self.client.post(url, payload, format="json")
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("password", response.data)
+
+    def test_register_common_password_returns_field_error(self):
+        url = reverse("auth-register")
+        payload = {
+            "email": "common@example.com",
+            "password": "password12345678",
+            "first_name": "Common",
+            "last_name": "Pass",
+        }
+        response = self.client.post(url, payload, format="json")
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("password", response.data)
+

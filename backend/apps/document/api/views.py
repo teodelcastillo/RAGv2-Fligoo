@@ -9,10 +9,10 @@ from django.shortcuts import get_object_or_404
 
 from django.db.models import Q
 
-from apps.document.models import SmartChunk, Document, DocumentShare
+from apps.document.models import SmartChunk, Document, DocumentShare, Category
 from apps.document.api.filters import DocumentFilter
 from apps.document.api.serializers import (
-    SmartChunkSerializer, 
+    SmartChunkSerializer,
     DocumentSerializer,
     DocumentCreateSerializer,
     DocumentBulkCreateSerializer,
@@ -20,6 +20,8 @@ from apps.document.api.serializers import (
     DocumentUpdateSerializer,
     DocumentShareSerializer,
     DocumentShareWriteSerializer,
+    CategorySerializer,
+    CategoryWriteSerializer,
 )
 from apps.chat.models import ChatSession
 from apps.chat.api.serializers import ChatSessionSerializer
@@ -71,119 +73,113 @@ class RAGQueryView(APIView):
 
 
 class DocumentCreateAPIView(CreateAPIView):
-    queryset=Document.objects.all()
-    serializer_class=DocumentCreateSerializer
+    queryset = Document.objects.all()
+    serializer_class = DocumentCreateSerializer
+    permission_classes = [permissions.IsAuthenticated]
 
     def create(self, request, *args, **kwargs):
-
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         document = serializer.save(owner=request.user)
+
+        project = getattr(serializer, '_project', None)
+        if project:
+            from apps.project.models import ProjectDocument
+            ProjectDocument.objects.get_or_create(
+                project=project,
+                document=document,
+                defaults={"added_by": request.user},
+            )
 
         response_serializer = DocumentSerializer(document, context=self.get_serializer_context())
         return Response(response_serializer.data, status=status.HTTP_201_CREATED)
 
 
 class DocumentBulkCreateAPIView(APIView):
-    """
-    API View for bulk document upload.
-    Accepts multiple files and creates a document for each one.
-    """
     permission_classes = [permissions.IsAuthenticated]
-    
+
     def post(self, request, *args, **kwargs):
-        """
-        Create multiple documents from multiple files.
-        
-        Expected format: multipart/form-data with multiple 'files' fields
-        Example: files[]=file1.pdf&files[]=file2.pdf
-        Also accepts: name, category, description, is_public (applied to all documents)
-        """
-        # Handle both 'files' as a list and 'files[]' format
         files = request.FILES.getlist('files') or request.FILES.getlist('files[]')
-        
+
         if not files:
             return Response(
                 {"error": "No files provided. Use 'files' or 'files[]' field(s)."},
-                status=status.HTTP_400_BAD_REQUEST
+                status=status.HTTP_400_BAD_REQUEST,
             )
-        
-        # Prepare data for serializer validation
+
         data = {'files': files}
-        
-        # Add optional properties if provided
-        if 'name' in request.data:
-            data['name'] = request.data['name']
-        if 'category' in request.data:
-            data['category'] = request.data['category']
-        if 'description' in request.data:
-            data['description'] = request.data['description']
-        if 'is_public' in request.data:
-            data['is_public'] = request.data['is_public']
-        
-        # Validate using serializer
+        for key in ('name', 'category', 'description', 'is_public', 'project_slug'):
+            if key in request.data:
+                data[key] = request.data[key]
+
         serializer = DocumentBulkCreateSerializer(
             data=data,
-            context={'request': request}
+            context={'request': request},
         )
         serializer.is_valid(raise_exception=True)
         validated_data = serializer.validated_data
         validated_files = validated_data['files']
-        
-        # Extract properties to apply to all documents
+
         document_props = {}
-        if 'name' in validated_data:
-            document_props['name'] = validated_data['name']
-        if 'category' in validated_data:
-            document_props['category'] = validated_data['category']
-        if 'description' in validated_data:
-            document_props['description'] = validated_data['description']
-        if 'is_public' in validated_data:
-            document_props['is_public'] = validated_data['is_public']
-        
+        for key in ('name', 'category', 'description', 'is_public'):
+            if key in validated_data:
+                document_props[key] = validated_data[key]
+
+        project = getattr(serializer, '_project', None)
+        successful = []
+        failed = []
         created_documents = []
-        errors = []
-        
-        # Create a document for each file
-        for index, file in enumerate(validated_files):
+
+        for file in validated_files:
             try:
-                # Create document with user-provided properties
                 document = Document.objects.create(
                     owner=request.user,
                     file=file,
-                    **document_props
+                    **document_props,
                 )
                 created_documents.append(document)
-            except Exception as e:
-                errors.append({
-                    'file_index': index,
-                    'filename': file.name if hasattr(file, 'name') else 'unknown',
-                    'error': str(e)
+                successful.append({
+                    'filename': getattr(file, 'name', 'unknown'),
+                    'id': document.id,
+                    'slug': document.slug,
                 })
-        
-        # Serialize created documents
+
+                if project:
+                    from apps.project.models import ProjectDocument
+                    ProjectDocument.objects.get_or_create(
+                        project=project,
+                        document=document,
+                        defaults={"added_by": request.user},
+                    )
+            except Exception as e:
+                failed.append({
+                    'filename': getattr(file, 'name', 'unknown'),
+                    'error': str(e),
+                })
+
+        ctx = {'request': request, 'view': self}
         response_serializer = DocumentSerializer(
-            created_documents,
-            many=True,
-            context=self.get_serializer_context()
+            created_documents, many=True, context=ctx,
         )
-        
+
         response_data = {
-            'created': len(created_documents),
-            'failed': len(errors),
-            'documents': response_serializer.data
+            'successful': successful,
+            'failed': failed,
+            'created': len(successful),
+            'documents': response_serializer.data,
         }
-        
-        if errors:
-            response_data['errors'] = errors
-        
-        # Return 201 if all succeeded, 207 (Multi-Status) if some failed, 400 if all failed
-        if len(errors) == 0:
+        if failed:
+            response_data['errors'] = failed
+
+        if not failed:
             return Response(response_data, status=status.HTTP_201_CREATED)
-        elif len(created_documents) > 0:
+        elif successful:
             return Response(response_data, status=status.HTTP_207_MULTI_STATUS)
         else:
-            return Response(response_data, status=status.HTTP_400_BAD_REQUEST)
+            return Response(
+                {"message": "Failed to upload documents", "failed": failed},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
     
 
 class DocumentListAPIView(ListAPIView):
@@ -417,9 +413,40 @@ class DocumentViewSet(
         )
         # Asociar el documento a allowed_documents también
         session.allowed_documents.add(document)
-        
+
         serializer = ChatSessionSerializer(
             session,
             context={"request": request}
         )
         return Response(serializer.data, status=status.HTTP_201_CREATED)
+
+
+class CategoryViewSet(viewsets.ModelViewSet):
+    queryset = Category.objects.none()
+    permission_classes = [permissions.IsAuthenticated]
+    lookup_field = 'slug'
+
+    def get_queryset(self):
+        user = self.request.user
+        if user.is_staff:
+            return Category.objects.all()
+        return Category.objects.filter(owner=user)
+
+    def get_serializer_class(self):
+        if self.action in ('create', 'update', 'partial_update'):
+            return CategoryWriteSerializer
+        return CategorySerializer
+
+    def perform_create(self, serializer):
+        serializer.save(owner=self.request.user)
+
+    def perform_update(self, serializer):
+        instance = self.get_object()
+        if instance.owner != self.request.user and not self.request.user.is_staff:
+            raise PermissionDenied("You do not have permission to edit this category.")
+        serializer.save()
+
+    def perform_destroy(self, instance):
+        if instance.owner != self.request.user and not self.request.user.is_staff:
+            raise PermissionDenied("You do not have permission to delete this category.")
+        instance.delete()

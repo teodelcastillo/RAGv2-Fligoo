@@ -208,3 +208,42 @@ class DocumentShare(models.Model):
 
     def __str__(self):
         return f"{self.document_id}-{self.user_id}-{self.role}"
+
+
+class Category(models.Model):
+    owner = models.ForeignKey(
+        User,
+        related_name="categories",
+        on_delete=models.CASCADE,
+    )
+    name = models.CharField(max_length=255)
+    slug = models.SlugField(unique=True, blank=True, max_length=255)
+    parent = models.ForeignKey(
+        "self",
+        null=True,
+        blank=True,
+        related_name="children",
+        on_delete=models.CASCADE,
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name_plural = "categories"
+        ordering = ("name",)
+
+    def __str__(self) -> str:
+        return self.name
+
+    def save(self, *args, **kwargs):
+        if not self.slug:
+            base = slugify(self.name) or "category"
+            base = base[:255]
+            slug = base
+            counter = 1
+            while Category.objects.filter(slug=slug).exclude(pk=self.pk).exists():
+                suffix = f"-{counter}"
+                slug = f"{base[:255 - len(suffix)]}{suffix}"
+                counter += 1
+            self.slug = slug
+        super().save(*args, **kwargs)

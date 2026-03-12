@@ -16,6 +16,11 @@ class ChatSessionSerializer(serializers.ModelSerializer):
         read_only=True,
         allow_null=True,
     )
+    project_slug = serializers.SlugField(
+        source="project.slug",
+        read_only=True,
+        allow_null=True,
+    )
 
     class Meta:
         model = ChatSession
@@ -31,6 +36,7 @@ class ChatSessionSerializer(serializers.ModelSerializer):
             "updated_at",
             "document_slugs",
             "primary_document_slug",
+            "project_slug",
         )
 
     def get_document_slugs(self, obj: ChatSession) -> List[str]:

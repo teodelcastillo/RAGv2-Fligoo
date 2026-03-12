@@ -1,6 +1,6 @@
 from rest_framework import serializers
 from django.contrib.auth import get_user_model
-from apps.document.models import SmartChunk, Document, DocumentShare, DocumentShareRole
+from apps.document.models import SmartChunk, Document, DocumentShare, DocumentShareRole, Category
 
 User = get_user_model()
 
@@ -25,7 +25,10 @@ class DocumentCreateSerializer(serializers.ModelSerializer):
     category = serializers.CharField(required=False, allow_blank=True, allow_null=True, max_length=255)
     description = serializers.CharField(required=False, allow_blank=True)
     is_public = serializers.BooleanField(required=False, default=False)
-    
+    project_slug = serializers.SlugField(
+        write_only=True, required=False, allow_blank=True,
+    )
+
     class Meta:
         model = Document
         fields = [
@@ -34,16 +37,31 @@ class DocumentCreateSerializer(serializers.ModelSerializer):
             'category',
             'description',
             'is_public',
+            'project_slug',
         ]
-    
+
     def validate_file(self, value):
-        """Ensure the file is provided and not empty."""
         if not value:
             raise serializers.ValidationError("File is required.")
         return value
-    
+
+    def validate_project_slug(self, value):
+        if not value:
+            return value
+        from apps.project.models import Project
+        try:
+            project = Project.objects.get(slug=value)
+        except Project.DoesNotExist:
+            raise serializers.ValidationError("Project not found.")
+        request = self.context.get('request')
+        if request and not project.can_edit(request.user):
+            raise serializers.ValidationError(
+                "You do not have permission to add documents to this project."
+            )
+        self._project = project
+        return value
+
     def validate_is_public(self, value):
-        """Only superusers can set is_public field"""
         request = self.context.get('request')
         if request and hasattr(request, 'user'):
             if value and not request.user.is_superuser:
@@ -52,36 +70,53 @@ class DocumentCreateSerializer(serializers.ModelSerializer):
                 )
         return value
 
+    def create(self, validated_data):
+        validated_data.pop('project_slug', None)
+        return super().create(validated_data)
+
 
 class DocumentBulkCreateSerializer(serializers.Serializer):
-    """Serializer for bulk document upload - accepts multiple files"""
     files = serializers.ListField(
         child=serializers.FileField(required=True, allow_null=False, allow_empty_file=False),
         required=True,
         min_length=1,
-        max_length=100,  # Limitar a 100 archivos por request para evitar sobrecarga
+        max_length=100,
     )
     name = serializers.CharField(required=False, allow_blank=True, max_length=255)
     category = serializers.CharField(required=False, allow_blank=True, allow_null=True, max_length=255)
     description = serializers.CharField(required=False, allow_blank=True)
     is_public = serializers.BooleanField(required=False, default=False)
-    
+    project_slug = serializers.SlugField(
+        write_only=True, required=False, allow_blank=True,
+    )
+
     def validate_files(self, value):
-        """Validate that at least one file is provided and not empty."""
         if not value or len(value) == 0:
             raise serializers.ValidationError("At least one file is required.")
-        
-        # Validar que ningún archivo esté vacío
         for file in value:
             if not file:
                 raise serializers.ValidationError("All files must be provided and not empty.")
             if file.size == 0:
                 raise serializers.ValidationError("Files cannot be empty.")
-        
         return value
-    
+
+    def validate_project_slug(self, value):
+        if not value:
+            return value
+        from apps.project.models import Project
+        try:
+            project = Project.objects.get(slug=value)
+        except Project.DoesNotExist:
+            raise serializers.ValidationError("Project not found.")
+        request = self.context.get('request')
+        if request and not project.can_edit(request.user):
+            raise serializers.ValidationError(
+                "You do not have permission to add documents to this project."
+            )
+        self._project = project
+        return value
+
     def validate_is_public(self, value):
-        """Only superusers can set is_public field"""
         request = self.context.get('request')
         if request and hasattr(request, 'user'):
             if value and not request.user.is_superuser:
@@ -230,6 +265,58 @@ class DocumentShareWriteSerializer(serializers.Serializer):
                 'user_email': "El propietario del documento no puede ser compartido."
             })
         
-        # Reemplazar user_email con user para que la vista lo use
         attrs['user'] = user
         return attrs
+
+
+class CategorySerializer(serializers.ModelSerializer):
+    children = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Category
+        fields = (
+            'id', 'slug', 'name', 'parent', 'children',
+            'created_at', 'updated_at',
+        )
+        read_only_fields = ('id', 'slug', 'created_at', 'updated_at')
+
+    def get_children(self, obj):
+        qs = obj.children.all()
+        if not qs.exists():
+            return []
+        return CategorySerializer(qs, many=True).data
+
+
+class CategoryWriteSerializer(serializers.ModelSerializer):
+    parent_slug = serializers.SlugField(required=False, allow_blank=True, write_only=True)
+
+    class Meta:
+        model = Category
+        fields = ('name', 'parent_slug')
+
+    def validate_parent_slug(self, value):
+        if not value:
+            return value
+        try:
+            parent = Category.objects.get(slug=value)
+        except Category.DoesNotExist:
+            raise serializers.ValidationError("Parent category not found.")
+        request = self.context.get('request')
+        if request and parent.owner != request.user and not request.user.is_staff:
+            raise serializers.ValidationError("You do not own this parent category.")
+        self._parent = parent
+        return value
+
+    def create(self, validated_data):
+        validated_data.pop('parent_slug', None)
+        parent = getattr(self, '_parent', None)
+        if parent:
+            validated_data['parent'] = parent
+        return super().create(validated_data)
+
+    def update(self, instance, validated_data):
+        validated_data.pop('parent_slug', None)
+        parent = getattr(self, '_parent', None)
+        if parent:
+            validated_data['parent'] = parent
+        return super().update(instance, validated_data)

@@ -4,13 +4,19 @@ from django.http import JsonResponse
 from django.utils import timezone
 
 
+import logging
+
+logger = logging.getLogger(__name__)
+
+
 def health_check(request):
     db_ok = True
     try:
         with connections["default"].cursor() as cursor:
             cursor.execute("SELECT 1;")
             cursor.fetchone()
-    except OperationalError:
+    except Exception as exc:
+        logger.error("Health check DB failed: %s", exc)
         db_ok = False
 
     status_code = 200 if db_ok else 503

@@ -1,0 +1,94 @@
+name: Build & Deploy to ECS
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'backend/**'
+      - '.github/workflows/deploy.yml'
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: us-east-2
+  ECR_REPOSITORY: ecofilia-api
+  ECS_CLUSTER: cluster-ecofilia
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::028780196116:role/ecofilia-github-deploy
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build, tag, and push image
+        id: build
+        working-directory: backend
+        run: |
+          IMAGE_TAG=${{ github.sha }}
+          ECR_URI=${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPOSITORY }}
+
+          docker build -f docker/Dockerfile.prod -t $ECR_URI:$IMAGE_TAG .
+          docker push $ECR_URI:$IMAGE_TAG
+
+          echo "image=$ECR_URI:$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+      - name: Update API task definition
+        id: api-task
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition-arn: arn:aws:ecs:us-east-2:028780196116:task-definition/ecofilia-api
+          container-name: api
+          image: ${{ steps.build.outputs.image }}
+
+      - name: Deploy API service
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.api-task.outputs.task-definition }}
+          service: ecofilia-api
+          cluster: ${{ env.ECS_CLUSTER }}
+          wait-for-service-stability: true
+
+      - name: Update Worker task definition
+        id: worker-task
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition-arn: arn:aws:ecs:us-east-2:028780196116:task-definition/ecofilia-worker
+          container-name: worker
+          image: ${{ steps.build.outputs.image }}
+
+      - name: Deploy Worker service
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.worker-task.outputs.task-definition }}
+          service: ecofilia-worker
+          cluster: ${{ env.ECS_CLUSTER }}
+          wait-for-service-stability: true
+
+      - name: Update Beat task definition
+        id: beat-task
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition-arn: arn:aws:ecs:us-east-2:028780196116:task-definition/ecofilia-beat
+          container-name: beat
+          image: ${{ steps.build.outputs.image }}
+
+      - name: Deploy Beat service
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.beat-task.outputs.task-definition }}
+          service: ecofilia-beat
+          cluster: ${{ env.ECS_CLUSTER }}
+          wait-for-service-stability: true

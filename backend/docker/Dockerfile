@@ -16,3 +16,5 @@ RUN poetry config virtualenvs.create false && \
 
 # Copy the rest of the source code
 COPY . /code
+
+CMD ["gunicorn", "main.wsgi:application", "--bind", "0.0.0.0:8000", "--log-level=info", "--timeout=500"]

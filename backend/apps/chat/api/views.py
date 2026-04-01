@@ -24,6 +24,14 @@ logger = logging.getLogger(__name__)
 MAX_HISTORY_MESSAGES = int(os.environ.get("CHAT_HISTORY_MESSAGES", "10"))
 
 
+class ChatCompletionFailed(APIException):
+    """OpenAI u otro fallo al generar respuesta — 503 para que el cliente reciba JSON con detail."""
+
+    status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+    default_detail = "No se pudo generar la respuesta del asistente."
+    default_code = "chat_completion_failed"
+
+
 class ChatSessionViewSet(
     mixins.CreateModelMixin,
     mixins.ListModelMixin,
@@ -85,18 +93,27 @@ class ChatMessageViewSet(
         chunks = []
         context_block = None
 
-        # Si hay documentos disponibles, buscar chunks relevantes
+        # RAG: fallos aquí (embeddings, pgvector, API key) no deben tumbar el endpoint con 500 HTML
         if allowed_docs.exists():
-            chunks = fetch_relevant_chunks(
-                user=request.user,
-                query_text=content,
-                allowed_documents=allowed_docs,
-            )
-            context_block = build_context_block(chunks)
+            try:
+                chunks = fetch_relevant_chunks(
+                    user=request.user,
+                    query_text=content,
+                    allowed_documents=allowed_docs,
+                )
+                context_block = build_context_block(chunks) if chunks else None
+            except Exception as exc:
+                logger.exception("Chat RAG / embeddings failed (session=%s): %s", session.id, exc)
+                chunks = []
+                context_block = None
+
+        system_text = (session.system_prompt or "").strip() or (
+            "Eres Ecofilia, un asistente útil. Responde de forma clara y concisa."
+        )
 
         # Construir mensajes base
         base_messages = [
-            {"role": MessageRole.SYSTEM, "content": session.system_prompt.strip()},
+            {"role": str(MessageRole.SYSTEM), "content": system_text},
         ]
         
         # Si hay contexto de documentos, agregarlo con prioridad
@@ -118,11 +135,11 @@ class ChatMessageViewSet(
             [:MAX_HISTORY_MESSAGES]
         )
         history_messages = [
-            {"role": message.role, "content": message.content}
+            {"role": str(message.role), "content": message.content or ""}
             for message in reversed(list(history_qs))
         ]
         messages = base_messages + history_messages
-        messages.append({"role": MessageRole.USER, "content": content})
+        messages.append({"role": str(MessageRole.USER), "content": content})
 
         with transaction.atomic():
             user_message = ChatMessage.objects.create(
@@ -140,23 +157,21 @@ class ChatMessageViewSet(
             except Exception as exc:  # pragma: no cover - network failure
                 error_msg = str(exc)
                 logger.exception("Error al generar respuesta de OpenAI: %s", error_msg)
-                # Provide more specific error messages for common issues
                 if "api_key" in error_msg.lower() or "authentication" in error_msg.lower():
-                    raise APIException(
-                        "Error de autenticación con OpenAI. Verifica la configuración de la API key."
+                    raise ChatCompletionFailed(
+                        detail="Error de autenticación con OpenAI. Verifica la configuración de la API key.",
                     ) from exc
-                elif "rate limit" in error_msg.lower() or "quota" in error_msg.lower():
-                    raise APIException(
-                        "Límite de tasa excedido. Por favor, intenta de nuevo en unos momentos."
+                if "rate limit" in error_msg.lower() or "quota" in error_msg.lower():
+                    raise ChatCompletionFailed(
+                        detail="Límite de tasa excedido. Por favor, intenta de nuevo en unos momentos.",
                     ) from exc
-                elif "model" in error_msg.lower():
-                    raise APIException(
-                        f"Error con el modelo de OpenAI: {error_msg}"
+                if "model" in error_msg.lower():
+                    raise ChatCompletionFailed(
+                        detail=f"Error con el modelo de OpenAI: {error_msg}",
                     ) from exc
-                else:
-                    raise APIException(
-                        f"No fue posible generar la respuesta en este momento: {error_msg}"
-                    ) from exc
+                raise ChatCompletionFailed(
+                    detail=f"No fue posible generar la respuesta en este momento: {error_msg}",
+                ) from exc
 
             chunk_ids = [chunk.id for chunk in chunks]
             assistant_message = ChatMessage.objects.create(

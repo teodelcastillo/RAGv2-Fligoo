@@ -144,15 +144,21 @@ def generate_chat_completion(
         response = client.chat.completions.create(**request_params)
 
     # Extract the completion text from the response
-    if not response.choices or not response.choices[0].message.content:
+    if not response.choices:
         raise ValueError("OpenAI API returned an empty response")
-    
-    completion_text = response.choices[0].message.content.strip()
-    
-    # Extract usage information
-    usage = {
-        "input_tokens": response.usage.prompt_tokens,
-        "output_tokens": response.usage.completion_tokens,
-        "total_tokens": response.usage.total_tokens,
-    }
+
+    raw_content = response.choices[0].message.content
+    completion_text = (raw_content or "").strip()
+    if not completion_text:
+        raise ValueError("OpenAI API returned an empty response")
+
+    usage_obj = getattr(response, "usage", None)
+    if usage_obj is not None:
+        usage = {
+            "input_tokens": usage_obj.prompt_tokens or 0,
+            "output_tokens": usage_obj.completion_tokens or 0,
+            "total_tokens": usage_obj.total_tokens or 0,
+        }
+    else:
+        usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
     return completion_text, usage

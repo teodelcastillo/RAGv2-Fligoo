@@ -29,7 +29,8 @@ def fetch_relevant_chunks(
     if not doc_ids:
         return []
 
-    qs = SmartChunk.objects.filter(document_id__in=doc_ids)
+    # Chunks sin embedding rompen CosineDistance en pgvector y provocan 500
+    qs = SmartChunk.objects.filter(document_id__in=doc_ids).exclude(embedding__isnull=True)
     if not user.is_staff:
         # Incluir chunks de documentos propios, públicos, compartidos y de proyectos compartidos
         from apps.project.models import ProjectShare
@@ -42,6 +43,9 @@ def fetch_relevant_chunks(
             | Q(document__shares__user=user)
             | Q(document__projects__id__in=shared_project_ids)
         ).distinct()
+
+    if not qs.exists():
+        return []
 
     return list(qs.top_similar(query_text, top_n=top_n))
 

@@ -124,7 +124,9 @@
       "Bash(MSYS_NO_PATHCONV=1 aws ecs register-task-definition --cli-input-json \"file://C:/Users/teodo/AppData/Local/Temp/ecofilia_migrate_td.json\" --region us-east-2 --query 'taskDefinition.taskDefinitionArn' --output text)",
       "Bash(MSYS_NO_PATHCONV=1 aws ecs run-task --cli-input-json \"file://C:/Users/teodo/AppData/Local/Temp/ecofilia_migrate_run.json\" --region us-east-2 --query 'tasks[0].{taskArn:taskArn,status:lastStatus}' --output json)",
       "Bash(MSYS_NO_PATHCONV=1 aws ecs describe-tasks --cluster cluster-ecofilia --tasks \"arn:aws:ecs:us-east-2:028780196116:task/cluster-ecofilia/fb5c0e14517c42f3bef4daa710b7ce6c\" --region us-east-2 --query 'tasks[0].{status:lastStatus,exitCode:containers[0].exitCode,reason:containers[0].reason}' --output json)",
-      "Bash(MSYS_NO_PATHCONV=1 aws logs get-log-events --log-group-name /ecs/ecofilia-api --log-stream-name \"oneoff/oneoff/fb5c0e14517c42f3bef4daa710b7ce6c\" --region us-east-2 --query 'events[*].message' --output text)"
+      "Bash(MSYS_NO_PATHCONV=1 aws logs get-log-events --log-group-name /ecs/ecofilia-api --log-stream-name \"oneoff/oneoff/fb5c0e14517c42f3bef4daa710b7ce6c\" --region us-east-2 --query 'events[*].message' --output text)",
+      "Bash(powershell -Command \"Remove-Item ''C:\\\\Users\\\\teodo\\\\AppData\\\\Local\\\\Temp\\\\ecofilia_migrate_td.json'' -ErrorAction SilentlyContinue; Remove-Item ''C:\\\\Users\\\\teodo\\\\AppData\\\\Local\\\\Temp\\\\ecofilia_migrate_run.json'' -ErrorAction SilentlyContinue; Write-Host ''Cleaned''\")",
+      "Bash(MSYS_NO_PATHCONV=1 aws rds delete-db-instance --db-instance-identifier db-ecofilia-temp --skip-final-snapshot --region us-east-2 --query 'DBInstance.DBInstanceStatus' --output text)"
     ]
   }
 }

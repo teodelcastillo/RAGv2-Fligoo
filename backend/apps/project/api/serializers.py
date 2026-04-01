@@ -48,6 +48,7 @@ class ProjectSerializer(serializers.ModelSerializer):
     documents = ProjectDocumentSerializer(
         source="project_documents", many=True, read_only=True
     )
+    skill_executions_count = serializers.IntegerField(read_only=True, default=0)
 
     class Meta:
         model = Project
@@ -60,6 +61,7 @@ class ProjectSerializer(serializers.ModelSerializer):
             "owner",
             "owner_email",
             "documents",
+            "skill_executions_count",
             "created_at",
             "updated_at",
         )
@@ -69,6 +71,7 @@ class ProjectSerializer(serializers.ModelSerializer):
             "owner",
             "owner_email",
             "documents",
+            "skill_executions_count",
             "created_at",
             "updated_at",
         )

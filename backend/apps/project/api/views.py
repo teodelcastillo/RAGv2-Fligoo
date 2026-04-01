@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from django.db.models import Prefetch
+from django.db.models import Count, Prefetch
 from django.shortcuts import get_object_or_404
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
@@ -45,6 +45,7 @@ class ProjectViewSet(viewsets.ModelViewSet):
                     queryset=ProjectShare.objects.select_related("user"),
                 ),
             )
+            .annotate(skill_executions_count=Count("skill_executions", distinct=True))
             .distinct()
         )
 
@@ -164,6 +165,27 @@ class ProjectViewSet(viewsets.ModelViewSet):
 
         share.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
+
+    @action(
+        detail=True,
+        methods=["get"],
+        url_path="skill-executions",
+        url_name="skill-executions",
+    )
+    def skill_executions(self, request, slug=None):
+        """List all skill executions for a project."""
+        project = self.get_object()
+        if not project.can_view(request.user):
+            raise PermissionDenied("No tienes permisos para ver este proyecto.")
+        from apps.skill.models import SkillExecution
+        from apps.skill.api.serializers import SkillExecutionSerializer
+        executions = (
+            SkillExecution.objects.filter(project=project)
+            .select_related("skill", "owner", "document")
+            .order_by("-created_at")
+        )
+        serializer = SkillExecutionSerializer(executions, many=True)
+        return Response(serializer.data)
 
     @action(
         detail=True,

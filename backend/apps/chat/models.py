@@ -41,6 +41,14 @@ class ChatSession(models.Model):
         blank=True,
         help_text="Proyecto al que pertenece esta sesión de chat (si aplica)",
     )
+    repository = models.ForeignKey(
+        "repository.Repository",
+        related_name="chat_sessions",
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        help_text="Repositorio al que pertenece esta sesión de chat (si aplica)",
+    )
     title = models.CharField(max_length=255)
     system_prompt = models.TextField(
         blank=True,
@@ -67,6 +75,7 @@ class ChatSession(models.Model):
             models.Index(fields=("owner", "created_at")),
             models.Index(fields=("primary_document",)),
             models.Index(fields=("project", "owner", "created_at")),
+            models.Index(fields=("repository", "owner", "created_at")),
         ]
         constraints = [
             # Asegurar que solo haya una sesión primaria por documento y usuario

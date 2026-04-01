@@ -1,0 +1,168 @@
+from __future__ import annotations
+
+from django.db.models import Prefetch
+from django.shortcuts import get_object_or_404
+from rest_framework import status, viewsets
+from rest_framework.decorators import action
+from rest_framework.exceptions import PermissionDenied
+from rest_framework.permissions import IsAuthenticated
+from rest_framework.response import Response
+
+from apps.chat.models import ChatSession
+from apps.chat.api.serializers import ChatSessionSerializer, ChatSessionCreateSerializer
+from apps.document.models import Document
+from apps.repository.api.serializers import (
+    RepositoryDocumentAttachSerializer,
+    RepositorySerializer,
+    RepositoryWriteSerializer,
+)
+from apps.repository.models import Repository, RepositoryDocument, RepositoryType
+
+
+class RepositoryViewSet(viewsets.ModelViewSet):
+    queryset = Repository.objects.none()
+    permission_classes = [IsAuthenticated]
+    serializer_class = RepositorySerializer
+    lookup_field = "slug"
+
+    def get_queryset(self):
+        user = self.request.user
+        return (
+            Repository.objects.for_user(user)
+            .prefetch_related(
+                Prefetch(
+                    "repository_documents",
+                    queryset=RepositoryDocument.objects.select_related("document"),
+                ),
+            )
+        )
+
+    def get_serializer_class(self):
+        if self.action in {"create", "update", "partial_update"}:
+            return RepositoryWriteSerializer
+        return RepositorySerializer
+
+    def perform_create(self, serializer):
+        serializer.save(owner=self.request.user)
+
+    def perform_update(self, serializer):
+        repo = self.get_object()
+        if not repo.can_edit(self.request.user):
+            raise PermissionDenied("No tienes permisos para editar este repositorio.")
+        serializer.save()
+
+    def perform_destroy(self, instance):
+        if not instance.can_edit(self.request.user):
+            raise PermissionDenied("No tienes permisos para eliminar este repositorio.")
+        instance.delete()
+
+    # ------------------------------------------------------------------ #
+    # Documents                                                            #
+    # ------------------------------------------------------------------ #
+
+    @action(detail=True, methods=["post"], url_path="documents", url_name="add-documents")
+    def add_documents(self, request, slug=None):
+        repo = self.get_object()
+        if not repo.can_edit(request.user):
+            raise PermissionDenied("No tienes permisos para agregar fuentes a este repositorio.")
+        serializer = RepositoryDocumentAttachSerializer(
+            data=request.data, context={"request": request}
+        )
+        serializer.is_valid(raise_exception=True)
+        for document in serializer.get_documents():
+            RepositoryDocument.objects.get_or_create(
+                repository=repo, document=document
+            )
+        return Response(self._serialize_repo(repo), status=status.HTTP_200_OK)
+
+    @action(
+        detail=True,
+        methods=["delete"],
+        url_path=r"documents/(?P<document_slug>[^/]+)",
+        url_name="remove-document",
+    )
+    def remove_document(self, request, slug=None, document_slug=None):
+        repo = self.get_object()
+        if not repo.can_edit(request.user):
+            raise PermissionDenied("No tienes permisos para modificar este repositorio.")
+        document = get_object_or_404(Document, slug=document_slug)
+        deleted, _ = RepositoryDocument.objects.filter(
+            repository=repo, document=document
+        ).delete()
+        if not deleted:
+            return Response(
+                {"detail": "Documento no encontrado en el repositorio."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+    @action(
+        detail=True,
+        methods=["patch"],
+        url_path=r"documents/(?P<document_slug>[^/]+)/toggle",
+        url_name="toggle-document",
+    )
+    def toggle_document(self, request, slug=None, document_slug=None):
+        """Toggle is_active for a document in this repository."""
+        repo = self.get_object()
+        if not repo.can_manage_sources(request.user):
+            raise PermissionDenied("No tienes permisos para gestionar las fuentes de este repositorio.")
+        document = get_object_or_404(Document, slug=document_slug)
+        repo_doc = get_object_or_404(RepositoryDocument, repository=repo, document=document)
+        repo_doc.is_active = not repo_doc.is_active
+        repo_doc.save(update_fields=["is_active"])
+        return Response({"slug": document_slug, "is_active": repo_doc.is_active})
+
+    # ------------------------------------------------------------------ #
+    # Chat sessions                                                        #
+    # ------------------------------------------------------------------ #
+
+    @action(
+        detail=True,
+        methods=["get", "post"],
+        url_path="chat-sessions",
+        url_name="chat-sessions",
+    )
+    def chat_sessions(self, request, slug=None):
+        repo = self.get_object()
+
+        if request.method == "GET":
+            qs = (
+                ChatSession.objects.filter(owner=request.user, repository=repo)
+                .prefetch_related("allowed_documents")
+                .order_by("-updated_at")
+            )
+            serializer = ChatSessionSerializer(qs, many=True, context={"request": request})
+            return Response(serializer.data)
+
+        create_serializer = ChatSessionCreateSerializer(
+            data=request.data, context={"request": request}
+        )
+        create_serializer.is_valid(raise_exception=True)
+        validated = create_serializer.validated_data
+
+        session = ChatSession.objects.create(
+            owner=request.user,
+            repository=repo,
+            title=validated.get("title", f"Repository: {repo.name}"),
+            system_prompt=validated.get("system_prompt", ""),
+            model=validated.get("model", ChatSession._meta.get_field("model").default),
+            temperature=validated.get("temperature", 0.1),
+            language=validated.get("language", "es"),
+        )
+
+        slugs = validated.get("document_slugs", [])
+        if slugs:
+            docs = Document.objects.filter(slug__in=slugs)
+            session.allowed_documents.set(docs)
+
+        output = ChatSessionSerializer(session, context={"request": request})
+        return Response(output.data, status=status.HTTP_201_CREATED)
+
+    # ------------------------------------------------------------------ #
+    # Helpers                                                              #
+    # ------------------------------------------------------------------ #
+
+    def _serialize_repo(self, repo: Repository):
+        refreshed = self.get_queryset().get(pk=repo.pk)
+        return RepositorySerializer(refreshed, context=self.get_serializer_context()).data

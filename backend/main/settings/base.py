@@ -184,6 +184,10 @@ DATABASES = {
 ###############################################################################
 
 REST_FRAMEWORK = {
+    "DEFAULT_RENDERER_CLASSES": (
+        "rest_framework.renderers.JSONRenderer",
+        "rest_framework.renderers.BrowsableAPIRenderer",
+    ),
     "DEFAULT_AUTHENTICATION_CLASSES": (
         "rest_framework_simplejwt.authentication.JWTAuthentication",
         "rest_framework.authentication.SessionAuthentication",
@@ -259,6 +263,7 @@ USE_TZ = True
 # https://docs.djangoproject.com/en/3.0/howto/static-files/
 
 STATIC_URL = "/static/"
+SERVE_DJANGO_STATIC = _env_bool("SERVE_DJANGO_STATIC", "False")
 
 
 AUTHENTICATION_BACKENDS = ("django.contrib.auth.backends.ModelBackend",)

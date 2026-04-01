@@ -77,6 +77,7 @@ LOCAL_APPS = [
     "apps.chat",
     "apps.project",
     "apps.repository",
+    "apps.skill",
     "apps.evaluation",
     "apps.authentication",
 ]

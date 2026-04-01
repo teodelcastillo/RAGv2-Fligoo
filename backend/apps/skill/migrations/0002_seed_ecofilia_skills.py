@@ -275,7 +275,8 @@ def seed_skills(apps, schema_editor):
             },
         )
 
-    for data in COPILOT_SKILLS:
+    for raw in COPILOT_SKILLS:
+        data = {**raw}
         steps = data.pop("steps", [])
         skill, created = Skill.objects.get_or_create(
             slug=data["slug"],

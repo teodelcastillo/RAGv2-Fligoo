@@ -3,9 +3,11 @@ from __future__ import annotations
 from django.contrib.auth import get_user_model
 from rest_framework import serializers
 
-from apps.skill.models import ExecutionStatus, Skill, SkillExecution, SkillStep, SkillType
+from apps.skill.models import ExecutionStatus, Skill, SkillContext, SkillExecution, SkillStep, SkillType
 
 User = get_user_model()
+
+ALLOWED_CONTEXT_VALUES = {c.value for c in SkillContext}
 
 
 # ---------------------------------------------------------------------------
@@ -50,6 +52,17 @@ class SkillWriteSerializer(serializers.ModelSerializer):
             "allowed_contexts", "system_prompt", "prompt_template",
             "model", "temperature", "steps",
         )
+
+    def validate_allowed_contexts(self, value):
+        if not value:
+            raise serializers.ValidationError("At least one allowed context is required.")
+        invalid = set(value) - ALLOWED_CONTEXT_VALUES
+        if invalid:
+            raise serializers.ValidationError(
+                f"Invalid values: {sorted(invalid)}. "
+                f"Allowed: {sorted(ALLOWED_CONTEXT_VALUES)}."
+            )
+        return value
 
     def validate(self, attrs):
         skill_type = attrs.get("skill_type", SkillType.QUICK)

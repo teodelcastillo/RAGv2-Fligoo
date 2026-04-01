@@ -41,7 +41,11 @@ class SkillViewSet(viewsets.ModelViewSet):
             qs = qs.filter(skill_type=skill_type)
         context = self.request.query_params.get("context")
         if context:
-            qs = qs.filter(allowed_contexts__contains=context)
+            # Match skills whose allowed_contexts includes this context OR "any"
+            qs = qs.filter(
+                Q(allowed_contexts__contains=[context]) |
+                Q(allowed_contexts__contains=["any"])
+            )
         return qs
 
     def get_serializer_class(self):
@@ -75,6 +79,15 @@ class SkillViewSet(viewsets.ModelViewSet):
         serializer = RunSkillSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
+
+        # Validate the requested context type is allowed by this skill
+        context_type = data["context_type"]
+        if "any" not in skill.allowed_contexts and context_type not in skill.allowed_contexts:
+            return Response(
+                {"detail": f"This skill does not support '{context_type}' context. "
+                           f"Allowed: {skill.allowed_contexts}"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
         execution = SkillExecution.objects.create(
             skill=skill,

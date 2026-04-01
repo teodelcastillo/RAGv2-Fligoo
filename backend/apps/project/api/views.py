@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from django.db.models import Count, Prefetch
+from django.db.models import Count, OuterRef, Prefetch, Subquery  # Count used in subquery helper
 from django.shortcuts import get_object_or_404
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
@@ -24,6 +24,21 @@ from apps.project.api.serializers import (
 from apps.project.models import Project, ProjectDocument, ProjectShare
 
 
+def _skill_execution_count_subquery():
+    """
+    Returns a Subquery that counts SkillExecutions for a given project.
+    Defined as a function to keep the import lazy and avoid circular dependencies.
+    """
+    from apps.skill.models import SkillExecution
+    return (
+        SkillExecution.objects
+        .filter(project=OuterRef("pk"))
+        .values("project")
+        .annotate(c=Count("id"))
+        .values("c")[:1]
+    )
+
+
 class ProjectViewSet(viewsets.ModelViewSet):
     queryset = Project.objects.none()
     permission_classes = [IsAuthenticated, ProjectAccessPermission]
@@ -45,7 +60,11 @@ class ProjectViewSet(viewsets.ModelViewSet):
                     queryset=ProjectShare.objects.select_related("user"),
                 ),
             )
-            .annotate(skill_executions_count=Count("skill_executions", distinct=True))
+            .annotate(
+                skill_executions_count=Subquery(
+                    _skill_execution_count_subquery()
+                )
+            )
             .distinct()
         )
 

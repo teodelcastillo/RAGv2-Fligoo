@@ -26,7 +26,8 @@ dependencies = [
     "celery[sqs] (>=5.5.3,<6.0.0)",
     "boto3 (>=1.40.26,<2.0.0)",
     "django-storages (>=1.14.6,<2.0.0)",
-    "python-dotenv (>=1.0.0,<2.0.0)"
+    "python-dotenv (>=1.0.0,<2.0.0)",
+    "whitenoise (>=6.9.0,<7.0.0)"
 ]
 
 

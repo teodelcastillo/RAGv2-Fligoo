@@ -132,7 +132,16 @@
       "Bash(MSYS_NO_PATHCONV=1 aws ecs describe-task-definition --task-definition ecofilia-api:9 --region us-east-2 --query 'taskDefinition.containerDefinitions[0].image' --output text)",
       "Bash(MSYS_NO_PATHCONV=1 aws ecs describe-tasks --cluster cluster-ecofilia --tasks \"arn:aws:ecs:us-east-2:028780196116:task/cluster-ecofilia/50cf73fac17f4f9b827fd808314d16fe\" --region us-east-2 --query 'tasks[0].{status:lastStatus,exitCode:containers[0].exitCode,reason:containers[0].reason}' --output json)",
       "Bash(MSYS_NO_PATHCONV=1 aws logs get-log-events --log-group-name /ecs/ecofilia-api --log-stream-name \"oneoff/oneoff/50cf73fac17f4f9b827fd808314d16fe\" --region us-east-2 --query 'events[*].message' --output text)",
-      "Bash(powershell -Command \"Remove-Item ''C:\\\\Users\\\\teodo\\\\AppData\\\\Local\\\\Temp\\\\ecofilia_oneoff_td.json'',''C:\\\\Users\\\\teodo\\\\AppData\\\\Local\\\\Temp\\\\ecofilia_oneoff_run.json'' -ErrorAction SilentlyContinue\")"
+      "Bash(powershell -Command \"Remove-Item ''C:\\\\Users\\\\teodo\\\\AppData\\\\Local\\\\Temp\\\\ecofilia_oneoff_td.json'',''C:\\\\Users\\\\teodo\\\\AppData\\\\Local\\\\Temp\\\\ecofilia_oneoff_run.json'' -ErrorAction SilentlyContinue\")",
+      "Bash(ACCESS=\"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ0b2tlbl90eXBlIjoiYWNjZXNzIiwiZXhwIjoxNzc1MzQ0NDI4LCJpYXQiOjE3NzUzNDM1MjgsImp0aSI6ImNmZDBlYjYxZjNmYzRiYjhiYTQxMWE3MzMzMzUyYmNlIiwidXNlcl9pZCI6IjUifQ.A8o1Oq-UUlCJFj8ZyW5nF_JQsqLTNaBd4DjEZD1fF5g\" __NEW_LINE_d503b163558fd1e5__ curl -s -X GET https://api.ecofilia.site/api/chat/sessions/ -H \"Authorization: Bearer $ACCESS\")",
+      "Bash(python -m json.tool)",
+      "Bash(ACCESS=\"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ0b2tlbl90eXBlIjoiYWNjZXNzIiwiZXhwIjoxNzc1MzQ0NDI4LCJpYXQiOjE3NzUzNDM1MjgsImp0aSI6ImNmZDBlYjYxZjNmYzRiYjhiYTQxMWE3MzMzMzUyYmNlIiwidXNlcl9pZCI6IjUifQ.A8o1Oq-UUlCJFj8ZyW5nF_JQsqLTNaBd4DjEZD1fF5g\")",
+      "Bash(__NEW_LINE_75a0d2a5334c4ba8__ curl:*)",
+      "Bash(__NEW_LINE_f214a2f2d6480881__ curl:*)",
+      "Bash(MSYS_NO_PATHCONV=1 aws ecs describe-tasks --cluster cluster-ecofilia --tasks \"arn:aws:ecs:us-east-2:028780196116:task/cluster-ecofilia/e5b781d5839f49a88f1d7d8685b78b6c\" --region us-east-2 --query 'tasks[0].{status:lastStatus,exitCode:containers[0].exitCode}' --output json)",
+      "Bash(MSYS_NO_PATHCONV=1 aws logs get-log-events --log-group-name /ecs/ecofilia-api --log-stream-name \"oneoff/oneoff/e5b781d5839f49a88f1d7d8685b78b6c\" --region us-east-2 --query 'events[*].message' --output text)",
+      "Bash(MSYS_NO_PATHCONV=1 aws ecs run-task --cli-input-json \"file://C:/Users/teodo/AppData/Local/Temp/ecofilia_oneoff_run.json\" --region us-east-2 --query 'tasks[0].taskArn' --output text)",
+      "Bash(MSYS_NO_PATHCONV=1 aws logs get-log-events --log-group-name /ecs/ecofilia-api --log-stream-name \"oneoff/oneoff/49357ca1b565466994c97a817d623b8d\" --region us-east-2 --query 'events[*].message' --output text)"
     ]
   }
 }

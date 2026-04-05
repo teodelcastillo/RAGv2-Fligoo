@@ -40,6 +40,15 @@ class Document(models.Model):
     last_error = models.TextField(blank=True)
     retry_count = models.IntegerField(default=0)
     is_public = models.BooleanField(default=False)
+    year = models.IntegerField(blank=True, null=True, help_text="Año del documento")
+    region = models.CharField(max_length=255, blank=True, null=True, help_text="Región del documento")
+    topics = ArrayField(
+        base_field=models.TextField(),
+        blank=True,
+        default=list,
+        help_text="Temas o palabras clave del documento",
+    )
+    source = models.CharField(max_length=255, blank=True, null=True, help_text="Fuente del documento")
 
     def save(self, *args, **kwargs):
         # Si no hay name ni slug, generar ambos desde el nombre del archivo

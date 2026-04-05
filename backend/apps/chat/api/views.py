@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import json
 import logging
 import os
 
 from django.db import transaction
+from django.http import StreamingHttpResponse
 from rest_framework import mixins, status, viewsets
 from rest_framework.exceptions import APIException
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
+from rest_framework.views import APIView
 
 from apps.chat.api.serializers import (
     ChatMessageCreateSerializer,
@@ -17,7 +20,7 @@ from apps.chat.api.serializers import (
 )
 from apps.chat.models import ChatMessage, ChatSession, MessageRole
 from apps.chat.services.rag import build_context_block, fetch_relevant_chunks
-from apps.document.utils.client_openia import generate_chat_completion
+from apps.document.utils.client_openia import generate_chat_completion, generate_chat_completion_stream
 
 logger = logging.getLogger(__name__)
 
@@ -122,8 +125,12 @@ class ChatMessageViewSet(
                 {
                     "role": MessageRole.SYSTEM,
                     "content": (
-                        "Utiliza exclusivamente el siguiente contexto para responder. "
-                        "Si no hay suficiente información en el contexto, responde que no se encontró."
+                        "El siguiente contexto proviene de los documentos del usuario. "
+                        "Prioriza este contexto para responder. "
+                        "Si la información del contexto es suficiente, basate principalmente en ella. "
+                        "Si el contexto no contiene información relevante o es insuficiente, "
+                        "puedes complementar con tu conocimiento general, pero indica claramente "
+                        "qué parte proviene del documento y qué parte de tu conocimiento general."
                         f"\n\n{context_block}"
                     ),
                 }
@@ -188,3 +195,139 @@ class ChatMessageViewSet(
         }
         return Response(response_payload, status=status.HTTP_201_CREATED)
 
+
+def _build_chat_messages(session: ChatSession, content: str, user, max_history: int = MAX_HISTORY_MESSAGES):
+    """
+    Shared helper that builds the OpenAI messages list (RAG + history + user query).
+    Returns (openai_messages, chunks).
+    """
+    allowed_docs = session.allowed_documents.all()
+    chunks = []
+    context_block = None
+
+    if allowed_docs.exists():
+        try:
+            chunks = fetch_relevant_chunks(
+                user=user,
+                query_text=content,
+                allowed_documents=allowed_docs,
+            )
+            context_block = build_context_block(chunks) if chunks else None
+        except Exception as exc:
+            logger.exception("Chat RAG / embeddings failed (session=%s): %s", session.id, exc)
+
+    system_text = (session.system_prompt or "").strip() or (
+        "Eres Ecofilia, un asistente útil. Responde de forma clara y concisa."
+    )
+
+    base_messages = [{"role": str(MessageRole.SYSTEM), "content": system_text}]
+
+    if context_block:
+        base_messages.append(
+            {
+                "role": str(MessageRole.SYSTEM),
+                "content": (
+                    "El siguiente contexto proviene de los documentos del usuario. "
+                    "Prioriza este contexto para responder. "
+                    "Si la información del contexto es suficiente, basate principalmente en ella. "
+                    "Si el contexto no contiene información relevante o es insuficiente, "
+                    "puedes complementar con tu conocimiento general, pero indica claramente "
+                    "qué parte proviene del documento y qué parte de tu conocimiento general."
+                    f"\n\n{context_block}"
+                ),
+            }
+        )
+
+    history_qs = (
+        session.messages.order_by("-created_at")
+        .exclude(role=MessageRole.SYSTEM)
+        [:max_history]
+    )
+    history_messages = [
+        {"role": str(m.role), "content": m.content or ""}
+        for m in reversed(list(history_qs))
+    ]
+
+    messages = base_messages + history_messages
+    messages.append({"role": str(MessageRole.USER), "content": content})
+    return messages, chunks
+
+
+class ChatMessageStreamView(APIView):
+    """
+    POST /chat/messages/stream/
+
+    SSE endpoint — streams the assistant reply token-by-token.
+
+    Event types sent:
+      • {"type": "user_message", "message": {...}}   — the persisted user ChatMessage
+      • {"type": "chunk",        "content": "..."}   — incremental text fragment
+      • {"type": "done",         "message": {...}}   — the persisted assistant ChatMessage
+      • {"type": "error",        "detail":  "..."}   — on failure (user message is rolled back)
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, *args, **kwargs):
+        serializer = ChatMessageCreateSerializer(
+            data=request.data, context={"request": request}
+        )
+        serializer.is_valid(raise_exception=True)
+        session = serializer.validated_data["session"]
+        content = serializer.validated_data["content"]
+
+        messages, chunks = _build_chat_messages(session, content, request.user)
+
+        user_message = ChatMessage.objects.create(
+            session=session,
+            role=MessageRole.USER,
+            content=content,
+        )
+
+        def _event(payload: dict) -> str:
+            return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+        def stream():
+            yield _event(
+                {
+                    "type": "user_message",
+                    "message": ChatMessageSerializer(user_message).data,
+                }
+            )
+
+            collected: list[str] = []
+            try:
+                for text_chunk in generate_chat_completion_stream(
+                    messages,
+                    model=session.model,
+                    temperature=session.temperature,
+                ):
+                    collected.append(text_chunk)
+                    yield _event({"type": "chunk", "content": text_chunk})
+
+                answer_text = "".join(collected)
+                chunk_ids = [c.id for c in chunks]
+                assistant_message = ChatMessage.objects.create(
+                    session=session,
+                    role=MessageRole.ASSISTANT,
+                    content=answer_text,
+                    chunk_ids=chunk_ids,
+                )
+                yield _event(
+                    {
+                        "type": "done",
+                        "message": ChatMessageSerializer(assistant_message).data,
+                    }
+                )
+
+            except Exception as exc:
+                logger.exception(
+                    "Streaming chat completion failed (session=%s): %s", session.id, exc
+                )
+                user_message.delete()
+                yield _event({"type": "error", "detail": str(exc)})
+
+        response = StreamingHttpResponse(stream(), content_type="text/event-stream")
+        response["Cache-Control"] = "no-cache"
+        response["X-Accel-Buffering"] = "no"
+        return response

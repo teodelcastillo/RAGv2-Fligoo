@@ -28,6 +28,8 @@ from apps.chat.api.serializers import ChatSessionSerializer
 
 
 class RAGQueryView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
     def get(self, request):
         query_text = request.query_params.get("query")
         if not query_text:
@@ -186,7 +188,8 @@ class DocumentListAPIView(ListAPIView):
     queryset = Document.objects.all()
     serializer_class = DocumentSerializer
     filterset_class = DocumentFilter
-    
+    permission_classes = [permissions.IsAuthenticated]
+
     def get_queryset(self):
         qs = Document.objects.all()
         user = self.request.user

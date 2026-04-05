@@ -130,7 +130,7 @@ class DocumentSerializer(serializers.ModelSerializer):
     is_public = serializers.BooleanField(read_only=True)
     is_owner = serializers.SerializerMethodField()
     owner_email = serializers.EmailField(source='owner.email', read_only=True)
-    
+
     class Meta:
         model = Document
         fields = [
@@ -144,17 +144,17 @@ class DocumentSerializer(serializers.ModelSerializer):
             'is_owner',
             'owner_email',
             'created_at',
+            'chunking_status',
+            'chunking_done',
+            'last_error',
         ]
         read_only_fields = [
             'id',
             'slug',
             'created_at',
-            'extracted_text',
             'chunking_status',
             'chunking_done',
-            'chunking_offset',
             'last_error',
-            'retry_count',
             'is_public',
             'owner',
             'name',

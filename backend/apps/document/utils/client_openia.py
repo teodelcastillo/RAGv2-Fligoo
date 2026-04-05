@@ -18,7 +18,7 @@ Usage by App:
 - Evaluations: Uses generate_chat_completion() for structured evaluations
 """
 import os
-from typing import List, Tuple, Optional
+from typing import Generator, List, Tuple, Optional
 
 from openai import OpenAI
 
@@ -162,3 +162,34 @@ def generate_chat_completion(
     else:
         usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
     return completion_text, usage
+
+
+def generate_chat_completion_stream(
+    messages: List[dict],
+    *,
+    model: str | None = None,
+    temperature: float = 0.1,
+) -> Generator[str, None, None]:
+    """
+    Stream chat completion tokens from OpenAI.
+
+    Yields individual text chunks as they arrive.  The caller is responsible
+    for assembling the full response and persisting the ChatMessage record.
+    """
+    client = get_openai_client()
+    formatted_messages = [
+        {"role": m["role"], "content": m["content"]}
+        for m in messages
+    ]
+    stream = client.chat.completions.create(
+        model=model or MODEL_COMPLETION,
+        temperature=temperature,
+        messages=formatted_messages,
+        stream=True,
+    )
+    for chunk in stream:
+        if not chunk.choices:
+            continue
+        delta = chunk.choices[0].delta
+        if delta and delta.content:
+            yield delta.content

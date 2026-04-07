@@ -10,7 +10,14 @@ from django.utils import timezone
 from apps.chat.services.rag import build_context_block, fetch_relevant_chunks
 from apps.document.models import Document
 from apps.document.utils.client_openia import generate_chat_completion
-from apps.skill.models import ExecutionStatus, Skill, SkillExecution, SkillStep, SkillType
+from apps.skill.models import (
+    ExecutionStatus,
+    RetrievalStrategy,
+    Skill,
+    SkillExecution,
+    SkillStep,
+    SkillType,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -69,21 +76,66 @@ def _render_quick_prompt(template: str, context_block: str, extra_instructions: 
     return prompt.strip()
 
 
+def _comparative_instruction_block(strict_missing_evidence: bool) -> str:
+    lines = [
+        "Comparative output requirements:",
+        "1) Present findings by document first for each criterion.",
+        "2) For every criterion, include every active document even if there is no direct evidence.",
+    ]
+    if strict_missing_evidence:
+        lines.append(
+            "3) If a document does not contain evidence for a criterion, explicitly write: "
+            "'Sin evidencia en fuentes provistas'."
+        )
+    else:
+        lines.append(
+            "3) If evidence is missing, state that limitation clearly and avoid unsupported inference."
+        )
+    return "\n".join(lines).strip()
+
+
+def _collect_source_stats(chunks, total_docs: int) -> dict:
+    docs_covered = set()
+    chunks_per_document = {}
+    for c in chunks:
+        docs_covered.add(c.document.slug)
+        chunks_per_document[c.document.slug] = chunks_per_document.get(c.document.slug, 0) + 1
+    return {
+        "docs_total": total_docs,
+        "docs_covered": len(docs_covered),
+        "doc_coverage_ratio": round((len(docs_covered) / total_docs), 4) if total_docs else 0,
+        "chunks_per_document": chunks_per_document,
+    }
+
+
 def _run_quick(execution: SkillExecution, documents: QuerySet[Document]) -> None:
     skill = execution.skill
     query_text = f"{skill.name}. {skill.description}. {execution.extra_instructions}".strip()
+    effective_retrieval_strategy = (
+        RetrievalStrategy.HYBRID_PER_DOCUMENT
+        if skill.comparative_mode_enabled
+        else skill.retrieval_strategy
+    )
 
     chunks = fetch_relevant_chunks(
         user=execution.owner,
         query_text=query_text,
         allowed_documents=documents,
         top_n=DEFAULT_CHUNKS,
+        retrieval_strategy=effective_retrieval_strategy,
+        k_per_doc=skill.k_per_doc,
+        total_limit=skill.total_limit,
+        max_chunks_per_doc=skill.max_per_doc_after_rerank,
     )
     context_block = build_context_block(chunks)
 
     prompt = _render_quick_prompt(
         skill.prompt_template, context_block, execution.extra_instructions
     )
+    if skill.comparative_mode_enabled:
+        prompt = (
+            f"{prompt}\n\n{_comparative_instruction_block(skill.strict_missing_evidence)}"
+        ).strip()
     messages = [
         {"role": "system", "content": skill.system_prompt},
         {"role": "user", "content": prompt},
@@ -93,9 +145,14 @@ def _run_quick(execution: SkillExecution, documents: QuerySet[Document]) -> None
     )
 
     execution.output = output_text
+    source_stats = _collect_source_stats(chunks, total_docs=documents.count())
     execution.metadata = {
         "usage": usage,
         "chunks_used": len(chunks),
+        "comparative_mode_enabled": skill.comparative_mode_enabled,
+        "strict_missing_evidence": skill.strict_missing_evidence,
+        "retrieval_strategy_used": effective_retrieval_strategy,
+        **source_stats,
         "sources": [
             {
                 "document_slug": c.document.slug,
@@ -122,6 +179,12 @@ def _run_copilot(execution: SkillExecution, documents: QuerySet[Document]) -> No
 
     # Build a running summary of previous steps to feed as context
     previous_outputs: List[str] = []
+    all_step_chunks = []
+    effective_retrieval_strategy = (
+        RetrievalStrategy.HYBRID_PER_DOCUMENT
+        if skill.comparative_mode_enabled
+        else skill.retrieval_strategy
+    )
 
     for step in steps:
         query_text = f"{step.title}. {step.instructions}".strip()
@@ -131,7 +194,12 @@ def _run_copilot(execution: SkillExecution, documents: QuerySet[Document]) -> No
             query_text=query_text,
             allowed_documents=documents,
             top_n=DEFAULT_CHUNKS,
+            retrieval_strategy=effective_retrieval_strategy,
+            k_per_doc=skill.k_per_doc,
+            total_limit=skill.total_limit,
+            max_chunks_per_doc=skill.max_per_doc_after_rerank,
         )
+        all_step_chunks.extend(chunks)
         context_block = build_context_block(chunks)
 
         # Compose the full prompt for this step
@@ -150,6 +218,8 @@ def _run_copilot(execution: SkillExecution, documents: QuerySet[Document]) -> No
             lines.append(f"\n## Document context:\n{context_block}")
         else:
             lines.append("\n(No document content found for this section — note this in your output.)")
+        if skill.comparative_mode_enabled:
+            lines.append(f"\n## Comparative constraints:\n{_comparative_instruction_block(skill.strict_missing_evidence)}")
 
         prompt = "\n".join(lines)
         messages = [
@@ -167,7 +237,14 @@ def _run_copilot(execution: SkillExecution, documents: QuerySet[Document]) -> No
             total_usage[key] += usage.get(key, 0)
 
     execution.output_structured = {"steps": step_results}
-    execution.metadata = {"usage": total_usage}
+    source_stats = _collect_source_stats(all_step_chunks, total_docs=documents.count())
+    execution.metadata = {
+        "usage": total_usage,
+        "comparative_mode_enabled": skill.comparative_mode_enabled,
+        "strict_missing_evidence": skill.strict_missing_evidence,
+        "retrieval_strategy_used": effective_retrieval_strategy,
+        **source_stats,
+    }
 
 
 # ---------------------------------------------------------------------------

@@ -3,7 +3,15 @@ from __future__ import annotations
 from django.contrib.auth import get_user_model
 from rest_framework import serializers
 
-from apps.skill.models import ExecutionStatus, Skill, SkillContext, SkillExecution, SkillStep, SkillType
+from apps.skill.models import (
+    ExecutionStatus,
+    RetrievalStrategy,
+    Skill,
+    SkillContext,
+    SkillExecution,
+    SkillStep,
+    SkillType,
+)
 
 User = get_user_model()
 
@@ -29,7 +37,10 @@ class SkillSerializer(serializers.ModelSerializer):
         fields = (
             "id", "slug", "name", "description", "skill_type",
             "allowed_contexts", "system_prompt", "prompt_template",
-            "model", "temperature", "is_template",
+            "model", "temperature",
+            "comparative_mode_enabled", "strict_missing_evidence",
+            "retrieval_strategy", "k_per_doc", "total_limit", "max_per_doc_after_rerank",
+            "is_template",
             "owner", "owner_email", "steps",
             "created_at", "updated_at",
         )
@@ -50,7 +61,10 @@ class SkillWriteSerializer(serializers.ModelSerializer):
         fields = (
             "name", "description", "skill_type",
             "allowed_contexts", "system_prompt", "prompt_template",
-            "model", "temperature", "steps",
+            "model", "temperature",
+            "comparative_mode_enabled", "strict_missing_evidence",
+            "retrieval_strategy", "k_per_doc", "total_limit", "max_per_doc_after_rerank",
+            "steps",
         )
 
     def validate_allowed_contexts(self, value):
@@ -65,16 +79,66 @@ class SkillWriteSerializer(serializers.ModelSerializer):
         return value
 
     def validate(self, attrs):
+        existing = self.instance
         skill_type = attrs.get("skill_type", SkillType.QUICK)
         steps = attrs.get("steps", [])
+        comparative_mode_enabled = attrs.get(
+            "comparative_mode_enabled",
+            existing.comparative_mode_enabled if existing else False,
+        )
+        retrieval_strategy = attrs.get(
+            "retrieval_strategy",
+            existing.retrieval_strategy if existing else RetrievalStrategy.GLOBAL,
+        )
+        k_per_doc = attrs.get("k_per_doc", existing.k_per_doc if existing else 2)
+        total_limit = attrs.get("total_limit", existing.total_limit if existing else 12)
+        max_per_doc_after_rerank = attrs.get(
+            "max_per_doc_after_rerank",
+            existing.max_per_doc_after_rerank if existing else 4,
+        )
+
         if skill_type == SkillType.COPILOT and not steps:
             raise serializers.ValidationError(
                 {"steps": "Copilot skills require at least one step."}
             )
-        if skill_type == SkillType.QUICK and not attrs.get("prompt_template", "").strip():
+        effective_prompt_template = attrs.get(
+            "prompt_template",
+            existing.prompt_template if existing else "",
+        )
+        if skill_type == SkillType.QUICK and not effective_prompt_template.strip():
             raise serializers.ValidationError(
                 {"prompt_template": "Quick skills require a prompt template."}
             )
+        if retrieval_strategy not in {choice for choice, _ in RetrievalStrategy.choices}:
+            raise serializers.ValidationError(
+                {"retrieval_strategy": "Invalid retrieval strategy."}
+            )
+        if k_per_doc < 1 or k_per_doc > 10:
+            raise serializers.ValidationError(
+                {"k_per_doc": "k_per_doc must be between 1 and 10."}
+            )
+        if total_limit < 1 or total_limit > 50:
+            raise serializers.ValidationError(
+                {"total_limit": "total_limit must be between 1 and 50."}
+            )
+        if max_per_doc_after_rerank < 1 or max_per_doc_after_rerank > 20:
+            raise serializers.ValidationError(
+                {
+                    "max_per_doc_after_rerank": (
+                        "max_per_doc_after_rerank must be between 1 and 20."
+                    )
+                }
+            )
+        if max_per_doc_after_rerank > total_limit:
+            raise serializers.ValidationError(
+                {
+                    "max_per_doc_after_rerank": (
+                        "max_per_doc_after_rerank cannot exceed total_limit."
+                    )
+                }
+            )
+        if comparative_mode_enabled and retrieval_strategy == RetrievalStrategy.GLOBAL:
+            attrs["retrieval_strategy"] = RetrievalStrategy.HYBRID_PER_DOCUMENT
         return attrs
 
     def create(self, validated_data):

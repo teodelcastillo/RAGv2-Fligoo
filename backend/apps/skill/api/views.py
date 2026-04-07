@@ -120,6 +120,7 @@ class SkillViewSet(viewsets.ModelViewSet):
 class SkillExecutionViewSet(
     mixins.ListModelMixin,
     mixins.RetrieveModelMixin,
+    mixins.DestroyModelMixin,
     viewsets.GenericViewSet,
 ):
     """

@@ -14,6 +14,11 @@ class SkillType(models.TextChoices):
     COPILOT = "copilot", _("Copilot")
 
 
+class RetrievalStrategy(models.TextChoices):
+    GLOBAL = "global", _("Global")
+    HYBRID_PER_DOCUMENT = "hybrid_per_document", _("Hybrid Per Document")
+
+
 class SkillContext(models.TextChoices):
     REPOSITORY = "repository", _("Repository")
     PROJECT = "project", _("Project")
@@ -76,6 +81,38 @@ class Skill(models.Model):
     )
     model = models.CharField(max_length=100, default=DEFAULT_MODEL)
     temperature = models.FloatField(default=0.3)
+    comparative_mode_enabled = models.BooleanField(
+        default=False,
+        help_text=(
+            "When enabled, enforce per-document comparative output and use "
+            "hybrid retrieval strategy by default."
+        ),
+    )
+    strict_missing_evidence = models.BooleanField(
+        default=True,
+        help_text=(
+            "When comparative mode is enabled, require explicit 'no evidence' "
+            "statements for missing document/criterion pairs."
+        ),
+    )
+    retrieval_strategy = models.CharField(
+        max_length=40,
+        choices=RetrievalStrategy.choices,
+        default=RetrievalStrategy.GLOBAL,
+        help_text="Chunk retrieval strategy to build model context.",
+    )
+    k_per_doc = models.PositiveSmallIntegerField(
+        default=2,
+        help_text="Candidate chunks to retrieve per document in hybrid mode.",
+    )
+    total_limit = models.PositiveSmallIntegerField(
+        default=12,
+        help_text="Maximum number of chunks included in the final merged context.",
+    )
+    max_per_doc_after_rerank = models.PositiveSmallIntegerField(
+        default=4,
+        help_text="Max chunks kept per document after global reranking.",
+    )
 
     # True = Ecofilia-provided, non-editable by regular users
     is_template = models.BooleanField(default=False)

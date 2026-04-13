@@ -7,7 +7,8 @@ from rest_framework.exceptions import PermissionDenied
 from rest_framework import viewsets, mixins
 from django.shortcuts import get_object_or_404
 
-from django.db.models import Q
+from django.db.models import Q, Count, Case, When, Value, CharField, F
+from rest_framework.pagination import PageNumberPagination
 
 from apps.document.models import SmartChunk, Document, DocumentShare, Category
 from apps.document.api.filters import DocumentFilter
@@ -182,7 +183,46 @@ class DocumentBulkCreateAPIView(APIView):
                 {"message": "Failed to upload documents", "failed": failed},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-    
+
+
+def _document_list_sort_order(request):
+    sort = request.query_params.get("sort", "recent")
+    order_map = {
+        "recent": ("-created_at",),
+        "oldest": ("created_at",),
+        "title": ("name",),
+        "title-desc": ("-name",),
+        "year-desc": ("-year", "name"),
+        "year-asc": ("year", "name"),
+    }
+    return order_map.get(sort, ("-created_at",))
+
+
+def _library_category_queryset(queryset, library_category):
+    if library_category == "__uncategorized__":
+        return queryset.filter(Q(category__isnull=True) | Q(category=""))
+    if library_category:
+        return queryset.filter(category=library_category)
+    return queryset
+
+
+class PublicDocumentListPagination(PageNumberPagination):
+    page_size = 20
+    page_query_param = "page"
+    page_size_query_param = "page_size"
+    max_page_size = 100
+
+    def get_page_size(self, request):
+        raw = request.query_params.get("per_page")
+        if raw is not None:
+            try:
+                n = int(raw)
+                if n > 0:
+                    return min(n, self.max_page_size)
+            except ValueError:
+                pass
+        return super().get_page_size(request)
+
 
 class DocumentListAPIView(ListAPIView):
     queryset = Document.objects.all()
@@ -228,6 +268,72 @@ class DocumentListAPIView(ListAPIView):
                 ).distinct()
 
         return qs
+
+    def list(self, request, *args, **kwargs):
+        if request.query_params.get("summary") == "categories":
+            if request.query_params.get("scope") != "public":
+                return Response(
+                    {"detail": "summary=categories is only supported with scope=public"},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            qs = self.filter_queryset(self.get_queryset())
+            aggregated = (
+                qs.annotate(
+                    cat_key=Case(
+                        When(Q(category__isnull=True) | Q(category=""), then=Value("__uncategorized__")),
+                        default=F("category"),
+                        output_field=CharField(),
+                    )
+                )
+                .values("cat_key")
+                .annotate(document_count=Count("id"))
+                .order_by("cat_key")
+            )
+            return Response(
+                {
+                    "categories": [
+                        {"category": row["cat_key"], "document_count": row["document_count"]}
+                        for row in aggregated
+                    ]
+                }
+            )
+
+        ids_param = request.query_params.get("ids")
+        if ids_param is not None and ids_param.strip() != "":
+            id_list = []
+            for part in ids_param.split(","):
+                part = part.strip()
+                if not part:
+                    continue
+                try:
+                    id_list.append(int(part))
+                except ValueError:
+                    return Response(
+                        {"detail": "Invalid ids parameter; use comma-separated integers"},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+            if len(id_list) > 200:
+                id_list = id_list[:200]
+            if not id_list:
+                return Response([])
+            qs = self.filter_queryset(self.get_queryset()).filter(id__in=id_list)
+            serializer = self.get_serializer(qs, many=True)
+            return Response(serializer.data)
+
+        paginate_flag = request.query_params.get("paginate", "").lower() in ("1", "true", "yes")
+        scope = request.query_params.get("scope", "all")
+        if paginate_flag and scope in ("own", "public", "all"):
+            queryset = self.filter_queryset(self.get_queryset())
+            library_category = request.query_params.get("library_category")
+            if library_category:
+                queryset = _library_category_queryset(queryset, library_category)
+            queryset = queryset.order_by(*_document_list_sort_order(request))
+            paginator = PublicDocumentListPagination()
+            page = paginator.paginate_queryset(queryset, request, view=self)
+            serializer = self.get_serializer(page, many=True)
+            return paginator.get_paginated_response(serializer.data)
+
+        return super().list(request, *args, **kwargs)
 
 
 class DocumentAccessPermission(permissions.BasePermission):

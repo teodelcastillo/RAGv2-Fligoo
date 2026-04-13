@@ -12,4 +12,6 @@ class DocumentFilter(django_filters.FilterSet):
             'chunking_status': ['exact'],
             'created_at': ['exact', 'year__gt', 'year__lt'],
             'is_public': ['exact'],
+            'region': ['exact'],
+            'year': ['exact'],
         }

@@ -5,8 +5,10 @@ import logging
 import os
 
 from django.db import transaction
+from django.db.models import Count
 from django.http import StreamingHttpResponse
 from rest_framework import mixins, status, viewsets
+from rest_framework.pagination import PageNumberPagination
 from rest_framework.exceptions import APIException
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
@@ -27,6 +29,12 @@ logger = logging.getLogger(__name__)
 MAX_HISTORY_MESSAGES = int(os.environ.get("CHAT_HISTORY_MESSAGES", "10"))
 
 
+class ChatSessionPagination(PageNumberPagination):
+    page_size = 25
+    page_size_query_param = "page_size"
+    max_page_size = 100
+
+
 class ChatCompletionFailed(APIException):
     """OpenAI u otro fallo al generar respuesta — 503 para que el cliente reciba JSON con detail."""
 
@@ -44,12 +52,23 @@ class ChatSessionViewSet(
 ):
     permission_classes = [IsAuthenticated]
     serializer_class = ChatSessionSerializer
+    pagination_class = ChatSessionPagination
 
     def get_queryset(self):
         qs = ChatSession.objects.prefetch_related("allowed_documents")
         if self.request.user.is_staff:
-            return qs
-        return qs.filter(owner=self.request.user)
+            base = qs
+        else:
+            base = qs.filter(owner=self.request.user)
+
+        # Listado: no devolver sesiones vacías salvo ?include_empty=true (evita ruido y carga innecesaria).
+        if getattr(self, "action", None) == "list":
+            raw = (self.request.query_params.get("include_empty") or "").lower()
+            if raw not in ("1", "true", "yes"):
+                base = base.annotate(_ecofilia_msg_count=Count("messages")).filter(
+                    _ecofilia_msg_count__gt=0
+                )
+        return base
 
     def get_serializer_class(self):
         if self.action == "create":

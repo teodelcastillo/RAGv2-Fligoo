@@ -247,8 +247,9 @@ class ProjectViewSet(viewsets.ModelViewSet):
 
         if request.method == "GET":
             qs = (
-                ChatSession.objects
-                .filter(owner=request.user, project=project)
+                ChatSession.objects.filter(owner=request.user, project=project)
+                .annotate(_ecofilia_msg_count=Count("messages"))
+                .filter(_ecofilia_msg_count__gt=0)
                 .prefetch_related("allowed_documents")
                 .order_by("-updated_at")
             )

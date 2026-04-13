@@ -23,27 +23,3 @@ def handle_document_post_save(sender, instance: Document, created: bool, **kwarg
     else:
         transaction.on_commit(lambda: process_document_chunks.delay(instance.pk))
 
-
-@receiver(post_save, sender=Document)
-def create_document_chat_session(sender, instance: Document, created: bool, **kwargs):
-    """Crear automáticamente una sesión de chat cuando se crea un documento"""
-    if created:
-        from apps.chat.models import ChatSession
-        
-        # Usar get_or_create para evitar duplicados si el signal se ejecuta múltiples veces
-        session, created_session = ChatSession.objects.get_or_create(
-            owner=instance.owner,
-            primary_document=instance,
-            defaults={
-                "title": f"Chat: {instance.name}",
-            }
-        )
-        
-        # Asegurar que el documento esté en allowed_documents
-        if created_session:
-            session.allowed_documents.add(instance)
-            logger.info(
-                "Created chat session for document: id=%s, session_id=%s",
-                instance.id,
-                session.id
-            )

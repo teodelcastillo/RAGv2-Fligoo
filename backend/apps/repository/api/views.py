@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from django.db.models import Prefetch
+from django.db.models import Count, Prefetch
 from django.shortcuts import get_object_or_404
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
@@ -129,6 +129,8 @@ class RepositoryViewSet(viewsets.ModelViewSet):
         if request.method == "GET":
             qs = (
                 ChatSession.objects.filter(owner=request.user, repository=repo)
+                .annotate(_ecofilia_msg_count=Count("messages"))
+                .filter(_ecofilia_msg_count__gt=0)
                 .prefetch_related("allowed_documents")
                 .order_by("-updated_at")
             )

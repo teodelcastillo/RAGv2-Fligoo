@@ -188,8 +188,8 @@ class DocumentBulkCreateAPIView(APIView):
 
 class DocumentBulkPublicAPIView(APIView):
     """
-    Superusers only: bulk set is_public on documents they own.
-    Slugs not owned by the request user are ignored.
+    Superusers only: bulk set is_public for the public sustainability library.
+    Applies to every matched slug (any owner); unknown slugs are skipped.
     """
 
     permission_classes = [permissions.IsAuthenticated]
@@ -204,7 +204,7 @@ class DocumentBulkPublicAPIView(APIView):
         slugs = list(dict.fromkeys(raw_slugs))
         is_public = serializer.validated_data["is_public"]
 
-        qs = Document.objects.filter(slug__in=slugs, owner=request.user)
+        qs = Document.objects.filter(slug__in=slugs)
         matched = qs.count()
         updated = qs.update(is_public=is_public)
 

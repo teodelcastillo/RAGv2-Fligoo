@@ -56,7 +56,7 @@ class DocumentBulkPublicAPITest(APITestCase):
         self.assertTrue(self.doc_a.is_public)
         self.assertTrue(self.doc_b.is_public)
 
-    def test_superuser_cannot_change_other_users_documents(self):
+    def test_superuser_can_change_any_document_for_public_library(self):
         self.client.force_authenticate(self.superuser)
         url = reverse("documentbulkpublic")
         response = self.client.post(
@@ -65,10 +65,10 @@ class DocumentBulkPublicAPITest(APITestCase):
             format="json",
         )
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual(response.data["updated"], 0)
-        self.assertEqual(response.data["matched"], 0)
+        self.assertEqual(response.data["updated"], 1)
+        self.assertEqual(response.data["matched"], 1)
         self.other_doc.refresh_from_db()
-        self.assertFalse(self.other_doc.is_public)
+        self.assertTrue(self.other_doc.is_public)
 
     def test_regular_user_forbidden(self):
         self.client.force_authenticate(self.regular)

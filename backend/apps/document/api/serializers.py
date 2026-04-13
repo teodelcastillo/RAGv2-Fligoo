@@ -76,7 +76,7 @@ class DocumentCreateSerializer(serializers.ModelSerializer):
 
 
 class DocumentBulkPublicSerializer(serializers.Serializer):
-    """Superusers only: set is_public on many owned documents at once."""
+    """Superusers only: bulk set is_public (public library visibility)."""
 
     slugs = serializers.ListField(
         child=serializers.SlugField(),

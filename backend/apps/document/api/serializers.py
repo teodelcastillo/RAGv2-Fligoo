@@ -75,6 +75,17 @@ class DocumentCreateSerializer(serializers.ModelSerializer):
         return super().create(validated_data)
 
 
+class DocumentBulkPublicSerializer(serializers.Serializer):
+    """Superusers only: set is_public on many owned documents at once."""
+
+    slugs = serializers.ListField(
+        child=serializers.SlugField(),
+        min_length=1,
+        max_length=200,
+    )
+    is_public = serializers.BooleanField()
+
+
 class DocumentBulkCreateSerializer(serializers.Serializer):
     files = serializers.ListField(
         child=serializers.FileField(required=True, allow_null=False, allow_empty_file=False),

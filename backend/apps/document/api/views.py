@@ -17,6 +17,7 @@ from apps.document.api.serializers import (
     DocumentSerializer,
     DocumentCreateSerializer,
     DocumentBulkCreateSerializer,
+    DocumentBulkPublicSerializer,
     DocumentDetailSerializer,
     DocumentUpdateSerializer,
     DocumentShareSerializer,
@@ -183,6 +184,38 @@ class DocumentBulkCreateAPIView(APIView):
                 {"message": "Failed to upload documents", "failed": failed},
                 status=status.HTTP_400_BAD_REQUEST,
             )
+
+
+class DocumentBulkPublicAPIView(APIView):
+    """
+    Superusers only: bulk set is_public on documents they own.
+    Slugs not owned by the request user are ignored.
+    """
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request, *args, **kwargs):
+        if not request.user.is_superuser:
+            raise PermissionDenied("Only superusers can bulk change document visibility.")
+
+        serializer = DocumentBulkPublicSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        raw_slugs = serializer.validated_data["slugs"]
+        slugs = list(dict.fromkeys(raw_slugs))
+        is_public = serializer.validated_data["is_public"]
+
+        qs = Document.objects.filter(slug__in=slugs, owner=request.user)
+        matched = qs.count()
+        updated = qs.update(is_public=is_public)
+
+        return Response(
+            {
+                "updated": updated,
+                "matched": matched,
+                "requested": len(slugs),
+            },
+            status=status.HTTP_200_OK,
+        )
 
 
 def _document_list_sort_order(request):

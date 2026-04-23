@@ -16,6 +16,38 @@ from apps.skill.models import (
 User = get_user_model()
 
 ALLOWED_CONTEXT_VALUES = {c.value for c in SkillContext}
+MULTI_DOCUMENT_CONTEXTS = {SkillContext.REPOSITORY.value, SkillContext.PROJECT.value}
+DOCUMENT_FIRST_KEYWORDS = (
+    "compar",
+    "versus",
+    "vs ",
+    "benchmark",
+    "checklist",
+    "extract",
+    "snapshot",
+    "map",
+    "diagnosis",
+    "table",
+    "matriz",
+    "criter",
+)
+
+
+def _requires_document_first_analysis(
+    *,
+    skill_type: str,
+    allowed_contexts: list[str],
+    name: str,
+    description: str,
+    prompt_template: str,
+) -> bool:
+    has_multi_document_scope = bool(set(allowed_contexts or []).intersection(MULTI_DOCUMENT_CONTEXTS))
+    if not has_multi_document_scope:
+        return False
+    if skill_type == SkillType.COPILOT:
+        return True
+    text = f"{name} {description} {prompt_template}".lower()
+    return any(keyword in text for keyword in DOCUMENT_FIRST_KEYWORDS)
 
 
 # ---------------------------------------------------------------------------
@@ -80,8 +112,15 @@ class SkillWriteSerializer(serializers.ModelSerializer):
 
     def validate(self, attrs):
         existing = self.instance
-        skill_type = attrs.get("skill_type", SkillType.QUICK)
+        skill_type = attrs.get(
+            "skill_type",
+            existing.skill_type if existing else SkillType.QUICK,
+        )
         steps = attrs.get("steps", [])
+        allowed_contexts = attrs.get(
+            "allowed_contexts",
+            existing.allowed_contexts if existing else [],
+        )
         comparative_mode_enabled = attrs.get(
             "comparative_mode_enabled",
             existing.comparative_mode_enabled if existing else False,
@@ -105,6 +144,19 @@ class SkillWriteSerializer(serializers.ModelSerializer):
             "prompt_template",
             existing.prompt_template if existing else "",
         )
+        name = attrs.get("name", existing.name if existing else "")
+        description = attrs.get("description", existing.description if existing else "")
+
+        if _requires_document_first_analysis(
+            skill_type=skill_type,
+            allowed_contexts=allowed_contexts,
+            name=name,
+            description=description,
+            prompt_template=effective_prompt_template,
+        ):
+            comparative_mode_enabled = True
+            attrs["comparative_mode_enabled"] = True
+            attrs["retrieval_strategy"] = RetrievalStrategy.HYBRID_PER_DOCUMENT
         if skill_type == SkillType.QUICK and not effective_prompt_template.strip():
             raise serializers.ValidationError(
                 {"prompt_template": "Quick skills require a prompt template."}

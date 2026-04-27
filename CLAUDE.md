@@ -136,6 +136,35 @@ backend/
 └── manage.py
 ```
 
+## Email — Amazon SES
+
+Backend configurado con `django-ses`. Templates HTML en `apps/authentication/templates/emails/`.
+
+**Emails implementados:**
+- `verification.html` — confirmación de cuenta al registrarse
+- `password_reset.html` — restablecimiento de contraseña
+
+**Variables de entorno necesarias en ECS (Secrets Manager o task definition):**
+```
+EMAIL_BACKEND=django_ses.SESBackend
+DEFAULT_FROM_EMAIL=no-reply@ecofilia.site
+AWS_SES_REGION_NAME=us-east-2
+```
+
+**Permisos IAM requeridos en `ecofiliaTaskRole`:**
+```json
+{ "Effect": "Allow", "Action": ["ses:SendEmail", "ses:SendRawEmail"], "Resource": "*" }
+```
+
+**Pasos para activar SES en producción:**
+1. Verificar dominio `ecofilia.site` en SES (consola → Verified identities → Create identity)
+2. Agregar registros DNS en Vercel (DKIM + MAIL FROM)
+3. Pedir salida del sandbox: SES → Account dashboard → Request production access
+4. Agregar las 3 variables de entorno en Secrets Manager `ecofilia/prod`
+5. Hacer deploy
+
+---
+
 ## Variables de entorno clave (en Secrets Manager `ecofilia/prod`)
 
 `SECRET_KEY`, `JWT_SIGNING_KEY`, `OPENAI_API_KEY`, `POSTGRES_HOST`, `POSTGRES_PORT`, `POSTGRES_NAME`, `POSTGRES_USER`, `POSTGRES_PASSWORD`

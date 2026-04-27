@@ -1,0 +1,28 @@
+{% extends "emails/base.html" %}
+
+{% block title %}Confirmá tu cuenta — Ecofilia{% endblock %}
+
+{% block content %}
+  <p class="greeting">Hola, {{ first_name }} 👋</p>
+
+  <p class="text">
+    Gracias por registrarte en Ecofilia. Para activar tu cuenta y comenzar a analizar
+    documentos ESG, confirmá tu dirección de correo electrónico.
+  </p>
+
+  <div class="btn-wrapper">
+    <a href="{{ verification_url }}" class="btn">Confirmar mi cuenta</a>
+  </div>
+
+  <p class="text">
+    Este enlace es válido por <strong>24 horas</strong>. Si vence, podés solicitar
+    uno nuevo desde la pantalla de login.
+  </p>
+
+  <hr class="divider" />
+
+  <p class="fallback">
+    ¿El botón no funciona? Copiá y pegá este enlace en tu navegador:<br />
+    <a href="{{ verification_url }}">{{ verification_url }}</a>
+  </p>
+{% endblock %}

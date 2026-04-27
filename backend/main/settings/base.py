@@ -275,6 +275,15 @@ DEFAULT_FROM_EMAIL = os.environ.get("DEFAULT_FROM_EMAIL", "no-reply@example.com"
 FRONTEND_BASE_URL = os.environ.get("FRONTEND_BASE_URL", "http://localhost:3000")
 MFA_ISSUER_NAME = os.environ.get("MFA_ISSUER_NAME", "Ecofilia")
 
+# Email backend — usa SES en prod, consola en dev si no hay credenciales
+EMAIL_BACKEND = os.environ.get(
+    "EMAIL_BACKEND",
+    "django.core.mail.backends.console.EmailBackend",
+)
+AWS_SES_REGION_NAME = os.environ.get("AWS_SES_REGION_NAME", "us-east-2")
+AWS_SES_REGION_ENDPOINT = f"email.{AWS_SES_REGION_NAME}.amazonaws.com"
+AWS_SES_FROM_EMAIL = DEFAULT_FROM_EMAIL
+
 SECURE_SSL_REDIRECT = _env_bool("SECURE_SSL_REDIRECT", "False")
 SESSION_COOKIE_SECURE = _env_bool("SESSION_COOKIE_SECURE", "False")
 CSRF_COOKIE_SECURE = _env_bool("CSRF_COOKIE_SECURE", "False")

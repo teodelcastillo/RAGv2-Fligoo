@@ -1,37 +1,49 @@
 from django.conf import settings
-from django.core.mail import send_mail
+from django.core.mail import EmailMultiAlternatives
+from django.template.loader import render_to_string
 
 
 class EmailService:
-    """Thin wrapper around Django's mailer to keep auth flows decoupled."""
 
     @staticmethod
-    def _send(subject: str, message: str, recipient: str) -> None:
-        send_mail(
+    def _send(subject: str, text_body: str, html_body: str, recipient: str) -> None:
+        msg = EmailMultiAlternatives(
             subject=subject,
-            message=message,
+            body=text_body,
             from_email=settings.DEFAULT_FROM_EMAIL,
-            recipient_list=[recipient],
-            fail_silently=False,
+            to=[recipient],
         )
+        msg.attach_alternative(html_body, "text/html")
+        msg.send(fail_silently=False)
 
     @classmethod
     def send_verification_email(cls, user, verification_url: str) -> None:
-        subject = "Confirma tu email"
-        message = (
-            f"Hola {user.first_name or user.email},\n\n"
-            f"Confirma tu cuenta haciendo clic en el siguiente enlace:\n{verification_url}\n\n"
-            "Si no solicitaste esta acción, ignora este correo."
+        first_name = user.first_name or user.email
+        context = {
+            "first_name": first_name,
+            "verification_url": verification_url,
+            "recipient_email": user.email,
+        }
+        html = render_to_string("emails/verification.html", context)
+        text = (
+            f"Hola {first_name},\n\n"
+            f"Confirmá tu cuenta haciendo clic en el siguiente enlace:\n{verification_url}\n\n"
+            "Si no solicitaste esta acción, ignorá este correo."
         )
-        cls._send(subject, message, user.email)
+        cls._send("Confirmá tu cuenta — Ecofilia", text, html, user.email)
 
     @classmethod
     def send_password_reset_email(cls, user, reset_url: str) -> None:
-        subject = "Restablecer contraseña"
-        message = (
-            f"Hola {user.first_name or user.email},\n\n"
-            f"Restablece tu contraseña usando el siguiente enlace:\n{reset_url}\n\n"
-            "Si no solicitaste este cambio, contacta al soporte inmediatamente."
+        first_name = user.first_name or user.email
+        context = {
+            "first_name": first_name,
+            "reset_url": reset_url,
+            "recipient_email": user.email,
+        }
+        html = render_to_string("emails/password_reset.html", context)
+        text = (
+            f"Hola {first_name},\n\n"
+            f"Restablecé tu contraseña usando el siguiente enlace:\n{reset_url}\n\n"
+            "Si no solicitaste este cambio, contactá al soporte inmediatamente."
         )
-        cls._send(subject, message, user.email)
-
+        cls._send("Restablecer contraseña — Ecofilia", text, html, user.email)

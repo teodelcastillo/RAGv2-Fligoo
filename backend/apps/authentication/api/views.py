@@ -54,7 +54,10 @@ class RegisterView(APIView):
         uid = TokenService.make_uid(user)
         token = TokenService.generate_token(user)
         verification_url = build_frontend_url("/auth/verify-email", {"uid": uid, "token": token})
-        EmailService.send_verification_email(user, verification_url)
+        try:
+            EmailService.send_verification_email(user, verification_url)
+        except Exception:
+            logger.exception("Failed to send verification email to %s", user.email)
 
         return Response(
             {
@@ -188,7 +191,10 @@ class PasswordResetRequestView(APIView):
             uid = TokenService.make_uid(user)
             token = TokenService.generate_token(user)
             reset_url = build_frontend_url("/auth/reset-password", {"uid": uid, "token": token})
-            EmailService.send_password_reset_email(user, reset_url)
+            try:
+                EmailService.send_password_reset_email(user, reset_url)
+            except Exception:
+                logger.exception("Failed to send password reset email to %s", user.email)
         return Response({"detail": _("Si el email existe recibirás instrucciones.")})
 
 

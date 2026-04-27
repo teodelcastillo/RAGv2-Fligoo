@@ -9,6 +9,8 @@ class DocumentFilter(django_filters.FilterSet):
             'name': ['exact', 'icontains'],
             'extracted_text': ['icontains'],
             'category': ['exact', 'icontains'],
+            'category_ref': ['exact'],
+            'category_ref__slug': ['exact'],
             'chunking_status': ['exact'],
             'created_at': ['exact', 'year__gt', 'year__lt'],
             'is_public': ['exact'],

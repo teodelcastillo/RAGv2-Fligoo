@@ -7,10 +7,13 @@ from rest_framework.exceptions import PermissionDenied
 from rest_framework import viewsets, mixins
 from django.shortcuts import get_object_or_404
 
+from collections import defaultdict
+
 from django.db.models import Q, Count, Case, When, Value, CharField, F
 from rest_framework.pagination import PageNumberPagination
 
 from apps.document.models import SmartChunk, Document, DocumentShare, Category
+from apps.document.category_utils import category_descendant_ids
 from apps.user.models import UserRole
 from apps.document.api.filters import DocumentFilter
 from apps.document.api.serializers import (
@@ -93,11 +96,6 @@ class DocumentCreateAPIView(CreateAPIView):
         serializer.is_valid(raise_exception=True)
         document = serializer.save(owner=request.user)
 
-        # In bulk uploads, a shared `name` causes slug collisions across files.
-        # Keep using the filename-derived name/slug for each document.
-        if len(validated_files) > 1:
-            document_props.pop('name', None)
-
         project = getattr(serializer, '_project', None)
         if project:
             from apps.project.models import ProjectDocument
@@ -124,7 +122,7 @@ class DocumentBulkCreateAPIView(APIView):
             )
 
         data = {'files': files}
-        for key in ('name', 'category', 'description', 'is_public', 'project_slug'):
+        for key in ('name', 'category', 'category_slug', 'description', 'is_public', 'project_slug'):
             if key in request.data:
                 data[key] = request.data[key]
 
@@ -136,8 +134,37 @@ class DocumentBulkCreateAPIView(APIView):
         validated_data = serializer.validated_data
         validated_files = validated_data['files']
 
-        document_props = {}
-        for key in ('name', 'category', 'description', 'is_public'):
+        from apps.document.category_utils import resolve_write_category
+
+        category_slug = validated_data.get('category_slug') or None
+        category_text = validated_data.get('category') or None
+        try:
+            if category_slug and str(category_slug).strip():
+                cat, cat_str = resolve_write_category(
+                    request.user,
+                    category_slug=str(category_slug).strip(),
+                    is_staff=request.user.is_staff,
+                )
+            else:
+                cat, cat_str = resolve_write_category(
+                    request.user,
+                    category_name=category_text,
+                    is_staff=request.user.is_staff,
+                )
+        except ValueError as e:
+            code = str(e)
+            if code == "category_not_found":
+                return Response(
+                    {"error": "Category not found."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            return Response(
+                {"error": "You do not have permission to use this category."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        document_props = {"category": cat_str, "category_ref": cat}
+        for key in ('name', 'description', 'is_public'):
             if key in validated_data:
                 document_props[key] = validated_data[key]
 
@@ -230,6 +257,78 @@ class DocumentBulkPublicAPIView(APIView):
         )
 
 
+def _expand_ancestor_ids(used_ids: set) -> set:
+    if not used_ids:
+        return set()
+    out = set(used_ids)
+    frontier = list(used_ids)
+    while frontier:
+        parents = {
+            p
+            for p in Category.objects.filter(id__in=frontier).values_list("parent_id", flat=True)
+            if p is not None
+        }
+        new = [p for p in parents if p not in out]
+        for p in new:
+            out.add(p)
+        frontier = new
+    return out
+
+
+def _build_category_tree_for_documents(qs):
+    """
+    Build nested category tree for a document queryset.
+    Counts: document_count_direct (only docs in this node), document_count_total (subtree).
+    """
+    from django.db.models import Count
+
+    direct_rows = (
+        qs.exclude(category_ref__isnull=True)
+        .values("category_ref_id")
+        .annotate(c=Count("id"))
+    )
+    direct = {r["category_ref_id"]: r["c"] for r in direct_rows}
+    if not direct:
+        unc = qs.filter(
+            Q(category_ref__isnull=True) & (Q(category__isnull=True) | Q(category=""))
+        ).count()
+        return {"uncategorized_count": unc, "tree": []}
+
+    used = _expand_ancestor_ids(set(direct.keys()))
+    categories = list(
+        Category.objects.filter(id__in=used)
+        .select_related("parent")
+        .order_by("name")
+    )
+    by_parent = defaultdict(list)
+    for c in categories:
+        by_parent[c.parent_id].append(c)
+
+    def total_for(cat_id: int) -> int:
+        t = 0
+        for did in category_descendant_ids(cat_id):
+            t += direct.get(did, 0)
+        return t
+
+    def build_node(c):
+        children_cats = sorted(by_parent.get(c.id, []), key=lambda x: (x.name or "").lower())
+        return {
+            "slug": c.slug,
+            "name": c.name,
+            "parent_slug": c.parent.slug if c.parent_id else None,
+            "document_count_direct": direct.get(c.id, 0),
+            "document_count_total": total_for(c.id),
+            "children": [build_node(ch) for ch in children_cats],
+        }
+
+    root_cats = sorted(by_parent.get(None, []), key=lambda x: (x.name or "").lower())
+    tree = [build_node(c) for c in root_cats]
+    unc = qs.filter(
+        Q(category_ref__isnull=True) & (Q(category__isnull=True) | Q(category=""))
+    ).count()
+    return {"uncategorized_count": unc, "tree": tree}
+
+
 def _document_list_sort_order(request):
     sort = request.query_params.get("sort", "recent")
     order_map = {
@@ -243,12 +342,20 @@ def _document_list_sort_order(request):
     return order_map.get(sort, ("-created_at",))
 
 
-def _library_category_queryset(queryset, library_category):
+def _library_category_queryset(queryset, library_category, subtree: bool = True):
     if library_category == "__uncategorized__":
-        return queryset.filter(Q(category__isnull=True) | Q(category=""))
-    if library_category:
+        return queryset.filter(
+            Q(category_ref__isnull=True) & (Q(category__isnull=True) | Q(category=""))
+        )
+    if not library_category:
+        return queryset
+    try:
+        cat = Category.objects.get(slug=library_category)
+    except Category.DoesNotExist:
         return queryset.filter(category=library_category)
-    return queryset
+    if subtree:
+        return queryset.filter(category_ref_id__in=category_descendant_ids(cat.id))
+    return queryset.filter(category_ref_id=cat.id)
 
 
 class PublicDocumentListPagination(PageNumberPagination):
@@ -276,45 +383,53 @@ class DocumentListAPIView(ListAPIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def get_queryset(self):
+        return self._get_queryset_base().select_related("category_ref", "owner")
+
+    def _get_queryset_base(self):
         qs = Document.objects.all()
         user = self.request.user
-        scope = self.request.query_params.get('scope', 'all')  # 'all', 'own', 'public', 'shared'
-        
+        scope = self.request.query_params.get("scope", "all")
+
         if user.is_staff:
-            # Staff puede ver todos, pero puede filtrar por scope
-            if scope == 'own':
+            if scope == "own":
                 qs = qs.filter(owner=user)
-            elif scope == 'public':
+            elif scope == "public":
                 qs = qs.filter(is_public=True)
-            elif scope == 'shared':
-                # Documentos compartidos con el usuario (excluyendo los propios)
+            elif scope == "shared":
                 qs = qs.filter(shares__user=user).exclude(owner=user).distinct()
-            # Si scope == 'all', no filtrar (ver todos)
         else:
-            # Usuarios no-staff: pueden ver sus propios documentos, los públicos y los compartidos
-            if scope == 'own':
+            if scope == "own":
                 qs = qs.filter(owner=user)
-            elif scope == 'public':
+            elif scope == "public":
                 qs = qs.filter(is_public=True)
-            elif scope == 'shared':
-                # Documentos compartidos con el usuario (excluyendo los propios)
+            elif scope == "shared":
                 qs = qs.filter(shares__user=user).exclude(owner=user).distinct()
-            else:  # scope == 'all'
-                # Incluir documentos propios, públicos, compartidos y de proyectos compartidos
+            else:
                 from apps.project.models import ProjectShare
+
                 shared_project_ids = ProjectShare.objects.filter(
                     user=user
-                ).values_list('project_id', flat=True)
+                ).values_list("project_id", flat=True)
                 qs = qs.filter(
-                    Q(owner=user) 
-                    | Q(is_public=True) 
+                    Q(owner=user)
+                    | Q(is_public=True)
                     | Q(shares__user=user)
                     | Q(projects__id__in=shared_project_ids)
                 ).distinct()
-
         return qs
 
     def list(self, request, *args, **kwargs):
+        if request.query_params.get("summary") == "category_tree":
+            scope = request.query_params.get("scope", "all")
+            if scope not in ("public", "own", "all"):
+                return Response(
+                    {"detail": "summary=category_tree requires scope=public, own, or all"},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            qs = self.filter_queryset(self.get_queryset())
+            tree_data = _build_category_tree_for_documents(qs)
+            return Response(tree_data)
+
         if request.query_params.get("summary") == "categories":
             if request.query_params.get("scope") != "public":
                 return Response(
@@ -325,7 +440,14 @@ class DocumentListAPIView(ListAPIView):
             aggregated = (
                 qs.annotate(
                     cat_key=Case(
-                        When(Q(category__isnull=True) | Q(category=""), then=Value("__uncategorized__")),
+                        When(
+                            Q(category_ref__isnull=False),
+                            then=F("category_ref__slug"),
+                        ),
+                        When(
+                            Q(category__isnull=True) | Q(category=""),
+                            then=Value("__uncategorized__"),
+                        ),
                         default=F("category"),
                         output_field=CharField(),
                     )
@@ -370,8 +492,16 @@ class DocumentListAPIView(ListAPIView):
         if paginate_flag and scope in ("own", "public", "all"):
             queryset = self.filter_queryset(self.get_queryset())
             library_category = request.query_params.get("library_category")
+            subtree = request.query_params.get("library_category_subtree", "1").lower() in (
+                "1",
+                "true",
+                "yes",
+                "",
+            )
             if library_category:
-                queryset = _library_category_queryset(queryset, library_category)
+                queryset = _library_category_queryset(
+                    queryset, library_category, subtree=subtree
+                )
             queryset = queryset.order_by(*_document_list_sort_order(request))
             paginator = PublicDocumentListPagination()
             page = paginator.paginate_queryset(queryset, request, view=self)
@@ -435,7 +565,7 @@ class DocumentViewSet(
     
     def get_queryset(self):
         """Filter queryset based on user permissions"""
-        qs = Document.objects.all()
+        qs = Document.objects.all().select_related("category_ref", "owner")
         user = self.request.user
         if not user.is_staff:
             # Incluir documentos propios, públicos, compartidos y de proyectos compartidos

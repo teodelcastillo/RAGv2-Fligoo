@@ -25,7 +25,20 @@ class Document(models.Model):
     owner = models.ForeignKey(User, related_name="document_owner", on_delete=models.CASCADE)
     name = models.CharField(max_length=255, blank=True)
     slug = models.SlugField(unique=True, blank=True)
-    category =  models.CharField(max_length=255, blank=True, null=True)
+    # Kept for backward-compatible API clients; prefer `category_ref` / `category_slug` in new code.
+    category = models.CharField(
+        max_length=255,
+        blank=True,
+        null=True,
+        help_text="Legacy display string; mirrors Category.name when category_ref is set.",
+    )
+    category_ref = models.ForeignKey(
+        "Category",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="documents",
+    )
     description = models.TextField(blank=True)
     file = models.FileField(upload_to='documents/', null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
@@ -82,6 +95,15 @@ class Document(models.Model):
             name = os.path.splitext(name)[0] 
             self.name = name[:255]
 
+        if self.category_ref_id:
+            from django.apps import apps
+
+            CategoryModel = apps.get_model("document", "Category")
+            try:
+                cat = CategoryModel.objects.only("name").get(pk=self.category_ref_id)
+                self.category = cat.name
+            except CategoryModel.DoesNotExist:
+                pass
         super().save(*args, **kwargs)
 
     def can_view(self, user) -> bool:

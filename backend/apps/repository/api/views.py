@@ -45,6 +45,19 @@ class RepositoryViewSet(viewsets.ModelViewSet):
     def perform_create(self, serializer):
         serializer.save(owner=self.request.user)
 
+    def create(self, request, *args, **kwargs):
+        """
+        Return full repository payload (including slug) after create.
+        Frontend links documents immediately using that slug.
+        """
+        write_serializer = self.get_serializer(data=request.data)
+        write_serializer.is_valid(raise_exception=True)
+        self.perform_create(write_serializer)
+        repo = write_serializer.instance
+        read_serializer = RepositorySerializer(repo, context=self.get_serializer_context())
+        headers = self.get_success_headers(read_serializer.data)
+        return Response(read_serializer.data, status=status.HTTP_201_CREATED, headers=headers)
+
     def perform_update(self, serializer):
         repo = self.get_object()
         if not repo.can_edit(self.request.user):

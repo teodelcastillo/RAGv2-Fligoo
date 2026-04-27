@@ -1,6 +1,18 @@
 from django.conf import settings
 from django.db import migrations, models
 import django.db.models.deletion
+from django.utils.text import slugify
+
+
+def _unique_slug(Category, name):
+    base = slugify(name) or "category"
+    slug = base
+    counter = 1
+    while Category.objects.filter(slug=slug).exists():
+        suffix = f"-{counter}"
+        slug = f"{base[:255 - len(suffix)]}{suffix}"
+        counter += 1
+    return slug
 
 
 def forwards_category_ref(apps, schema_editor):
@@ -22,6 +34,7 @@ def forwards_category_ref(apps, schema_editor):
             doc.save(update_fields=["category_ref_id"])
             continue
         cat = Category(owner_id=doc.owner_id, name=name, parent_id=None)
+        cat.slug = _unique_slug(Category, name)
         cat.save()
         doc.category_ref_id = cat.id
         doc.save(update_fields=["category_ref_id"])

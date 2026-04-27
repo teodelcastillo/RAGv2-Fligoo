@@ -1,0 +1,144 @@
+# Ecofilia RAGv2 — Contexto para Claude Code
+
+## Qué es este proyecto
+
+Backend Django + Celery de la plataforma Ecofilia. RAG (Retrieval-Augmented Generation) para análisis de documentos ESG con embeddings pgvector + OpenAI.
+
+Stack: Django · DRF · SimpleJWT · Celery · PostgreSQL + pgvector · Docker · AWS ECS Fargate
+
+---
+
+## Infraestructura AWS (producción)
+
+**Cuenta:** `028780196116`
+**Región:** `us-east-2` (Ohio)
+**Dominio API:** `api.ecofilia.site`
+
+### Servicios ECS (cluster: `cluster-ecofilia`)
+
+| Servicio | Task Definition | Función |
+|---|---|---|
+| `ecofilia-api` | `ecofilia-api` | Django/Gunicorn — API REST |
+| `ecofilia-worker` | `ecofilia-worker` | Celery worker (procesa docs, evaluaciones) |
+| `ecofilia-beat` | `ecofilia-beat` | Celery beat scheduler |
+
+- Imagen Docker: `028780196116.dkr.ecr.us-east-2.amazonaws.com/ecofilia-api:<git-sha>`
+- Subnets ECS (privadas, sin IP pública): `subnet-0eeb7c030c003896d`, `subnet-084c6ea560cf05512`, `subnet-0bf0864eb1124711d`
+- Security Group API: `sg-0e751d4a7ed56c286`
+- Security Group Worker: `sg-060d35df0ec63c774`
+
+### Base de datos
+
+- **RDS PostgreSQL 17.4** — `ecofilia-db.cjsem8ewibzq.us-east-2.rds.amazonaws.com`
+- Instancia: `db.t4g.micro` | DB: `postgres` | Sin acceso público
+- Extensión: `pgvector`
+
+### Otros recursos
+
+| Recurso | Identificador |
+|---|---|
+| ECR repo | `ecofilia-api` |
+| SQS queue | `ecofilia-celery-sqs` |
+| Secrets Manager | `ecofilia/prod` |
+| ALB | `ecofilia-alb` |
+| Log groups | `/ecs/ecofilia-api`, `/ecs/ecofilia-worker`, `/ecs/ecofilia-beat` |
+
+---
+
+## Comandos AWS frecuentes
+
+### Ejecutar migraciones de Django
+
+```bash
+aws ecs run-task \
+  --cluster cluster-ecofilia \
+  --task-definition ecofilia-api \
+  --launch-type FARGATE \
+  --network-configuration "awsvpcConfiguration={subnets=[subnet-0eeb7c030c003896d],securityGroups=[sg-0e751d4a7ed56c286],assignPublicIp=DISABLED}" \
+  --overrides '{"containerOverrides":[{"name":"api","command":["python","manage.py","migrate"]}]}' \
+  --region us-east-2
+```
+
+### Ver logs en tiempo real
+
+```bash
+# API
+aws logs tail /ecs/ecofilia-api --follow --region us-east-2
+
+# Worker
+aws logs tail /ecs/ecofilia-worker --follow --region us-east-2
+
+# Solo errores
+aws logs filter-log-events --log-group-name /ecs/ecofilia-api --filter-pattern "ERROR" --region us-east-2
+```
+
+### Estado de servicios ECS
+
+```bash
+# Listar tareas corriendo
+aws ecs list-tasks --cluster cluster-ecofilia --region us-east-2
+
+# Estado de un servicio
+aws ecs describe-services --cluster cluster-ecofilia --services ecofilia-api --region us-east-2
+
+# Forzar nuevo deploy (redeploy sin cambio de imagen)
+aws ecs update-service --cluster cluster-ecofilia --service ecofilia-api --force-new-deployment --region us-east-2
+```
+
+### Ejecutar cualquier comando de Django en ECS
+
+```bash
+aws ecs run-task \
+  --cluster cluster-ecofilia \
+  --task-definition ecofilia-api \
+  --launch-type FARGATE \
+  --network-configuration "awsvpcConfiguration={subnets=[subnet-0eeb7c030c003896d],securityGroups=[sg-0e751d4a7ed56c286],assignPublicIp=DISABLED}" \
+  --overrides '{"containerOverrides":[{"name":"api","command":["python","manage.py","COMANDO_AQUI"]}]}' \
+  --region us-east-2
+```
+
+### Secretos
+
+```bash
+# Ver secretos de producción
+aws secretsmanager get-secret-value --secret-id ecofilia/prod --region us-east-2
+```
+
+---
+
+## CI/CD
+
+Push a `main` con cambios en `backend/**` → GitHub Actions → build Docker → push ECR → deploy ECS (los 3 servicios).
+
+Workflow: `.github/workflows/deploy.yml`
+Rol IAM: `arn:aws:iam::028780196116:role/ecofilia-github-deploy` (OIDC, sin credenciales estáticas)
+
+---
+
+## Estructura del backend
+
+```
+backend/
+├── main/           # Settings, URLs, Celery config, WSGI
+│   └── settings/
+│       ├── base.py
+│       └── prod.py
+├── apps/
+│   ├── authentication/  # JWT, login, register, MFA
+│   ├── user/
+│   ├── document/        # Upload, parsing, embeddings
+│   ├── chat/            # RAG queries
+│   ├── evaluation/      # Evaluaciones ESG
+│   └── project/
+├── docker/
+│   ├── Dockerfile.prod
+│   └── template.env
+└── manage.py
+```
+
+## Variables de entorno clave (en Secrets Manager `ecofilia/prod`)
+
+`SECRET_KEY`, `JWT_SIGNING_KEY`, `OPENAI_API_KEY`, `POSTGRES_HOST`, `POSTGRES_PORT`, `POSTGRES_NAME`, `POSTGRES_USER`, `POSTGRES_PASSWORD`
+
+Variables de configuración (en task definition ECS):
+`DJANGO_SETTINGS_MODULE=main.settings.prod`, `JWT_ACCESS_TTL_MINUTES`, `JWT_REFRESH_TTL_DAYS`, `SQS_QUEUE_URL`, `AWS_STORAGE_BUCKET_NAME`

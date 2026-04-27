@@ -712,7 +712,8 @@ class CategoryViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         user = self.request.user
-        if user.is_staff:
+        scope = (self.request.query_params.get("scope") or "").strip().lower()
+        if user.is_staff and scope == "all":
             return Category.objects.all()
         return Category.objects.filter(owner=user)
 

@@ -50,6 +50,17 @@ class DocumentCreateWithProjectSlugTest(APITestCase):
             self.project.documents.filter(id=doc.id).exists()
         )
 
+    def test_create_document_rejects_is_public_during_upload(self):
+        url = reverse("documentcreate")
+        data = {
+            "file": self._make_file(),
+            "is_public": "true",
+        }
+        response = self.client.post(url, data, format="multipart")
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("is_public", response.data)
+
     def test_create_document_with_invalid_project_slug(self):
         url = reverse("documentcreate")
         data = {

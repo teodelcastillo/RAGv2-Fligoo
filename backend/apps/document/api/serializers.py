@@ -1,8 +1,15 @@
 from rest_framework import serializers
 from django.contrib.auth import get_user_model
 from apps.document.models import SmartChunk, Document, DocumentShare, DocumentShareRole, Category
+from apps.user.models import UserRole
 
 User = get_user_model()
+
+
+def _can_manage_public_documents(user) -> bool:
+    if not user:
+        return False
+    return bool(user.is_superuser or getattr(user, "role", None) == UserRole.ADMIN)
 
 class SmartChunkSerializer(serializers.ModelSerializer):
     class Meta:
@@ -62,12 +69,11 @@ class DocumentCreateSerializer(serializers.ModelSerializer):
         return value
 
     def validate_is_public(self, value):
-        request = self.context.get('request')
-        if request and hasattr(request, 'user'):
-            if value and not request.user.is_superuser:
-                raise serializers.ValidationError(
-                    "Only superadmins can set the is_public field."
-                )
+        # Public visibility can only be changed after upload in document edit flows.
+        if value:
+            raise serializers.ValidationError(
+                "is_public can only be set on already uploaded documents."
+            )
         return value
 
     def create(self, validated_data):
@@ -128,12 +134,11 @@ class DocumentBulkCreateSerializer(serializers.Serializer):
         return value
 
     def validate_is_public(self, value):
-        request = self.context.get('request')
-        if request and hasattr(request, 'user'):
-            if value and not request.user.is_superuser:
-                raise serializers.ValidationError(
-                    "Only superadmins can set the is_public field."
-                )
+        # Public visibility can only be changed after upload in document edit flows.
+        if value:
+            raise serializers.ValidationError(
+                "is_public can only be set on already uploaded documents."
+            )
         return value
 
 class DocumentSerializer(serializers.ModelSerializer):
@@ -224,22 +229,22 @@ class DocumentUpdateSerializer(serializers.ModelSerializer):
         ]
     
     def validate_is_public(self, value):
-        """Only superusers can modify is_public field"""
+        """Only superadmins and admin users can modify is_public field."""
         request = self.context.get('request')
         if request and hasattr(request, 'user'):
-            if not request.user.is_superuser:
+            if not _can_manage_public_documents(request.user):
                 raise serializers.ValidationError(
-                    "Only superadmins can modify the is_public field."
+                    "Only superadmins and admin users can modify the is_public field."
                 )
         return value
     
     def update(self, instance, validated_data):
-        """Update document, but restrict is_public to superusers"""
+        """Update document, but restrict is_public to superadmins/admin users."""
         request = self.context.get('request')
         
         # Remove is_public from validated_data if user is not superuser
         if request and hasattr(request, 'user'):
-            if not request.user.is_superuser and 'is_public' in validated_data:
+            if not _can_manage_public_documents(request.user) and 'is_public' in validated_data:
                 validated_data.pop('is_public')
         
         return super().update(instance, validated_data)

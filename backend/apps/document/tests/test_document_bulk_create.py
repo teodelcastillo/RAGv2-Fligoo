@@ -77,6 +77,24 @@ class DocumentBulkCreateTest(APITestCase):
         self.assertEqual(doc.category, "reports")
         self.assertEqual(doc.description, "Quarterly report")
 
+    def test_bulk_create_multiple_files_ignores_shared_name_and_keeps_category(self):
+        files = [self._make_file(f"multi{i}.txt") for i in range(3)]
+        data = {
+            "files": files,
+            "name": "Shared Name",
+            "category": "reports",
+        }
+        response = self.client.post(self.url, data, format="multipart")
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(len(response.data["successful"]), 3)
+        self.assertEqual(len(response.data["failed"]), 0)
+
+        created_ids = [entry["id"] for entry in response.data["successful"]]
+        docs = Document.objects.filter(id__in=created_ids)
+        self.assertEqual(docs.count(), 3)
+        self.assertTrue(all(doc.category == "reports" for doc in docs))
+
     def test_bulk_create_response_has_backward_compat_keys(self):
         files = [self._make_file("compat.txt")]
         data = {"files": files}

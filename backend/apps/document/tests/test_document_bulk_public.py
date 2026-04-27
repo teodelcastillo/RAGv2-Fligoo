@@ -20,6 +20,12 @@ class DocumentBulkPublicAPITest(APITestCase):
             password="TestPass123!",
             username="user@test.com",
         )
+        self.admin_user = User.objects.create_user(
+            email="admin-role@test.com",
+            password="TestPass123!",
+            username="admin-role@test.com",
+            role="admin",
+        )
         self.doc_a = Document.objects.create(
             owner=self.superuser,
             name="A",
@@ -67,6 +73,19 @@ class DocumentBulkPublicAPITest(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(response.data["updated"], 1)
         self.assertEqual(response.data["matched"], 1)
+        self.other_doc.refresh_from_db()
+        self.assertTrue(self.other_doc.is_public)
+
+    def test_admin_role_user_can_change_document_visibility(self):
+        self.client.force_authenticate(self.admin_user)
+        url = reverse("documentbulkpublic")
+        response = self.client.post(
+            url,
+            {"slugs": [self.other_doc.slug], "is_public": True},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["updated"], 1)
         self.other_doc.refresh_from_db()
         self.assertTrue(self.other_doc.is_public)
 

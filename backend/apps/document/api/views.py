@@ -11,6 +11,7 @@ from django.db.models import Q, Count, Case, When, Value, CharField, F
 from rest_framework.pagination import PageNumberPagination
 
 from apps.document.models import SmartChunk, Document, DocumentShare, Category
+from apps.user.models import UserRole
 from apps.document.api.filters import DocumentFilter
 from apps.document.api.serializers import (
     SmartChunkSerializer,
@@ -27,6 +28,12 @@ from apps.document.api.serializers import (
 )
 from apps.chat.models import ChatSession
 from apps.chat.api.serializers import ChatSessionSerializer
+
+
+def _can_manage_public_documents(user) -> bool:
+    if not user:
+        return False
+    return bool(user.is_superuser or getattr(user, "role", None) == UserRole.ADMIN)
 
 
 class RAGQueryView(APIView):
@@ -85,6 +92,11 @@ class DocumentCreateAPIView(CreateAPIView):
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         document = serializer.save(owner=request.user)
+
+        # In bulk uploads, a shared `name` causes slug collisions across files.
+        # Keep using the filename-derived name/slug for each document.
+        if len(validated_files) > 1:
+            document_props.pop('name', None)
 
         project = getattr(serializer, '_project', None)
         if project:
@@ -188,15 +200,15 @@ class DocumentBulkCreateAPIView(APIView):
 
 class DocumentBulkPublicAPIView(APIView):
     """
-    Superusers only: bulk set is_public for the public sustainability library.
+    Superadmins and admin users only: bulk set is_public for the public library.
     Applies to every matched slug (any owner); unknown slugs are skipped.
     """
 
     permission_classes = [permissions.IsAuthenticated]
 
     def post(self, request, *args, **kwargs):
-        if not request.user.is_superuser:
-            raise PermissionDenied("Only superusers can bulk change document visibility.")
+        if not _can_manage_public_documents(request.user):
+            raise PermissionDenied("Only superadmins and admin users can bulk change document visibility.")
 
         serializer = DocumentBulkPublicSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)

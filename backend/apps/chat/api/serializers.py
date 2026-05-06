@@ -142,6 +142,11 @@ class ChatMessageSerializer(serializers.ModelSerializer):
 class ChatMessageCreateSerializer(serializers.Serializer):
     session = serializers.PrimaryKeyRelatedField(queryset=ChatSession.objects.all())
     content = serializers.CharField(allow_blank=False, max_length=4000)
+    response_mode = serializers.ChoiceField(
+        choices=("puntual", "panorama", "comparacion", "extraccion"),
+        required=False,
+        allow_null=True,
+    )
 
     def validate_session(self, session: ChatSession):
         user = self.context["request"].user

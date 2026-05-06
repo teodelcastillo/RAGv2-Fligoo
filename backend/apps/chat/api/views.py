@@ -31,13 +31,19 @@ logger = logging.getLogger(__name__)
 MAX_HISTORY_MESSAGES = int(os.environ.get("CHAT_HISTORY_MESSAGES", "10"))
 
 
-def _chat_retrieval_params(session: ChatSession, content: str) -> dict:
+def _chat_retrieval_params(
+    session: ChatSession,
+    content: str,
+    response_mode: str | None = None,
+) -> dict:
     """
     Heuristic sizing for the RAG retrieval pool given the session scope and
     the current message. Wider pools for broader questions and bigger libraries.
     """
     doc_count = session.allowed_documents.count()
     analysis = classify_query(content)
+    if response_mode == "panorama":
+        analysis.coverage_mode = COVERAGE_MODE_ALL
     broad_question = len((content or "").split()) >= 18
     if analysis.coverage_mode == COVERAGE_MODE_ALL:
         total_limit = doc_count
@@ -86,7 +92,12 @@ def _build_coverage_instruction(session: ChatSession, retrieval: RetrievalResult
     )
 
 
-def _run_retrieval(session: ChatSession, content: str, user) -> RetrievalResult:
+def _run_retrieval(
+    session: ChatSession,
+    content: str,
+    user,
+    response_mode: str | None = None,
+) -> RetrievalResult:
     """
     Defensive wrapper around ``retrieve_for_chat``. Failures (embeddings,
     pgvector, OpenAI keys) must not bubble up as 500s — return an empty
@@ -100,7 +111,8 @@ def _run_retrieval(session: ChatSession, content: str, user) -> RetrievalResult:
             user=user,
             query_text=content,
             allowed_documents=allowed_docs,
-            **_chat_retrieval_params(session, content),
+            response_mode=response_mode,
+            **_chat_retrieval_params(session, content, response_mode=response_mode),
         )
     except Exception as exc:
         logger.exception("Chat RAG pipeline failed (session=%s): %s", session.id, exc)
@@ -111,6 +123,7 @@ def _compose_messages(
     session: ChatSession,
     content: str,
     retrieval: RetrievalResult,
+    response_mode: str | None = None,
     *,
     max_history: int = MAX_HISTORY_MESSAGES,
 ) -> list[dict]:
@@ -151,6 +164,16 @@ def _compose_messages(
     ]
 
     messages = base_messages + history_messages
+    if response_mode:
+        messages.append(
+            {
+                "role": str(MessageRole.SYSTEM),
+                "content": (
+                    "El usuario seleccionó un modo de respuesta explícito. "
+                    f"Prioriza este modo: '{response_mode}'."
+                ),
+            }
+        )
     messages.append({"role": str(MessageRole.USER), "content": content})
     return messages
 
@@ -237,9 +260,15 @@ class ChatMessageViewSet(
         serializer.is_valid(raise_exception=True)
         session = serializer.validated_data["session"]
         content = serializer.validated_data["content"]
+        response_mode = serializer.validated_data.get("response_mode")
 
-        retrieval = _run_retrieval(session, content, request.user)
-        messages = _compose_messages(session, content, retrieval)
+        retrieval = _run_retrieval(session, content, request.user, response_mode=response_mode)
+        messages = _compose_messages(
+            session,
+            content,
+            retrieval,
+            response_mode=response_mode,
+        )
 
         with transaction.atomic():
             user_message = ChatMessage.objects.create(
@@ -278,6 +307,8 @@ class ChatMessageViewSet(
                 metadata["rag_diagnostics"] = retrieval.diagnostics
             if retrieval.analysis is not None:
                 metadata["query_analysis"] = retrieval.analysis.to_dict()
+            if response_mode:
+                metadata["response_mode"] = response_mode
 
             assistant_message = ChatMessage.objects.create(
                 session=session,
@@ -294,13 +325,26 @@ class ChatMessageViewSet(
         return Response(response_payload, status=status.HTTP_201_CREATED)
 
 
-def _build_chat_messages(session: ChatSession, content: str, user, max_history: int = MAX_HISTORY_MESSAGES):
+def _build_chat_messages(
+    session: ChatSession,
+    content: str,
+    user,
+    *,
+    response_mode: str | None = None,
+    max_history: int = MAX_HISTORY_MESSAGES,
+):
     """
     Shared helper used by the streaming endpoint.
     Returns (openai_messages, retrieval_result).
     """
-    retrieval = _run_retrieval(session, content, user)
-    messages = _compose_messages(session, content, retrieval, max_history=max_history)
+    retrieval = _run_retrieval(session, content, user, response_mode=response_mode)
+    messages = _compose_messages(
+        session,
+        content,
+        retrieval,
+        response_mode=response_mode,
+        max_history=max_history,
+    )
     return messages, retrieval
 
 
@@ -326,8 +370,14 @@ class ChatMessageStreamView(APIView):
         serializer.is_valid(raise_exception=True)
         session = serializer.validated_data["session"]
         content = serializer.validated_data["content"]
+        response_mode = serializer.validated_data.get("response_mode")
 
-        messages, retrieval = _build_chat_messages(session, content, request.user)
+        messages, retrieval = _build_chat_messages(
+            session,
+            content,
+            request.user,
+            response_mode=response_mode,
+        )
 
         user_message = ChatMessage.objects.create(
             session=session,
@@ -362,6 +412,8 @@ class ChatMessageStreamView(APIView):
                     metadata["rag_diagnostics"] = retrieval.diagnostics
                 if retrieval.analysis is not None:
                     metadata["query_analysis"] = retrieval.analysis.to_dict()
+                if response_mode:
+                    metadata["response_mode"] = response_mode
                 assistant_message = ChatMessage.objects.create(
                     session=session,
                     role=MessageRole.ASSISTANT,

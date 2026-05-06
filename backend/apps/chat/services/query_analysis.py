@@ -25,10 +25,16 @@ QUERY_TYPE_FACTUAL = "factual"
 QUERY_TYPE_NUMERIC = "numeric"
 QUERY_TYPE_COMPARATIVE = "comparative"
 QUERY_TYPE_PANORAMA = "panorama"
+QUERY_TYPE_EXTRACTION = QUERY_TYPE_NUMERIC
 
 COVERAGE_MODE_FOCUSED = "focused"
 COVERAGE_MODE_BALANCED = "balanced"
 COVERAGE_MODE_ALL = "all"
+
+RESPONSE_MODE_PUNTUAL = "puntual"
+RESPONSE_MODE_PANORAMA = "panorama"
+RESPONSE_MODE_COMPARACION = "comparacion"
+RESPONSE_MODE_EXTRACCION = "extraccion"
 
 _PANORAMA_PATTERNS = (
     r"\b(resumen|panorama|vision|visión|overview|síntesis|sintesis)\b",
@@ -165,6 +171,49 @@ def classify_query(text: str) -> QueryAnalysis:
         analysis.coverage_mode = COVERAGE_MODE_FOCUSED
 
     analysis.sub_queries = _heuristic_sub_queries(analysis)
+    return analysis
+
+
+def apply_response_mode_override(
+    analysis: QueryAnalysis,
+    response_mode: str | None,
+) -> QueryAnalysis:
+    """
+    Deterministic override from explicit frontend selector.
+    If provided, this mode takes precedence over heuristic classification.
+    """
+    mode = (response_mode or "").strip().lower()
+    if not mode:
+        return analysis
+
+    if mode == RESPONSE_MODE_PUNTUAL:
+        analysis.query_type = QUERY_TYPE_FACTUAL
+        analysis.coverage_mode = COVERAGE_MODE_FOCUSED
+        analysis.is_general = False
+        analysis.sub_queries = []
+        return analysis
+
+    if mode == RESPONSE_MODE_PANORAMA:
+        analysis.query_type = QUERY_TYPE_PANORAMA
+        analysis.coverage_mode = COVERAGE_MODE_ALL
+        analysis.is_general = True
+        analysis.sub_queries = _heuristic_sub_queries(analysis)
+        return analysis
+
+    if mode == RESPONSE_MODE_COMPARACION:
+        analysis.query_type = QUERY_TYPE_COMPARATIVE
+        analysis.coverage_mode = COVERAGE_MODE_BALANCED
+        analysis.is_general = True
+        analysis.sub_queries = _heuristic_sub_queries(analysis)
+        return analysis
+
+    if mode == RESPONSE_MODE_EXTRACCION:
+        analysis.query_type = QUERY_TYPE_NUMERIC
+        analysis.coverage_mode = COVERAGE_MODE_FOCUSED
+        analysis.is_general = False
+        analysis.sub_queries = []
+        return analysis
+
     return analysis
 
 

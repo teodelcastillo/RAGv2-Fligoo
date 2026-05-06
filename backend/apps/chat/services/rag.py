@@ -38,6 +38,7 @@ from apps.chat.services.query_analysis import (
     COVERAGE_MODE_ALL,
     QUERY_TYPE_PANORAMA,
     QueryAnalysis,
+    apply_response_mode_override,
     build_query_set,
     classify_query,
 )
@@ -282,6 +283,7 @@ def retrieve_for_chat(
     max_chunks_per_doc: int | None = None,
     k_per_doc: int = 2,
     topics: list[str] | None = None,
+    response_mode: str | None = None,
 ) -> RetrievalResult:
     """
     Full RAG retrieval pipeline:
@@ -324,9 +326,11 @@ def retrieve_for_chat(
         return RetrievalResult(diagnostics=diagnostics)
 
     analysis = classify_query(query_text)
+    analysis = apply_response_mode_override(analysis, response_mode)
     queries = build_query_set(analysis)
     diagnostics["query_type"] = analysis.query_type
     diagnostics["coverage_mode"] = analysis.coverage_mode
+    diagnostics["response_mode_override"] = response_mode or None
     diagnostics["sub_queries"] = max(0, len(queries) - 1)
 
     requires_all_docs = analysis.coverage_mode == COVERAGE_MODE_ALL

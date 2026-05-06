@@ -54,20 +54,14 @@ class SkillViewSet(viewsets.ModelViewSet):
                 repository = Repository.objects.for_user(user).get(slug=context_slug)
             except Repository.DoesNotExist:
                 return qs.none()
-            qs = qs.filter(
-                Q(is_default_enabled=True) |
-                Q(enabled_repositories=repository)
-            ).distinct()
+            qs = qs.filter(enabled_repositories=repository).distinct()
         elif context == "project" and context_slug:
             from apps.project.models import Project
             try:
                 project = Project.objects.for_user(user).get(slug=context_slug)
             except Project.DoesNotExist:
                 return qs.none()
-            qs = qs.filter(
-                Q(is_default_enabled=True) |
-                Q(enabled_projects=project)
-            ).distinct()
+            qs = qs.filter(enabled_projects=project).distinct()
         return qs
 
     def get_serializer_class(self):
@@ -156,7 +150,7 @@ class SkillViewSet(viewsets.ModelViewSet):
             )
 
     def _skill_enabled_for_context(self, skill: Skill, context_type: str, data: dict) -> bool:
-        if context_type == "document" or skill.is_default_enabled:
+        if context_type == "document":
             return True
         if context_type == "repository":
             repository = data.get("repository")

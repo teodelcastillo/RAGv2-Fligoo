@@ -22,11 +22,9 @@ from apps.chat.api.serializers import (
 )
 from apps.chat.models import ChatMessage, ChatSession, MessageRole
 from apps.chat.services.context_builder import build_citation_prompt
+from apps.chat.services.query_analysis import COVERAGE_MODE_ALL, classify_query
 from apps.chat.services.rag import RetrievalResult, retrieve_for_chat
-from apps.document.utils.client_openia import (
-    generate_chat_completion,
-    generate_chat_completion_stream,
-)
+from apps.document.utils import client_openia
 
 logger = logging.getLogger(__name__)
 
@@ -39,16 +37,53 @@ def _chat_retrieval_params(session: ChatSession, content: str) -> dict:
     the current message. Wider pools for broader questions and bigger libraries.
     """
     doc_count = session.allowed_documents.count()
+    analysis = classify_query(content)
     broad_question = len((content or "").split()) >= 18
-    total_limit = min(18, max(8, doc_count * 2))
-    if not broad_question:
+    if analysis.coverage_mode == COVERAGE_MODE_ALL:
+        total_limit = doc_count
+        max_chunks_per_doc = 1
+    else:
+        total_limit = min(18, max(8, doc_count * 2))
+        max_chunks_per_doc = 2
+    if not broad_question and analysis.coverage_mode != COVERAGE_MODE_ALL:
         total_limit = min(total_limit, 12)
     return {
         "top_n": total_limit,
         "total_limit": total_limit,
         "k_per_doc": 2,
-        "max_chunks_per_doc": 2,
+        "max_chunks_per_doc": max_chunks_per_doc,
     }
+
+
+def _build_coverage_instruction(session: ChatSession, retrieval: RetrievalResult) -> str:
+    if retrieval.analysis is None or retrieval.analysis.coverage_mode != COVERAGE_MODE_ALL:
+        return ""
+
+    docs = list(session.allowed_documents.order_by("name").values("id", "name", "slug"))
+    total_docs = len(docs)
+    covered_ids = retrieval.covered_document_ids
+    missing = [doc for doc in docs if doc["id"] not in covered_ids]
+    covered_count = total_docs - len(missing)
+    missing_text = (
+        " Documentos sin evidencia recuperada: "
+        + ", ".join(f"{doc['name']} ({doc['slug']})" for doc in missing)
+        + "."
+        if missing
+        else ""
+    )
+    return (
+        "\n\nPOLITICA DE COBERTURA OBLIGATORIA:\n"
+        f"- La sesión tiene {total_docs} documentos seleccionados.\n"
+        f"- El contexto recuperado cubre {covered_count}/{total_docs} documentos.\n"
+        "- Para preguntas de panorama/repositorio/base documental, debes razonar "
+        "sobre todos los documentos cubiertos y no presentar una respuesta como "
+        "completa si falta cobertura.\n"
+        "- Si el usuario pide listar o resumir por documento, devuelve exactamente "
+        "una entrada por cada documento cubierto, sin repetir documentos.\n"
+        "- Si hay documentos sin evidencia recuperada, menciónalos explícitamente "
+        "como no cubiertos en esta respuesta."
+        f"{missing_text}"
+    )
 
 
 def _run_retrieval(session: ChatSession, content: str, user) -> RetrievalResult:
@@ -100,6 +135,7 @@ def _compose_messages(
                     "puedes complementar con tu conocimiento general, pero indica claramente "
                     "qué parte proviene del documento y qué parte de tu conocimiento general. "
                     + build_citation_prompt()
+                    + _build_coverage_instruction(session, retrieval)
                     + f"\n\n{retrieval.context_block}"
                 ),
             }
@@ -213,7 +249,7 @@ class ChatMessageViewSet(
             )
 
             try:
-                answer_text, usage = generate_chat_completion(
+                answer_text, usage = client_openia.generate_chat_completion(
                     messages,
                     model=session.model,
                     temperature=session.temperature,
@@ -312,7 +348,7 @@ class ChatMessageStreamView(APIView):
 
             collected: list[str] = []
             try:
-                for text_chunk in generate_chat_completion_stream(
+                for text_chunk in client_openia.generate_chat_completion_stream(
                     messages,
                     model=session.model,
                     temperature=session.temperature,

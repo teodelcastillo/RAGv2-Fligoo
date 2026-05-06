@@ -35,6 +35,7 @@ from apps.chat.services.context_builder import (
     mmr_select,
 )
 from apps.chat.services.query_analysis import (
+    COVERAGE_MODE_ALL,
     QUERY_TYPE_PANORAMA,
     QueryAnalysis,
     build_query_set,
@@ -52,6 +53,9 @@ MAX_CONTEXT_CHUNKS = int(os.environ.get("CHAT_CONTEXT_CHUNKS", "8"))
 RAG_RERANK_POOL = int(os.environ.get("RAG_RERANK_POOL", "20"))
 RAG_VECTOR_POOL_MULTIPLIER = float(os.environ.get("RAG_VECTOR_POOL_MULTIPLIER", "2.5"))
 RAG_LEXICAL_POOL_MULTIPLIER = float(os.environ.get("RAG_LEXICAL_POOL_MULTIPLIER", "2.0"))
+RAG_ALL_DOCS_MIN_COVERAGE_RATIO = float(
+    os.environ.get("RAG_ALL_DOCS_MIN_COVERAGE_RATIO", "1.0")
+)
 
 
 GENERAL_QUERY_PATTERNS = (
@@ -88,6 +92,10 @@ class RetrievalResult:
     @property
     def chunk_ids(self) -> List[int]:
         return [c.id for c in self.chunks]
+
+    @property
+    def covered_document_ids(self) -> set:
+        return {c.document_id for c in self.chunks}
 
 
 # ---------------------------------------------------------------------------
@@ -227,6 +235,43 @@ def _scope_qs_for_user(user, doc_ids: list) -> QuerySet[SmartChunk]:
     return qs
 
 
+def _fill_missing_documents(
+    *,
+    base_qs: QuerySet[SmartChunk],
+    query_text: str,
+    missing_doc_ids: list,
+    existing_chunks: list[SmartChunk],
+) -> list[SmartChunk]:
+    """
+    Coverage fallback: retrieve one best chunk for every document missing from
+    the final context. This is intentionally simple and deterministic; for
+    all-docs prompts, predictability is more important than pure top-k score.
+    """
+    if not missing_doc_ids:
+        return existing_chunks
+
+    try:
+        query_embedding = embed_text(query_text)
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("Coverage fallback embedding failed: %s", exc)
+        query_embedding = None
+
+    filled = list(existing_chunks)
+    for doc_id in missing_doc_ids:
+        doc_qs = base_qs.filter(document_id=doc_id)
+        if query_embedding:
+            chunk = (
+                doc_qs.annotate(distance=CosineDistance("embedding", query_embedding))
+                .order_by("distance", "chunk_index")
+                .first()
+            )
+        else:
+            chunk = doc_qs.order_by("chunk_index").first()
+        if chunk is not None:
+            filled.append(chunk)
+    return filled
+
+
 def retrieve_for_chat(
     *,
     user,
@@ -261,6 +306,11 @@ def retrieve_for_chat(
         "mmr_applied": False,
         "sub_queries": 0,
         "documents_in_scope": 0,
+        "coverage_mode": "focused",
+        "coverage_target_ratio": None,
+        "coverage_target_documents": None,
+        "coverage_missing_documents": [],
+        "coverage_met": True,
         "elapsed_seconds": 0.0,
     }
 
@@ -276,10 +326,19 @@ def retrieve_for_chat(
     analysis = classify_query(query_text)
     queries = build_query_set(analysis)
     diagnostics["query_type"] = analysis.query_type
+    diagnostics["coverage_mode"] = analysis.coverage_mode
     diagnostics["sub_queries"] = max(0, len(queries) - 1)
+
+    requires_all_docs = analysis.coverage_mode == COVERAGE_MODE_ALL
+    coverage_target_ratio = RAG_ALL_DOCS_MIN_COVERAGE_RATIO if requires_all_docs else None
+    diagnostics["coverage_target_ratio"] = coverage_target_ratio
 
     # Sizing the candidate pools.
     base_top_n = top_n or MAX_CONTEXT_CHUNKS
+    if requires_all_docs:
+        base_top_n = max(base_top_n, len(doc_ids))
+        total_limit = max(total_limit or base_top_n, len(doc_ids))
+        max_chunks_per_doc = 1
     pool_top_n = max(base_top_n, RAG_RERANK_POOL)
     vector_per_query = max(
         base_top_n,
@@ -293,7 +352,7 @@ def retrieve_for_chat(
     # Strategy: panorama/comparative -> hybrid_per_document; else auto.
     vector_strategy = (
         "hybrid_per_document"
-        if analysis.query_type == QUERY_TYPE_PANORAMA or len(doc_ids) > 3
+        if requires_all_docs or analysis.query_type == QUERY_TYPE_PANORAMA or len(doc_ids) > 3
         else "auto"
     )
 
@@ -301,6 +360,9 @@ def retrieve_for_chat(
     vector_lists: list[list[SmartChunk]] = []
     for q in queries:
         try:
+            vector_total_limit = len(doc_ids) if requires_all_docs else vector_per_query
+            vector_k_per_doc = 1 if requires_all_docs else k_per_doc
+            vector_max_per_doc = 1 if requires_all_docs else max(2, k_per_doc + 1)
             v_chunks = fetch_relevant_chunks(
                 user=user,
                 query_text=q,
@@ -308,9 +370,9 @@ def retrieve_for_chat(
                 top_n=vector_per_query,
                 topics=topics,
                 retrieval_strategy=vector_strategy,
-                k_per_doc=k_per_doc,
-                total_limit=vector_per_query,
-                max_chunks_per_doc=max(2, k_per_doc + 1),
+                k_per_doc=vector_k_per_doc,
+                total_limit=vector_total_limit,
+                max_chunks_per_doc=vector_max_per_doc,
             )
         except Exception as exc:  # pragma: no cover - defensive
             logger.warning("Vector retrieval failed for sub-query %r: %s", q, exc)
@@ -355,6 +417,24 @@ def retrieve_for_chat(
         total_limit=safe_total,
     )
 
+    if requires_all_docs:
+        covered_ids = {c.document_id for c in capped}
+        target_count = max(1, int(round(len(doc_ids) * RAG_ALL_DOCS_MIN_COVERAGE_RATIO)))
+        missing_doc_ids = [doc_id for doc_id in doc_ids if doc_id not in covered_ids]
+        diagnostics["coverage_target_documents"] = target_count
+        if len(covered_ids) < target_count and missing_doc_ids:
+            capped = _fill_missing_documents(
+                base_qs=base_qs,
+                query_text=query_text,
+                missing_doc_ids=missing_doc_ids,
+                existing_chunks=capped,
+            )
+            capped = cap_per_document(
+                capped,
+                max_per_doc=1,
+                total_limit=max(safe_total, target_count),
+            )
+
     # --- Optional MMR (off by default) ---
     final_chunks: list[SmartChunk] = capped
     if is_mmr_enabled() and capped:
@@ -371,6 +451,12 @@ def retrieve_for_chat(
     diagnostics["elapsed_seconds"] = round(time.perf_counter() - started, 4)
     diagnostics["final_chunks"] = len(final_chunks)
     diagnostics["unique_documents"] = len({c.document_id for c in final_chunks})
+    final_doc_ids = {c.document_id for c in final_chunks}
+    missing_doc_ids = [doc_id for doc_id in doc_ids if doc_id not in final_doc_ids]
+    diagnostics["coverage_missing_documents"] = missing_doc_ids
+    if requires_all_docs:
+        target_count = diagnostics["coverage_target_documents"] or len(doc_ids)
+        diagnostics["coverage_met"] = len(final_doc_ids) >= target_count
 
     return RetrievalResult(
         chunks=final_chunks,

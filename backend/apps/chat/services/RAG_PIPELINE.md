@@ -74,6 +74,30 @@ Todas opcionales; los defaults son seguros para producción.
 | `RAG_QUERY_EXPANSION_ENABLED` | `0` | Activa la expansión LLM de sub-queries. |
 | `RAG_QUERY_EXPANSION_MODEL` | `gpt-4o-mini` | Modelo de la expansión. |
 | `RAG_MMR_ENABLED` | `0` | Activa diversidad MMR sobre el final. |
+| `CHAT_MAX_DOCUMENTS_PER_SESSION` | `20` | Límite duro de documentos seleccionables por sesión de chat; protege predictibilidad y costo. |
+| `RAG_ALL_DOCS_MIN_COVERAGE_RATIO` | `1.0` | Cobertura mínima para consultas `coverage_all` (1.0 = todos los documentos). |
+
+## 3.1. Política de cobertura predecible
+
+El pipeline distingue consultas enfocadas de consultas que necesitan cubrir la
+base completa:
+
+- `focused`: dato puntual; optimiza precisión.
+- `balanced`: panorama/comparativa; aumenta diversidad.
+- `all`: repositorio/base/documentación/“rasgos generales”/“cada documento”;
+  exige cobertura por documento.
+
+Cuando `coverage_mode == all`:
+
+1. `total_limit` sube como mínimo al número de documentos seleccionados.
+2. Se recupera 1 chunk por documento (`max_chunks_per_doc=1`) para evitar
+   repeticiones.
+3. Si después de RRF faltan documentos, se ejecuta una segunda pasada dirigida
+   a los documentos faltantes.
+4. El prompt recibe una política explícita: cantidad total de documentos,
+   cobertura lograda y lista de documentos sin evidencia si los hubiera.
+5. Si el usuario pide salida por documento, el modelo debe devolver una entrada
+   por documento cubierto, sin duplicados.
 
 ## 4. Cómo correr la evaluación
 

@@ -26,12 +26,24 @@ QUERY_TYPE_NUMERIC = "numeric"
 QUERY_TYPE_COMPARATIVE = "comparative"
 QUERY_TYPE_PANORAMA = "panorama"
 
+COVERAGE_MODE_FOCUSED = "focused"
+COVERAGE_MODE_BALANCED = "balanced"
+COVERAGE_MODE_ALL = "all"
+
 _PANORAMA_PATTERNS = (
     r"\b(resumen|panorama|vision|visión|overview|síntesis|sintesis)\b",
     r"\b(general|global|integral|completo|completa)\b",
     r"\b(todo|toda|todos|todas|cada (uno|una))\b",
-    r"\b(base documental|documentacion|documentación|biblioteca)\b",
+    r"\b(base documental|documentacion|documentación|biblioteca|repositorio|repository)\b",
+    r"\b(rasgos generales|de qu[eé] trata|en t[eé]rminos generales)\b",
     r"\b(overall|high[- ]level|across|across all)\b",
+)
+
+_ALL_COVERAGE_PATTERNS = (
+    r"\b(cada documento|cada uno|cada una|uno por documento|una por documento)\b",
+    r"\b(todos los documentos|todas las fuentes|documentos seleccionados)\b",
+    r"\b(repositorio|repository|base documental|biblioteca|documentaci[oó]n)\b",
+    r"\b(rasgos generales|panorama general|visi[oó]n general|overview|overall)\b",
 )
 
 _COMPARATIVE_PATTERNS = (
@@ -55,6 +67,7 @@ class QueryAnalysis:
     normalized: str
     query_type: str = QUERY_TYPE_FACTUAL
     is_general: bool = False
+    coverage_mode: str = COVERAGE_MODE_FOCUSED
     keywords: List[str] = field(default_factory=list)
     numeric_tokens: List[str] = field(default_factory=list)
     sub_queries: List[str] = field(default_factory=list)
@@ -63,6 +76,7 @@ class QueryAnalysis:
         return {
             "query_type": self.query_type,
             "is_general": self.is_general,
+            "coverage_mode": self.coverage_mode,
             "keywords": self.keywords,
             "numeric_tokens": self.numeric_tokens,
             "sub_queries": self.sub_queries,
@@ -121,6 +135,7 @@ def classify_query(text: str) -> QueryAnalysis:
     analysis.numeric_tokens = _extract_numeric_tokens(norm)
 
     is_panorama = any(re.search(p, norm) for p in _PANORAMA_PATTERNS)
+    all_coverage_hits = sum(1 for p in _ALL_COVERAGE_PATTERNS if re.search(p, norm))
     is_comparative = any(re.search(p, norm) for p in _COMPARATIVE_PATTERNS)
     is_numeric = any(re.search(p, norm) for p in _NUMERIC_PATTERNS) or bool(
         analysis.numeric_tokens
@@ -141,6 +156,13 @@ def classify_query(text: str) -> QueryAnalysis:
         QUERY_TYPE_PANORAMA,
         QUERY_TYPE_COMPARATIVE,
     } or long_question
+
+    if all_coverage_hits >= 2:
+        analysis.coverage_mode = COVERAGE_MODE_ALL
+    elif analysis.query_type in {QUERY_TYPE_PANORAMA, QUERY_TYPE_COMPARATIVE}:
+        analysis.coverage_mode = COVERAGE_MODE_BALANCED
+    else:
+        analysis.coverage_mode = COVERAGE_MODE_FOCUSED
 
     analysis.sub_queries = _heuristic_sub_queries(analysis)
     return analysis

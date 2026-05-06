@@ -5,7 +5,9 @@ from django.urls import reverse
 from rest_framework import status
 from rest_framework.test import APITestCase
 
+from apps.chat.api.views import _chat_retrieval_params
 from apps.chat.models import ChatSession
+from apps.chat.services.query_analysis import COVERAGE_MODE_ALL, classify_query
 from apps.document.models import Document, SmartChunk
 
 User = get_user_model()
@@ -46,6 +48,53 @@ class ChatAPITestCase(APITestCase):
         }
         response = self.client.post(url, payload, format="json")
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_create_session_rejects_too_many_documents(self):
+        docs = [
+            Document.objects.create(
+                owner=self.user,
+                name=f"Doc {i}",
+                slug=f"doc-{i}",
+            )
+            for i in range(25)
+        ]
+        url = reverse("chat-session-list")
+        payload = {
+            "title": "Demasiado amplia",
+            "document_slugs": [doc.slug for doc in docs],
+        }
+
+        response = self.client.post(url, payload, format="json")
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("máximo", str(response.data))
+
+    def test_repository_panorama_query_uses_all_docs_policy(self):
+        analysis = classify_query(
+            "Necesito saber en rasgos generales de que trata este repositorio"
+        )
+        self.assertEqual(analysis.coverage_mode, COVERAGE_MODE_ALL)
+
+        session = ChatSession.objects.create(
+            owner=self.user,
+            title="Repositorio",
+        )
+        docs = [
+            Document.objects.create(
+                owner=self.user,
+                name=f"Repo Doc {i}",
+                slug=f"repo-doc-{i}",
+            )
+            for i in range(17)
+        ]
+        session.allowed_documents.set(docs)
+
+        params = _chat_retrieval_params(
+            session,
+            "Necesito saber en rasgos generales de que trata este repositorio",
+        )
+        self.assertEqual(params["total_limit"], 17)
+        self.assertEqual(params["top_n"], 17)
+        self.assertEqual(params["max_chunks_per_doc"], 1)
 
     @patch("apps.chat.services.rag.fetch_relevant_chunks")
     @patch("apps.document.utils.client_openia.generate_chat_completion")

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import List
 
 from rest_framework import serializers
@@ -7,6 +8,8 @@ from rest_framework import serializers
 from apps.chat.models import ChatSession, ChatMessage
 from apps.document.services import accessible_documents_for
 from apps.document.models import Document, SmartChunk
+
+CHAT_MAX_DOCUMENTS_PER_SESSION = int(os.environ.get("CHAT_MAX_DOCUMENTS_PER_SESSION", "20"))
 
 
 class ChatSessionSerializer(serializers.ModelSerializer):
@@ -66,16 +69,25 @@ class ChatSessionCreateSerializer(serializers.ModelSerializer):
         # Si la lista está vacía, es válido (sesión sin documentos)
         if not slugs:
             return slugs
+
+        unique_slugs = list(dict.fromkeys(slugs))
+        if len(unique_slugs) > CHAT_MAX_DOCUMENTS_PER_SESSION:
+            raise serializers.ValidationError(
+                "Demasiados documentos seleccionados para una sesión de chat: "
+                f"{len(unique_slugs)} seleccionados, máximo "
+                f"{CHAT_MAX_DOCUMENTS_PER_SESSION}. "
+                "Reducí el alcance para mantener respuestas completas y predecibles."
+            )
         
         user = self.context["request"].user
-        available_docs = accessible_documents_for(user, slugs)
+        available_docs = accessible_documents_for(user, unique_slugs)
         found_slugs = set(available_docs.values_list("slug", flat=True))
-        missing = [slug for slug in slugs if slug not in found_slugs]
+        missing = [slug for slug in unique_slugs if slug not in found_slugs]
         if missing:
             raise serializers.ValidationError(
                 f"Documentos no encontrados o sin permisos: {', '.join(missing)}"
             )
-        return slugs
+        return unique_slugs
 
     def create(self, validated_data):
         slugs = validated_data.pop("document_slugs", [])
@@ -106,9 +118,15 @@ class ChatMessageSerializer(serializers.ModelSerializer):
     def get_chunks(self, obj: ChatMessage):
         if not obj.chunk_ids:
             return []
-        chunks = SmartChunk.objects.filter(id__in=obj.chunk_ids).select_related("document")
+        chunks_by_id = {
+            chunk.id: chunk
+            for chunk in SmartChunk.objects.filter(id__in=obj.chunk_ids).select_related("document")
+        }
         serialized = []
-        for chunk in chunks:
+        for chunk_id in obj.chunk_ids:
+            chunk = chunks_by_id.get(chunk_id)
+            if chunk is None:
+                continue
             serialized.append(
                 {
                     "id": chunk.id,
@@ -131,5 +149,13 @@ class ChatMessageCreateSerializer(serializers.Serializer):
             raise serializers.ValidationError("No tienes acceso a esta sesión.")
         if not session.is_active:
             raise serializers.ValidationError("La sesión está inactiva.")
+        doc_count = session.allowed_documents.count()
+        if doc_count > CHAT_MAX_DOCUMENTS_PER_SESSION:
+            raise serializers.ValidationError(
+                "Esta sesión tiene demasiados documentos para un chat predecible: "
+                f"{doc_count} documentos, máximo {CHAT_MAX_DOCUMENTS_PER_SESSION}. "
+                "Creá una sesión con menos documentos o aumentá "
+                "CHAT_MAX_DOCUMENTS_PER_SESSION si el entorno lo soporta."
+            )
         return session
 

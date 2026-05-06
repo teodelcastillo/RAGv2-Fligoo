@@ -27,6 +27,39 @@ class SmartChunkSerializer(serializers.ModelSerializer):
         read_only_fields = ['id', 'created_at', "content_norm"]
 
 
+class DocumentChunkSerializer(serializers.ModelSerializer):
+    """Chunk payload enriched with the document data needed by citation popups."""
+    document_slug = serializers.CharField(source='document.slug', read_only=True)
+    document_name = serializers.CharField(source='document.name', read_only=True)
+    document_file = serializers.SerializerMethodField()
+    document_source = serializers.CharField(source='document.source', read_only=True)
+
+    class Meta:
+        model = SmartChunk
+        fields = [
+            'id',
+            'content',
+            'chunk_index',
+            'document_id',
+            'document_slug',
+            'document_name',
+            'document_file',
+            'document_source',
+            'token_count',
+            'created_at',
+        ]
+        read_only_fields = fields
+
+    def get_document_file(self, obj):
+        if not obj.document.file:
+            return None
+        request = self.context.get('request')
+        url = obj.document.file.url
+        if request:
+            return request.build_absolute_uri(url)
+        return url
+
+
 class DocumentCreateSerializer(serializers.ModelSerializer):
     file = serializers.FileField(required=True, allow_null=False, allow_empty_file=False)
     name = serializers.CharField(required=False, allow_blank=True, max_length=255)

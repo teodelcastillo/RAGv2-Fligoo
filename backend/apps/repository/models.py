@@ -49,6 +49,12 @@ class Repository(models.Model):
         related_name="repositories",
         blank=True,
     )
+    enabled_skills = models.ManyToManyField(
+        "skill.Skill",
+        related_name="enabled_repositories",
+        blank=True,
+        help_text="Skills/copilots shown in this repository workspace.",
+    )
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 

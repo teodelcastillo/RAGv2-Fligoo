@@ -32,6 +32,20 @@ class Project(models.Model):
         related_name="projects",
         blank=True,
     )
+    blueprint_document = models.ForeignKey(
+        Document,
+        related_name="blueprint_for_projects",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        help_text="Documento fuente central del proyecto (blueprint).",
+    )
+    enabled_skills = models.ManyToManyField(
+        "skill.Skill",
+        related_name="enabled_projects",
+        blank=True,
+        help_text="Skills/copilots shown in this project workspace.",
+    )
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 

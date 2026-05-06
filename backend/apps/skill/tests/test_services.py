@@ -6,7 +6,7 @@ from django.test import TestCase
 
 from apps.document.models import Document
 from apps.project.models import Project, ProjectDocument
-from apps.skill.models import Skill, SkillExecution, SkillType
+from apps.skill.models import ExecutionOutputMode, Skill, SkillExecution, SkillType
 from apps.skill.services import execute_skill
 
 
@@ -78,3 +78,46 @@ class SkillRunnerServiceTestCase(TestCase):
         rendered_prompt = mock_completion.call_args.args[0][1]["content"]
         self.assertIn("Present findings by document first", rendered_prompt)
         self.assertIn("Sin evidencia en fuentes provistas", rendered_prompt)
+
+    @patch("apps.skill.services.generate_chat_completion")
+    @patch("apps.skill.services.fetch_relevant_chunks")
+    def test_quick_table_mode_uses_schema_and_normalizes_output(
+        self, mock_fetch_chunks, mock_completion
+    ):
+        chunk_a = SimpleNamespace(document=self.doc_a, chunk_index=0, content="Doc A row")
+        mock_fetch_chunks.return_value = [chunk_a]
+        mock_completion.return_value = (
+            '{"type":"table","rows":[{"titulo":"A","anio":"2025","cumple":"si","estado":"ok"}]}',
+            {"total_tokens": 10},
+        )
+        execution = SkillExecution.objects.create(
+            skill=self.skill,
+            owner=self.user,
+            project=self.project,
+            output_mode=ExecutionOutputMode.TABLE,
+            metadata={
+                "table_schema": {
+                    "columns": [
+                        {"key": "titulo", "type": "text", "required": True, "prompt_hint": ""},
+                        {"key": "anio", "type": "number", "required": True, "prompt_hint": ""},
+                        {"key": "cumple", "type": "boolean", "required": True, "prompt_hint": ""},
+                        {
+                            "key": "estado",
+                            "type": "enum",
+                            "required": False,
+                            "prompt_hint": "",
+                            "allowed_values": ["ok", "pendiente"],
+                        },
+                    ]
+                }
+            },
+        )
+
+        execute_skill(execution)
+        execution.refresh_from_db()
+
+        self.assertEqual(execution.status, "completed")
+        self.assertEqual(execution.output, "")
+        self.assertEqual(execution.output_structured["type"], "table")
+        self.assertEqual(execution.output_structured["rows"][0]["anio"], 2025)
+        self.assertIs(execution.output_structured["rows"][0]["cumple"], True)

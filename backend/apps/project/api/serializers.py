@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from django.contrib.auth import get_user_model
+from django.db.models import Q
 from rest_framework import serializers
 
 from apps.document.models import Document
@@ -11,6 +12,7 @@ from apps.project.models import (
     ProjectShare,
     ProjectShareRole,
 )
+from apps.skill.models import Skill
 
 User = get_user_model()
 
@@ -49,6 +51,17 @@ class ProjectSerializer(serializers.ModelSerializer):
         source="project_documents", many=True, read_only=True
     )
     skill_executions_count = serializers.IntegerField(read_only=True, default=0)
+    enabled_skill_slugs = serializers.SlugRelatedField(
+        source="enabled_skills",
+        many=True,
+        read_only=True,
+        slug_field="slug",
+    )
+    blueprint_document_slug = serializers.SlugField(
+        source="blueprint_document.slug",
+        read_only=True,
+        allow_null=True,
+    )
 
     class Meta:
         model = Project
@@ -62,6 +75,8 @@ class ProjectSerializer(serializers.ModelSerializer):
             "owner_email",
             "documents",
             "skill_executions_count",
+            "enabled_skill_slugs",
+            "blueprint_document_slug",
             "created_at",
             "updated_at",
         )
@@ -72,6 +87,8 @@ class ProjectSerializer(serializers.ModelSerializer):
             "owner_email",
             "documents",
             "skill_executions_count",
+            "enabled_skill_slugs",
+            "blueprint_document_slug",
             "created_at",
             "updated_at",
         )
@@ -82,6 +99,18 @@ class ProjectWriteSerializer(ProjectSerializer):
         child=serializers.SlugField(),
         allow_empty=True,
         required=False,
+        write_only=True,
+    )
+    enabled_skill_slugs = serializers.ListField(
+        child=serializers.SlugField(),
+        allow_empty=True,
+        required=False,
+        write_only=True,
+    )
+    blueprint_document_slug = serializers.SlugField(
+        required=False,
+        allow_null=True,
+        allow_blank=False,
         write_only=True,
     )
 
@@ -102,20 +131,73 @@ class ProjectWriteSerializer(ProjectSerializer):
         self.context["validated_documents"] = list(docs)
         return slugs
 
+    def validate_enabled_skill_slugs(self, slugs):
+        request = self.context["request"]
+        allowed = Skill.objects.filter(
+            Q(owner__isnull=True) | Q(owner=request.user),
+            Q(allowed_contexts__contains=["project"]) | Q(allowed_contexts__contains=["any"]),
+            slug__in=slugs,
+        )
+        found_slugs = set(allowed.values_list("slug", flat=True))
+        missing = [slug for slug in slugs if slug not in found_slugs]
+        if missing:
+            raise serializers.ValidationError(
+                f"Skills no encontradas o no disponibles para proyectos: {', '.join(missing)}"
+            )
+        self.context["validated_enabled_skills"] = list(allowed)
+        return slugs
+
+    def validate(self, attrs):
+        instance = self.instance
+        has_blueprint = "blueprint_document_slug" in attrs
+        if not has_blueprint:
+            return attrs
+
+        blueprint_slug = attrs.get("blueprint_document_slug")
+        if blueprint_slug is None:
+            return attrs
+
+        if "document_slugs" in attrs:
+            document_slugs = attrs.get("document_slugs") or []
+        elif instance:
+            document_slugs = list(
+                instance.project_documents.values_list("document__slug", flat=True)
+            )
+        else:
+            document_slugs = []
+
+        if blueprint_slug not in document_slugs:
+            raise serializers.ValidationError(
+                {"blueprint_document_slug": "Blueprint document must be linked to the project."}
+            )
+        return attrs
+
     def create(self, validated_data):
         document_slugs = validated_data.pop("document_slugs", [])
+        validated_data.pop("enabled_skill_slugs", None)
+        blueprint_slug = validated_data.pop("blueprint_document_slug", None)
         project = Project.objects.create(**validated_data)
         self._sync_documents(project, document_slugs)
+        self._sync_blueprint(project, blueprint_slug)
+        project.enabled_skills.set(self.context.get("validated_enabled_skills", []))
         return project
 
     def update(self, instance, validated_data):
         document_slugs = validated_data.pop("document_slugs", None)
+        should_sync_skills = "enabled_skill_slugs" in validated_data
+        validated_data.pop("enabled_skill_slugs", None)
+        should_sync_blueprint = "blueprint_document_slug" in validated_data
+        blueprint_slug = validated_data.pop("blueprint_document_slug", None)
         for attr, value in validated_data.items():
             setattr(instance, attr, value)
         instance.save()
         if document_slugs is not None:
             instance.project_documents.all().delete()
             self._sync_documents(instance, document_slugs)
+        if should_sync_blueprint:
+            self._sync_blueprint(instance, blueprint_slug)
+        if should_sync_skills:
+            instance.enabled_skills.set(self.context.get("validated_enabled_skills", []))
         return instance
 
     def _sync_documents(self, project: Project, slugs):
@@ -139,6 +221,15 @@ class ProjectWriteSerializer(ProjectSerializer):
                 document=doc,
                 added_by=project.owner,
             )
+
+    def _sync_blueprint(self, project: Project, blueprint_slug):
+        if blueprint_slug is None:
+            return
+        doc = Document.objects.filter(slug=blueprint_slug).first()
+        if not doc:
+            return
+        project.blueprint_document = doc
+        project.save(update_fields=["blueprint_document"])
 
 
 class ProjectDocumentAttachSerializer(serializers.Serializer):

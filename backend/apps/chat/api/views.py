@@ -21,12 +21,102 @@ from apps.chat.api.serializers import (
     ChatSessionSerializer,
 )
 from apps.chat.models import ChatMessage, ChatSession, MessageRole
-from apps.chat.services.rag import build_context_block, fetch_relevant_chunks
-from apps.document.utils.client_openia import generate_chat_completion, generate_chat_completion_stream
+from apps.chat.services.context_builder import build_citation_prompt
+from apps.chat.services.rag import RetrievalResult, retrieve_for_chat
+from apps.document.utils.client_openia import (
+    generate_chat_completion,
+    generate_chat_completion_stream,
+)
 
 logger = logging.getLogger(__name__)
 
 MAX_HISTORY_MESSAGES = int(os.environ.get("CHAT_HISTORY_MESSAGES", "10"))
+
+
+def _chat_retrieval_params(session: ChatSession, content: str) -> dict:
+    """
+    Heuristic sizing for the RAG retrieval pool given the session scope and
+    the current message. Wider pools for broader questions and bigger libraries.
+    """
+    doc_count = session.allowed_documents.count()
+    broad_question = len((content or "").split()) >= 18
+    total_limit = min(18, max(8, doc_count * 2))
+    if not broad_question:
+        total_limit = min(total_limit, 12)
+    return {
+        "top_n": total_limit,
+        "total_limit": total_limit,
+        "k_per_doc": 2,
+        "max_chunks_per_doc": 2,
+    }
+
+
+def _run_retrieval(session: ChatSession, content: str, user) -> RetrievalResult:
+    """
+    Defensive wrapper around ``retrieve_for_chat``. Failures (embeddings,
+    pgvector, OpenAI keys) must not bubble up as 500s — return an empty
+    result so the chat still answers using base knowledge.
+    """
+    allowed_docs = session.allowed_documents.all()
+    if not allowed_docs.exists():
+        return RetrievalResult()
+    try:
+        return retrieve_for_chat(
+            user=user,
+            query_text=content,
+            allowed_documents=allowed_docs,
+            **_chat_retrieval_params(session, content),
+        )
+    except Exception as exc:
+        logger.exception("Chat RAG pipeline failed (session=%s): %s", session.id, exc)
+        return RetrievalResult()
+
+
+def _compose_messages(
+    session: ChatSession,
+    content: str,
+    retrieval: RetrievalResult,
+    *,
+    max_history: int = MAX_HISTORY_MESSAGES,
+) -> list[dict]:
+    """Build the OpenAI messages list (system + context + history + user)."""
+    system_text = (session.system_prompt or "").strip() or (
+        "Eres Ecofilia, un asistente útil. Responde de forma clara y concisa."
+    )
+
+    base_messages: list[dict] = [
+        {"role": str(MessageRole.SYSTEM), "content": system_text},
+    ]
+
+    if retrieval.context_block:
+        base_messages.append(
+            {
+                "role": str(MessageRole.SYSTEM),
+                "content": (
+                    "El siguiente contexto proviene de los documentos del usuario. "
+                    "Prioriza este contexto para responder. "
+                    "Si la información del contexto es suficiente, basate principalmente en ella. "
+                    "Si el contexto no contiene información relevante o es insuficiente, "
+                    "puedes complementar con tu conocimiento general, pero indica claramente "
+                    "qué parte proviene del documento y qué parte de tu conocimiento general. "
+                    + build_citation_prompt()
+                    + f"\n\n{retrieval.context_block}"
+                ),
+            }
+        )
+
+    history_qs = (
+        session.messages.order_by("-created_at")
+        .exclude(role=MessageRole.SYSTEM)[:max_history]
+    )
+    history_messages = [
+        {"role": str(message.role), "content": message.content or ""}
+        for message in reversed(list(history_qs))
+    ]
+
+    messages = base_messages + history_messages
+    messages.append({"role": str(MessageRole.USER), "content": content})
+    return messages
 
 
 class ChatSessionPagination(PageNumberPagination):
@@ -112,61 +202,8 @@ class ChatMessageViewSet(
         session = serializer.validated_data["session"]
         content = serializer.validated_data["content"]
 
-        allowed_docs = session.allowed_documents.all()
-        chunks = []
-        context_block = None
-
-        # RAG: fallos aquí (embeddings, pgvector, API key) no deben tumbar el endpoint con 500 HTML
-        if allowed_docs.exists():
-            try:
-                chunks = fetch_relevant_chunks(
-                    user=request.user,
-                    query_text=content,
-                    allowed_documents=allowed_docs,
-                )
-                context_block = build_context_block(chunks) if chunks else None
-            except Exception as exc:
-                logger.exception("Chat RAG / embeddings failed (session=%s): %s", session.id, exc)
-                chunks = []
-                context_block = None
-
-        system_text = (session.system_prompt or "").strip() or (
-            "Eres Ecofilia, un asistente útil. Responde de forma clara y concisa."
-        )
-
-        # Construir mensajes base
-        base_messages = [
-            {"role": str(MessageRole.SYSTEM), "content": system_text},
-        ]
-        
-        # Si hay contexto de documentos, agregarlo con prioridad
-        if context_block:
-            base_messages.append(
-                {
-                    "role": MessageRole.SYSTEM,
-                    "content": (
-                        "El siguiente contexto proviene de los documentos del usuario. "
-                        "Prioriza este contexto para responder. "
-                        "Si la información del contexto es suficiente, basate principalmente en ella. "
-                        "Si el contexto no contiene información relevante o es insuficiente, "
-                        "puedes complementar con tu conocimiento general, pero indica claramente "
-                        "qué parte proviene del documento y qué parte de tu conocimiento general."
-                        f"\n\n{context_block}"
-                    ),
-                }
-            )
-
-        history_qs = (
-            session.messages.order_by("-created_at")
-            .exclude(role=MessageRole.SYSTEM)
-            [:MAX_HISTORY_MESSAGES]
-        )
-        history_messages = [
-            {"role": str(message.role), "content": message.content or ""}
-            for message in reversed(list(history_qs))
-        ]
-        messages = base_messages + history_messages
-        messages.append({"role": str(MessageRole.USER), "content": content})
+        retrieval = _run_retrieval(session, content, request.user)
+        messages = _compose_messages(session, content, retrieval)
 
         with transaction.atomic():
             user_message = ChatMessage.objects.create(
@@ -200,13 +237,18 @@ class ChatMessageViewSet(
                     detail=f"No fue posible generar la respuesta en este momento: {error_msg}",
                 ) from exc
 
-            chunk_ids = [chunk.id for chunk in chunks]
+            metadata: dict = {"usage": usage}
+            if retrieval.diagnostics:
+                metadata["rag_diagnostics"] = retrieval.diagnostics
+            if retrieval.analysis is not None:
+                metadata["query_analysis"] = retrieval.analysis.to_dict()
+
             assistant_message = ChatMessage.objects.create(
                 session=session,
                 role=MessageRole.ASSISTANT,
                 content=answer_text,
-                chunk_ids=chunk_ids,
-                metadata={"usage": usage},
+                chunk_ids=retrieval.chunk_ids,
+                metadata=metadata,
             )
 
         response_payload = {
@@ -218,59 +260,12 @@ class ChatMessageViewSet(
 
 def _build_chat_messages(session: ChatSession, content: str, user, max_history: int = MAX_HISTORY_MESSAGES):
     """
-    Shared helper that builds the OpenAI messages list (RAG + history + user query).
-    Returns (openai_messages, chunks).
+    Shared helper used by the streaming endpoint.
+    Returns (openai_messages, retrieval_result).
     """
-    allowed_docs = session.allowed_documents.all()
-    chunks = []
-    context_block = None
-
-    if allowed_docs.exists():
-        try:
-            chunks = fetch_relevant_chunks(
-                user=user,
-                query_text=content,
-                allowed_documents=allowed_docs,
-            )
-            context_block = build_context_block(chunks) if chunks else None
-        except Exception as exc:
-            logger.exception("Chat RAG / embeddings failed (session=%s): %s", session.id, exc)
-
-    system_text = (session.system_prompt or "").strip() or (
-        "Eres Ecofilia, un asistente útil. Responde de forma clara y concisa."
-    )
-
-    base_messages = [{"role": str(MessageRole.SYSTEM), "content": system_text}]
-
-    if context_block:
-        base_messages.append(
-            {
-                "role": str(MessageRole.SYSTEM),
-                "content": (
-                    "El siguiente contexto proviene de los documentos del usuario. "
-                    "Prioriza este contexto para responder. "
-                    "Si la información del contexto es suficiente, basate principalmente en ella. "
-                    "Si el contexto no contiene información relevante o es insuficiente, "
-                    "puedes complementar con tu conocimiento general, pero indica claramente "
-                    "qué parte proviene del documento y qué parte de tu conocimiento general."
-                    f"\n\n{context_block}"
-                ),
-            }
-        )
-
-    history_qs = (
-        session.messages.order_by("-created_at")
-        .exclude(role=MessageRole.SYSTEM)
-        [:max_history]
-    )
-    history_messages = [
-        {"role": str(m.role), "content": m.content or ""}
-        for m in reversed(list(history_qs))
-    ]
-
-    messages = base_messages + history_messages
-    messages.append({"role": str(MessageRole.USER), "content": content})
-    return messages, chunks
+    retrieval = _run_retrieval(session, content, user)
+    messages = _compose_messages(session, content, retrieval, max_history=max_history)
+    return messages, retrieval
 
 
 class ChatMessageStreamView(APIView):
@@ -296,7 +291,7 @@ class ChatMessageStreamView(APIView):
         session = serializer.validated_data["session"]
         content = serializer.validated_data["content"]
 
-        messages, chunks = _build_chat_messages(session, content, request.user)
+        messages, retrieval = _build_chat_messages(session, content, request.user)
 
         user_message = ChatMessage.objects.create(
             session=session,
@@ -326,12 +321,17 @@ class ChatMessageStreamView(APIView):
                     yield _event({"type": "chunk", "content": text_chunk})
 
                 answer_text = "".join(collected)
-                chunk_ids = [c.id for c in chunks]
+                metadata: dict = {}
+                if retrieval.diagnostics:
+                    metadata["rag_diagnostics"] = retrieval.diagnostics
+                if retrieval.analysis is not None:
+                    metadata["query_analysis"] = retrieval.analysis.to_dict()
                 assistant_message = ChatMessage.objects.create(
                     session=session,
                     role=MessageRole.ASSISTANT,
                     content=answer_text,
-                    chunk_ids=chunk_ids,
+                    chunk_ids=retrieval.chunk_ids,
+                    metadata=metadata,
                 )
                 yield _event(
                     {

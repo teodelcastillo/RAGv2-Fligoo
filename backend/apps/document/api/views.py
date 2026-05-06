@@ -18,6 +18,7 @@ from apps.user.models import UserRole
 from apps.document.api.filters import DocumentFilter
 from apps.document.api.serializers import (
     SmartChunkSerializer,
+    DocumentChunkSerializer,
     DocumentSerializer,
     DocumentCreateSerializer,
     DocumentBulkCreateSerializer,
@@ -584,6 +585,25 @@ class DocumentViewSet(
     def perform_destroy(self, instance):
         """Delete the document instance"""
         instance.delete()
+
+    @action(
+        detail=True,
+        methods=["get"],
+        url_path=r"chunks/(?P<chunk_index>\d+)",
+        url_name="chunk-detail",
+    )
+    def chunk_detail(self, request, slug=None, chunk_index=None):
+        """Return a single chunk for citation/source viewers."""
+        document = self.get_object()
+        chunk = get_object_or_404(
+            document.chunks.all(),
+            chunk_index=chunk_index,
+        )
+        serializer = DocumentChunkSerializer(
+            chunk,
+            context=self.get_serializer_context(),
+        )
+        return Response(serializer.data)
     
     @action(
         detail=True,

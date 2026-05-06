@@ -1,15 +1,98 @@
+"""
+RAG entry points for the chat layer.
+
+This module hosts:
+- ``fetch_relevant_chunks``: legacy vector-first retriever, kept for backward
+  compatibility with existing call sites and tests.
+- ``retrieve_for_chat``: the new pipeline orchestrator (hybrid retrieval, RRF,
+  optional LLM reranker, diversity selection, citation-ready context block).
+- ``build_context_block``: proxy to ``context_builder.build_context_block`` so
+  existing imports keep working.
+
+Design notes:
+- ``retrieve_for_chat`` calls ``fetch_relevant_chunks`` inside this module for
+  the vector branch. Tests can keep patching ``apps.chat.services.rag.fetch_relevant_chunks``
+  and the patch is honored at call time.
+- All optional steps (LLM reranker, MMR, query expansion) are gated by env flags
+  so the pipeline degrades gracefully when external services are off.
+"""
 from __future__ import annotations
 
+import logging
 import os
+import re
+import time
+from dataclasses import dataclass, field
 from typing import Iterable, List
 
 from django.db.models import Q, QuerySet
 from pgvector.django import CosineDistance
 
+from apps.chat.services.context_builder import (
+    build_citation_prompt,
+    build_context_block as _build_context_block,
+    is_mmr_enabled,
+    mmr_select,
+)
+from apps.chat.services.query_analysis import (
+    QUERY_TYPE_PANORAMA,
+    QueryAnalysis,
+    build_query_set,
+    classify_query,
+)
+from apps.chat.services.reranker import is_reranker_enabled, llm_rerank
+from apps.chat.services.retrieval import cap_per_document, lexical_search, rrf_fuse
 from apps.document.models import Document, SmartChunk
 from apps.document.utils.client_openia import embed_text
 
-MAX_CONTEXT_CHUNKS = int(os.environ.get("CHAT_CONTEXT_CHUNKS", "4"))
+logger = logging.getLogger(__name__)
+
+
+MAX_CONTEXT_CHUNKS = int(os.environ.get("CHAT_CONTEXT_CHUNKS", "8"))
+RAG_RERANK_POOL = int(os.environ.get("RAG_RERANK_POOL", "20"))
+RAG_VECTOR_POOL_MULTIPLIER = float(os.environ.get("RAG_VECTOR_POOL_MULTIPLIER", "2.5"))
+RAG_LEXICAL_POOL_MULTIPLIER = float(os.environ.get("RAG_LEXICAL_POOL_MULTIPLIER", "2.0"))
+
+
+GENERAL_QUERY_PATTERNS = (
+    r"\b(resumen|panorama|vision|visión)\b",
+    r"\b(general|global|integral|completo)\b",
+    r"\b(todo|toda|todos|todas)\b",
+    r"\b(base documental|documentacion|documentación)\b",
+    r"\b(overall|high[- ]level|across)\b",
+)
+
+
+def is_general_query(query_text: str) -> bool:
+    """Backward-compatible heuristic kept for legacy callers."""
+    text = (query_text or "").strip().lower()
+    if not text:
+        return False
+    if len(text.split()) >= 18:
+        return True
+    return any(re.search(pattern, text) for pattern in GENERAL_QUERY_PATTERNS)
+
+
+# ---------------------------------------------------------------------------
+# Public dataclass used by callers that want full pipeline diagnostics
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class RetrievalResult:
+    chunks: List[SmartChunk] = field(default_factory=list)
+    context_block: str = ""
+    analysis: QueryAnalysis | None = None
+    diagnostics: dict = field(default_factory=dict)
+
+    @property
+    def chunk_ids(self) -> List[int]:
+        return [c.id for c in self.chunks]
+
+
+# ---------------------------------------------------------------------------
+# Legacy vector-first retriever (still used by the orchestrator and tests)
+# ---------------------------------------------------------------------------
 
 
 def fetch_relevant_chunks(
@@ -26,6 +109,12 @@ def fetch_relevant_chunks(
 ) -> List[SmartChunk]:
     """
     Returns the most relevant chunks limited to the allowed documents for the session.
+    Strategies:
+      - ``global``: classic vector-only top-N over the whole pool.
+      - ``hybrid_per_document``: ensures recall coverage by taking top-k per
+        document, then reranks globally with per-document caps.
+      - ``auto``: picks ``hybrid_per_document`` for broad/multi-doc questions and
+        ``global`` otherwise.
     """
     top_n = top_n or MAX_CONTEXT_CHUNKS
     total_limit = total_limit or top_n
@@ -41,14 +130,14 @@ def fetch_relevant_chunks(
     # Chunks sin embedding rompen CosineDistance en pgvector y provocan 500
     qs = SmartChunk.objects.filter(document_id__in=doc_ids).exclude(embedding__isnull=True)
     if not user.is_staff:
-        # Incluir chunks de documentos propios, públicos, compartidos y de proyectos compartidos
         from apps.project.models import ProjectShare
-        shared_project_ids = ProjectShare.objects.filter(
-            user=user
-        ).values_list('project_id', flat=True)
+
+        shared_project_ids = ProjectShare.objects.filter(user=user).values_list(
+            "project_id", flat=True
+        )
         qs = qs.filter(
-            Q(document__owner=user) 
-            | Q(document__is_public=True) 
+            Q(document__owner=user)
+            | Q(document__is_public=True)
             | Q(document__shares__user=user)
             | Q(document__projects__id__in=shared_project_ids)
         ).distinct()
@@ -66,22 +155,25 @@ def fetch_relevant_chunks(
     if not qs.exists():
         return []
 
-    if retrieval_strategy != "hybrid_per_document":
+    resolved_strategy = retrieval_strategy
+    if retrieval_strategy == "auto":
+        if len(doc_ids) > 3 or is_general_query(query_text):
+            resolved_strategy = "hybrid_per_document"
+        else:
+            resolved_strategy = "global"
+
+    if resolved_strategy != "hybrid_per_document":
         return list(qs.top_similar(query_text, top_n=top_n))
 
     query_embedding = embed_text(query_text)
     if not query_embedding:
         return list(qs.top_similar(query_text, top_n=top_n))
 
-    doc_ids = list(allowed_documents.values_list("id", flat=True))
-    if not doc_ids:
-        return []
-
     ranked_qs = qs.annotate(
         distance=CosineDistance("embedding", query_embedding)
     ).order_by("distance")
 
-    # Phase 1: ensure recall coverage by taking top-k candidates per document.
+    # Phase 1: per-document recall coverage.
     candidates: list[SmartChunk] = []
     safe_k_per_doc = max(1, k_per_doc)
     for doc_id in doc_ids:
@@ -91,7 +183,6 @@ def fetch_relevant_chunks(
     if not candidates:
         return []
 
-    # Deduplicate candidates by chunk id while preserving best distance.
     by_id: dict[int, SmartChunk] = {}
     for chunk in candidates:
         existing = by_id.get(chunk.id)
@@ -107,33 +198,204 @@ def fetch_relevant_chunks(
         key=lambda c: getattr(c, "distance", 1.0),
     )
 
-    selected: list[SmartChunk] = []
-    per_doc_counter: dict[int, int] = {}
-    safe_per_doc_cap = max(1, max_chunks_per_doc)
-    safe_total_limit = max(1, total_limit)
-    for chunk in merged:
-        doc_id = chunk.document_id
-        used_for_doc = per_doc_counter.get(doc_id, 0)
-        if used_for_doc >= safe_per_doc_cap:
-            continue
-        selected.append(chunk)
-        per_doc_counter[doc_id] = used_for_doc + 1
-        if len(selected) >= safe_total_limit:
-            break
+    return cap_per_document(
+        merged,
+        max_per_doc=max_chunks_per_doc,
+        total_limit=total_limit,
+    )
 
-    return selected
+
+# ---------------------------------------------------------------------------
+# Pipeline orchestrator
+# ---------------------------------------------------------------------------
+
+
+def _scope_qs_for_user(user, doc_ids: list) -> QuerySet[SmartChunk]:
+    qs = SmartChunk.objects.filter(document_id__in=doc_ids).exclude(embedding__isnull=True)
+    if user is not None and not getattr(user, "is_staff", False):
+        from apps.project.models import ProjectShare
+
+        shared_project_ids = ProjectShare.objects.filter(user=user).values_list(
+            "project_id", flat=True
+        )
+        qs = qs.filter(
+            Q(document__owner=user)
+            | Q(document__is_public=True)
+            | Q(document__shares__user=user)
+            | Q(document__projects__id__in=shared_project_ids)
+        ).distinct()
+    return qs
+
+
+def retrieve_for_chat(
+    *,
+    user,
+    query_text: str,
+    allowed_documents: QuerySet[Document],
+    top_n: int | None = None,
+    total_limit: int | None = None,
+    max_chunks_per_doc: int | None = None,
+    k_per_doc: int = 2,
+    topics: list[str] | None = None,
+) -> RetrievalResult:
+    """
+    Full RAG retrieval pipeline:
+
+    1. Classify and (optionally) decompose the query.
+    2. Run vector retrieval (per sub-query) via ``fetch_relevant_chunks``.
+    3. Run lexical (trigram) retrieval over the same scope.
+    4. Fuse with Reciprocal Rank Fusion (RRF).
+    5. Optionally LLM-rerank the top-N pool.
+    6. Apply per-document cap and (optionally) MMR diversity.
+    7. Build a citation-ready context block.
+
+    Returns a ``RetrievalResult`` with chunks, context, query analysis and
+    diagnostics suitable for logging/observability.
+    """
+    started = time.perf_counter()
+    diagnostics: dict = {
+        "vector_candidates": 0,
+        "lexical_candidates": 0,
+        "fused_candidates": 0,
+        "reranked": False,
+        "mmr_applied": False,
+        "sub_queries": 0,
+        "documents_in_scope": 0,
+        "elapsed_seconds": 0.0,
+    }
+
+    if not query_text:
+        return RetrievalResult(diagnostics=diagnostics)
+
+    doc_ids = list(allowed_documents.values_list("id", flat=True))
+    diagnostics["documents_in_scope"] = len(doc_ids)
+    if not doc_ids:
+        diagnostics["elapsed_seconds"] = time.perf_counter() - started
+        return RetrievalResult(diagnostics=diagnostics)
+
+    analysis = classify_query(query_text)
+    queries = build_query_set(analysis)
+    diagnostics["query_type"] = analysis.query_type
+    diagnostics["sub_queries"] = max(0, len(queries) - 1)
+
+    # Sizing the candidate pools.
+    base_top_n = top_n or MAX_CONTEXT_CHUNKS
+    pool_top_n = max(base_top_n, RAG_RERANK_POOL)
+    vector_per_query = max(
+        base_top_n,
+        int(round(base_top_n * RAG_VECTOR_POOL_MULTIPLIER)),
+    )
+    lexical_per_query = max(
+        base_top_n,
+        int(round(base_top_n * RAG_LEXICAL_POOL_MULTIPLIER)),
+    )
+
+    # Strategy: panorama/comparative -> hybrid_per_document; else auto.
+    vector_strategy = (
+        "hybrid_per_document"
+        if analysis.query_type == QUERY_TYPE_PANORAMA or len(doc_ids) > 3
+        else "auto"
+    )
+
+    # --- Vector retrieval (per sub-query) ---
+    vector_lists: list[list[SmartChunk]] = []
+    for q in queries:
+        try:
+            v_chunks = fetch_relevant_chunks(
+                user=user,
+                query_text=q,
+                allowed_documents=allowed_documents,
+                top_n=vector_per_query,
+                topics=topics,
+                retrieval_strategy=vector_strategy,
+                k_per_doc=k_per_doc,
+                total_limit=vector_per_query,
+                max_chunks_per_doc=max(2, k_per_doc + 1),
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("Vector retrieval failed for sub-query %r: %s", q, exc)
+            v_chunks = []
+        if v_chunks:
+            vector_lists.append(v_chunks)
+            diagnostics["vector_candidates"] += len(v_chunks)
+
+    # --- Lexical retrieval (single pass on original query) ---
+    base_qs = _scope_qs_for_user(user, doc_ids)
+    try:
+        lex_chunks = lexical_search(base_qs, query_text, top_n=lexical_per_query)
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("Lexical retrieval failed: %s", exc)
+        lex_chunks = []
+    diagnostics["lexical_candidates"] = len(lex_chunks)
+
+    # --- Fusion ---
+    ranked_lists: list[list[SmartChunk]] = []
+    ranked_lists.extend(vector_lists)
+    if lex_chunks:
+        ranked_lists.append(lex_chunks)
+
+    if not ranked_lists:
+        diagnostics["elapsed_seconds"] = time.perf_counter() - started
+        return RetrievalResult(analysis=analysis, diagnostics=diagnostics)
+
+    fused = rrf_fuse(ranked_lists, top_n=pool_top_n)
+    diagnostics["fused_candidates"] = len(fused)
+
+    # --- Optional LLM rerank ---
+    safe_total = total_limit or base_top_n
+    if is_reranker_enabled() and len(fused) > safe_total:
+        fused = llm_rerank(query_text, fused, top_k=min(len(fused), pool_top_n))
+        diagnostics["reranked"] = True
+
+    # --- Diversity / per-doc cap ---
+    safe_per_doc = max_chunks_per_doc or max(1, min(3, k_per_doc + 1))
+    capped = cap_per_document(
+        fused,
+        max_per_doc=safe_per_doc,
+        total_limit=safe_total,
+    )
+
+    # --- Optional MMR (off by default) ---
+    final_chunks: list[SmartChunk] = capped
+    if is_mmr_enabled() and capped:
+        try:
+            q_emb = embed_text(query_text)
+            final_chunks = mmr_select(capped, q_emb, top_k=safe_total)
+            diagnostics["mmr_applied"] = True
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("MMR selection failed, falling back to capped: %s", exc)
+            final_chunks = capped
+
+    context_block = _build_context_block(final_chunks, with_citations=True)
+
+    diagnostics["elapsed_seconds"] = round(time.perf_counter() - started, 4)
+    diagnostics["final_chunks"] = len(final_chunks)
+    diagnostics["unique_documents"] = len({c.document_id for c in final_chunks})
+
+    return RetrievalResult(
+        chunks=final_chunks,
+        context_block=context_block,
+        analysis=analysis,
+        diagnostics=diagnostics,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Backward-compatible re-exports
+# ---------------------------------------------------------------------------
 
 
 def build_context_block(chunks: Iterable[SmartChunk]) -> str:
-    sections = []
-    for chunk in chunks:
-        sections.append(
-            (
-                f"Fuente: {chunk.document.name} (slug: {chunk.document.slug}, "
-                f"chunk #{chunk.chunk_index})\n{chunk.content.strip()}"
-            )
-        )
-    return "\n\n".join(sections).strip()
+    """Backward-compatible wrapper. New callers should use the orchestrator."""
+    return _build_context_block(chunks, with_citations=True)
 
 
-
+__all__ = [
+    "MAX_CONTEXT_CHUNKS",
+    "RetrievalResult",
+    "build_citation_prompt",
+    "build_context_block",
+    "fetch_relevant_chunks",
+    "is_general_query",
+    "retrieve_for_chat",
+]

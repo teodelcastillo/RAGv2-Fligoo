@@ -77,6 +77,8 @@ class EvaluationSerializer(serializers.ModelSerializer):
     owner = serializers.PrimaryKeyRelatedField(read_only=True)
     owner_email = serializers.EmailField(source="owner.email", read_only=True)
     project_slug = serializers.SlugField(source="project.slug", read_only=True)
+    can_edit = serializers.SerializerMethodField()
+    can_manage_shares = serializers.SerializerMethodField()
     documents = EvaluationDocumentSerializer(
         source="evaluation_documents", many=True, read_only=True
     )
@@ -101,6 +103,8 @@ class EvaluationSerializer(serializers.ModelSerializer):
             "owner_email",
             "documents",
             "pillars",
+            "can_edit",
+            "can_manage_shares",
             "created_at",
             "updated_at",
         )
@@ -113,9 +117,19 @@ class EvaluationSerializer(serializers.ModelSerializer):
             "project_slug",
             "documents",
             "pillars",
+            "can_edit",
+            "can_manage_shares",
             "created_at",
             "updated_at",
         )
+
+    def get_can_edit(self, obj):
+        request = self.context.get("request")
+        return bool(request and obj.can_edit(request.user))
+
+    def get_can_manage_shares(self, obj):
+        request = self.context.get("request")
+        return bool(request and obj.can_manage_shares(request.user))
 
 
 class EvaluationMetricInputSerializer(serializers.Serializer):

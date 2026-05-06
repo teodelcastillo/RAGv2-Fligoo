@@ -9,10 +9,10 @@ from typing import Any, Dict, List, Tuple
 from django.db import transaction
 
 from apps.chat.models import ChatMessage, ChatSession, MessageRole
+from apps.chat.services.context_builder import build_citation_prompt
 from apps.chat.services.rag import (
     MAX_CONTEXT_CHUNKS,
-    build_context_block,
-    fetch_relevant_chunks,
+    retrieve_for_chat,
 )
 from apps.document.utils.client_openia import generate_chat_completion
 
@@ -205,16 +205,17 @@ def run_plan(
 
         if needs_rag and allowed_docs.exists():
             query_text = f"{plan.original_question}\n\n{step.description}"
-            chunks = fetch_relevant_chunks(
+            retrieval = retrieve_for_chat(
                 user=user,
                 query_text=query_text,
                 allowed_documents=allowed_docs,
                 top_n=AGENT_CONTEXT_CHUNKS,
-                topics=step.topics,
+                total_limit=AGENT_CONTEXT_CHUNKS,
                 max_chunks_per_doc=AGENT_MAX_CHUNKS_PER_DOC,
+                topics=step.topics,
             )
-            context_block = build_context_block(chunks)
-            used_chunks_ids = [c.id for c in chunks]
+            context_block = retrieval.context_block
+            used_chunks_ids = retrieval.chunk_ids
 
         # Construir mensajes para el LLM
         messages = []
@@ -242,8 +243,9 @@ def run_plan(
                 {
                     "role": MessageRole.SYSTEM,
                     "content": (
-                        "Utiliza el siguiente contexto de documentos para este paso:\n\n"
-                        f"{context_block}"
+                        "Utiliza el siguiente contexto de documentos para este paso. "
+                        + build_citation_prompt()
+                        + f"\n\n{context_block}"
                     ),
                 }
             )

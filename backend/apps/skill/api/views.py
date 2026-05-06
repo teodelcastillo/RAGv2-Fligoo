@@ -14,6 +14,7 @@ from apps.skill.api.serializers import (
     SkillWriteSerializer,
 )
 from apps.skill.models import ExecutionStatus, Skill, SkillExecution, SkillStep
+from apps.skill.models import ExecutionOutputMode, SkillType
 from apps.skill.tasks import run_skill_task
 
 
@@ -46,6 +47,27 @@ class SkillViewSet(viewsets.ModelViewSet):
                 Q(allowed_contexts__contains=[context]) |
                 Q(allowed_contexts__contains=["any"])
             )
+        context_slug = self.request.query_params.get("context_slug")
+        if context == "repository" and context_slug:
+            from apps.repository.models import Repository
+            try:
+                repository = Repository.objects.for_user(user).get(slug=context_slug)
+            except Repository.DoesNotExist:
+                return qs.none()
+            qs = qs.filter(
+                Q(is_default_enabled=True) |
+                Q(enabled_repositories=repository)
+            ).distinct()
+        elif context == "project" and context_slug:
+            from apps.project.models import Project
+            try:
+                project = Project.objects.for_user(user).get(slug=context_slug)
+            except Project.DoesNotExist:
+                return qs.none()
+            qs = qs.filter(
+                Q(is_default_enabled=True) |
+                Q(enabled_projects=project)
+            ).distinct()
         return qs
 
     def get_serializer_class(self):
@@ -76,7 +98,7 @@ class SkillViewSet(viewsets.ModelViewSet):
         """
         skill = self.get_object()
 
-        serializer = RunSkillSerializer(data=request.data)
+        serializer = RunSkillSerializer(data=request.data, context={"request": request})
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
 
@@ -88,6 +110,19 @@ class SkillViewSet(viewsets.ModelViewSet):
                            f"Allowed: {skill.allowed_contexts}"},
                 status=status.HTTP_400_BAD_REQUEST,
             )
+        if not self._skill_enabled_for_context(skill, context_type, data):
+            return Response(
+                {"detail": "This skill is not enabled for this workspace."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if (
+            skill.skill_type == SkillType.COPILOT
+            and data.get("output_mode") == ExecutionOutputMode.TABLE
+        ):
+            return Response(
+                {"detail": "Table output mode is currently supported only for Quick skills."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
         execution = SkillExecution.objects.create(
             skill=skill,
@@ -96,10 +131,14 @@ class SkillViewSet(viewsets.ModelViewSet):
             project=data.get("project"),
             document=data.get("document"),
             extra_instructions=data.get("extra_instructions", ""),
+            output_mode=data.get("output_mode"),
+            metadata={
+                "table_columns": data.get("table_columns", []),
+                "table_schema": data.get("table_schema", {}),
+            },
             status=ExecutionStatus.PENDING,
         )
 
-        from apps.skill.models import SkillType
         if skill.skill_type == SkillType.QUICK:
             # Run synchronously — result is ready when this returns
             run_skill_task(execution.id)
@@ -115,6 +154,17 @@ class SkillViewSet(viewsets.ModelViewSet):
                 SkillExecutionSerializer(execution).data,
                 status=status.HTTP_202_ACCEPTED,
             )
+
+    def _skill_enabled_for_context(self, skill: Skill, context_type: str, data: dict) -> bool:
+        if context_type == "document" or skill.is_default_enabled:
+            return True
+        if context_type == "repository":
+            repository = data.get("repository")
+            return bool(repository and repository.enabled_skills.filter(pk=skill.pk).exists())
+        if context_type == "project":
+            project = data.get("project")
+            return bool(project and project.enabled_skills.filter(pk=skill.pk).exists())
+        return False
 
 
 class SkillExecutionViewSet(

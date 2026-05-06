@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import os
 from typing import List
@@ -11,6 +12,7 @@ from apps.chat.services.rag import build_context_block, fetch_relevant_chunks
 from apps.document.models import Document
 from apps.document.utils.client_openia import generate_chat_completion
 from apps.skill.models import (
+    ExecutionOutputMode,
     ExecutionStatus,
     RetrievalStrategy,
     Skill,
@@ -136,15 +138,49 @@ def _run_quick(execution: SkillExecution, documents: QuerySet[Document]) -> None
         prompt = (
             f"{prompt}\n\n{_comparative_instruction_block(skill.strict_missing_evidence)}"
         ).strip()
+    system_prompt = skill.system_prompt
+    if execution.output_mode == ExecutionOutputMode.TABLE:
+        table_schema = execution.metadata.get("table_schema") or {}
+        columns = table_schema.get("columns") or []
+        columns_json = json.dumps(columns, ensure_ascii=False)
+        column_instructions = []
+        for column in columns:
+            prompt_hint = (column.get("prompt_hint") or "").strip()
+            if not prompt_hint:
+                continue
+            column_instructions.append(
+                f"- {column.get('key')} ({column.get('type')}): {prompt_hint}"
+            )
+        column_instructions_block = "\n".join(column_instructions) or "- No extra per-column hints."
+        system_prompt = (
+            f"{skill.system_prompt}\n\n"
+            "Debes responder EXCLUSIVAMENTE en JSON válido (sin markdown, sin texto adicional) "
+            "con este schema:\n"
+            '{"type":"table","columns":[string],"rows":[object]}\n'
+            "Usa EXACTAMENTE estas columnas y metadatos en este orden: "
+            f"{columns_json}. "
+            "Cada fila debe incluir todas las columnas con su tipo esperado."
+            "\n\nInstrucciones por columna:\n"
+            f"{column_instructions_block}"
+        )
     messages = [
-        {"role": "system", "content": skill.system_prompt},
+        {"role": "system", "content": system_prompt},
         {"role": "user", "content": prompt},
     ]
     output_text, usage = generate_chat_completion(
         messages, model=skill.model, temperature=skill.temperature
     )
 
-    execution.output = output_text
+    if execution.output_mode == ExecutionOutputMode.TABLE:
+        parsed = _coerce_table_output(
+            output_text=output_text,
+            table_schema=execution.metadata.get("table_schema") or {},
+        )
+        execution.output = ""
+        execution.output_structured = parsed
+    else:
+        execution.output = output_text
+        execution.output_structured = {}
     source_stats = _collect_source_stats(chunks, total_docs=documents.count())
     execution.metadata = {
         "usage": usage,
@@ -161,6 +197,8 @@ def _run_quick(execution: SkillExecution, documents: QuerySet[Document]) -> None
             }
             for c in chunks
         ],
+        "table_columns": execution.metadata.get("table_columns", []),
+        "table_schema": execution.metadata.get("table_schema", {}),
     }
 
 
@@ -244,7 +282,84 @@ def _run_copilot(execution: SkillExecution, documents: QuerySet[Document]) -> No
         "strict_missing_evidence": skill.strict_missing_evidence,
         "retrieval_strategy_used": effective_retrieval_strategy,
         **source_stats,
+        "table_columns": execution.metadata.get("table_columns", []),
+        "table_schema": execution.metadata.get("table_schema", {}),
     }
+
+
+def _coerce_table_output(*, output_text: str, table_schema: dict) -> dict:
+    schema_columns = table_schema.get("columns") or []
+    normalized_columns = [c.get("key") for c in schema_columns if c.get("key")]
+    if not normalized_columns or not schema_columns:
+        raise ValueError("Missing required columns for table output.")
+    try:
+        parsed = json.loads((output_text or "").strip())
+    except json.JSONDecodeError as exc:
+        raise ValueError("Model returned invalid JSON for table output.") from exc
+    if not isinstance(parsed, dict):
+        raise ValueError("Table output must be a JSON object.")
+    rows = parsed.get("rows")
+    if not isinstance(rows, list):
+        raise ValueError("Table output must contain a 'rows' array.")
+
+    type_map = {c["key"]: c.get("type", "text") for c in schema_columns}
+    required_map = {c["key"]: bool(c.get("required", False)) for c in schema_columns}
+    enum_map = {c["key"]: set(c.get("allowed_values") or []) for c in schema_columns}
+
+    normalized_rows = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        normalized_row = {}
+        for col in normalized_columns:
+            value = row.get(col, None)
+            value = _normalize_table_cell_value(
+                value=value,
+                col=col,
+                col_type=type_map.get(col, "text"),
+                required=required_map.get(col, False),
+                allowed_values=enum_map.get(col, set()),
+            )
+            normalized_row[col] = value
+        normalized_rows.append(normalized_row)
+    return {
+        "type": "table",
+        "columns": normalized_columns,
+        "column_schema": schema_columns,
+        "rows": normalized_rows,
+    }
+
+
+def _normalize_table_cell_value(*, value, col: str, col_type: str, required: bool, allowed_values: set):
+    if value in (None, ""):
+        if required:
+            return ""
+        return ""
+    if col_type == "boolean":
+        if isinstance(value, bool):
+            return value
+        text = str(value).strip().lower()
+        if text in {"true", "1", "yes", "si", "sí"}:
+            return True
+        if text in {"false", "0", "no"}:
+            return False
+        return ""
+    if col_type == "number":
+        try:
+            number = float(value)
+            if number.is_integer():
+                return int(number)
+            return number
+        except (TypeError, ValueError):
+            return ""
+    if col_type == "enum":
+        text = str(value).strip()
+        if text in allowed_values:
+            return text
+        lowered = {str(v).lower(): v for v in allowed_values}
+        mapped = lowered.get(text.lower())
+        return mapped if mapped is not None else ""
+    return str(value).strip()
 
 
 # ---------------------------------------------------------------------------

@@ -34,6 +34,7 @@ class RepositoryViewSet(viewsets.ModelViewSet):
                     "repository_documents",
                     queryset=RepositoryDocument.objects.select_related("document"),
                 ),
+                "enabled_skills",
             )
         )
 

@@ -59,6 +59,7 @@ class ProjectViewSet(viewsets.ModelViewSet):
                     "shares",
                     queryset=ProjectShare.objects.select_related("user"),
                 ),
+                "enabled_skills",
             )
             .annotate(
                 skill_executions_count=Subquery(

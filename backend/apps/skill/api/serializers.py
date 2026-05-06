@@ -4,6 +4,7 @@ from django.contrib.auth import get_user_model
 from rest_framework import serializers
 
 from apps.skill.models import (
+    ExecutionOutputMode,
     ExecutionStatus,
     RetrievalStrategy,
     Skill,
@@ -31,6 +32,7 @@ DOCUMENT_FIRST_KEYWORDS = (
     "matriz",
     "criter",
 )
+TABLE_COLUMN_TYPES = {"text", "boolean", "number", "enum", "date"}
 
 
 def _requires_document_first_analysis(
@@ -72,11 +74,14 @@ class SkillSerializer(serializers.ModelSerializer):
             "model", "temperature",
             "comparative_mode_enabled", "strict_missing_evidence",
             "retrieval_strategy", "k_per_doc", "total_limit", "max_per_doc_after_rerank",
-            "is_template",
+            "is_template", "is_default_enabled",
             "owner", "owner_email", "steps",
             "created_at", "updated_at",
         )
-        read_only_fields = ("id", "slug", "is_template", "owner", "owner_email", "created_at", "updated_at")
+        read_only_fields = (
+            "id", "slug", "is_template", "is_default_enabled",
+            "owner", "owner_email", "created_at", "updated_at",
+        )
 
 
 class SkillStepWriteSerializer(serializers.Serializer):
@@ -231,7 +236,7 @@ class SkillExecutionSerializer(serializers.ModelSerializer):
             "id", "skill", "skill_name", "skill_type",
             "status", "context_label",
             "repository_slug", "project_slug", "document_slug",
-            "extra_instructions",
+            "extra_instructions", "output_mode",
             "output", "output_structured",
             "document_snapshot", "metadata", "error_message",
             "started_at", "finished_at", "created_at",
@@ -247,6 +252,17 @@ class RunSkillSerializer(serializers.Serializer):
     )
     context_slug = serializers.SlugField(required=True)
     extra_instructions = serializers.CharField(required=False, allow_blank=True, default="")
+    output_mode = serializers.ChoiceField(
+        choices=ExecutionOutputMode.choices,
+        required=False,
+        default=ExecutionOutputMode.TEXT,
+    )
+    table_schema = serializers.DictField(required=False)
+    table_columns = serializers.ListField(
+        child=serializers.CharField(max_length=120),
+        required=False,
+        allow_empty=False,
+    )
 
     def validate(self, attrs):
         context_type = attrs["context_type"]
@@ -255,14 +271,18 @@ class RunSkillSerializer(serializers.Serializer):
         if context_type == "repository":
             from apps.repository.models import Repository
             try:
-                attrs["repository"] = Repository.objects.get(slug=context_slug)
+                attrs["repository"] = Repository.objects.for_user(
+                    self.context["request"].user
+                ).get(slug=context_slug)
             except Repository.DoesNotExist:
                 raise serializers.ValidationError({"context_slug": "Repository not found."})
 
         elif context_type == "project":
             from apps.project.models import Project
             try:
-                attrs["project"] = Project.objects.get(slug=context_slug)
+                attrs["project"] = Project.objects.for_user(
+                    self.context["request"].user
+                ).get(slug=context_slug)
             except Project.DoesNotExist:
                 raise serializers.ValidationError({"context_slug": "Project not found."})
 
@@ -273,4 +293,82 @@ class RunSkillSerializer(serializers.Serializer):
             except Document.DoesNotExist:
                 raise serializers.ValidationError({"context_slug": "Document not found."})
 
+        output_mode = attrs.get("output_mode", ExecutionOutputMode.TEXT)
+        table_schema = attrs.get("table_schema") or {}
+        table_columns = attrs.get("table_columns") or []
+
+        if table_schema and not table_columns:
+            table_columns = table_schema.get("columns", [])
+            attrs["table_columns"] = table_columns
+
+        if output_mode == ExecutionOutputMode.TABLE and not table_columns:
+            raise serializers.ValidationError(
+                {"table_columns": "table_columns is required when output_mode='table'."}
+            )
+        if output_mode != ExecutionOutputMode.TABLE and (table_columns or table_schema):
+            raise serializers.ValidationError(
+                {"table_schema": "table schema fields can only be used with output_mode='table'."}
+            )
+        if output_mode == ExecutionOutputMode.TABLE:
+            attrs["table_schema"] = self._build_table_schema(table_schema, table_columns)
         return attrs
+
+    def _build_table_schema(self, table_schema: dict, table_columns: list[str]) -> dict:
+        columns = table_schema.get("columns") if table_schema else None
+        if not columns:
+            columns = [{"key": c, "label": c, "type": "text"} for c in table_columns]
+        if not isinstance(columns, list):
+            raise serializers.ValidationError({"table_schema": "columns must be a list."})
+
+        normalized_columns = []
+        seen_keys = set()
+        for raw in columns:
+            if isinstance(raw, str):
+                raw = {"key": raw, "label": raw, "type": "text"}
+            if not isinstance(raw, dict):
+                raise serializers.ValidationError({"table_schema": "Invalid column entry."})
+            key = (raw.get("key") or "").strip()
+            label = (raw.get("label") or key).strip()
+            col_type = (raw.get("type") or "text").strip().lower()
+            prompt_hint = (raw.get("prompt_hint") or "").strip()
+            required = bool(raw.get("required", False))
+            allowed_values = raw.get("allowed_values") or []
+
+            if not key:
+                raise serializers.ValidationError({"table_schema": "Every column must include a key."})
+            if key in seen_keys:
+                raise serializers.ValidationError({"table_schema": f"Duplicate column key: {key}"})
+            if col_type not in TABLE_COLUMN_TYPES:
+                raise serializers.ValidationError(
+                    {"table_schema": f"Invalid type for column '{key}': {col_type}"}
+                )
+            if col_type == "enum":
+                if not isinstance(allowed_values, list) or len(allowed_values) == 0:
+                    raise serializers.ValidationError(
+                        {"table_schema": f"Column '{key}' of type enum requires allowed_values."}
+                    )
+                allowed_values = [str(v).strip() for v in allowed_values if str(v).strip()]
+                if not allowed_values:
+                    raise serializers.ValidationError(
+                        {"table_schema": f"Column '{key}' of type enum requires non-empty allowed_values."}
+                    )
+            else:
+                allowed_values = []
+
+            seen_keys.add(key)
+            normalized_columns.append(
+                {
+                    "key": key,
+                    "label": label,
+                    "type": col_type,
+                    "required": required,
+                    "prompt_hint": prompt_hint,
+                    "allowed_values": allowed_values,
+                }
+            )
+
+        return {
+            "name": (table_schema.get("name") or "").strip(),
+            "description": (table_schema.get("description") or "").strip(),
+            "columns": normalized_columns,
+        }

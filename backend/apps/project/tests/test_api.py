@@ -48,6 +48,28 @@ class ProjectAPITestCase(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
         self.assertEqual(len(response.data["documents"]), 2)
 
+    def test_create_project_with_blueprint_document(self):
+        url = reverse("project-list")
+        payload = {
+            "name": "Proyecto con Blueprint",
+            "document_slugs": ["doc-propio", "doc-publico"],
+            "blueprint_document_slug": "doc-publico",
+        }
+        response = self.client.post(url, payload, format="json")
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(response.data["blueprint_document_slug"], "doc-publico")
+
+    def test_reject_blueprint_not_in_linked_documents(self):
+        url = reverse("project-list")
+        payload = {
+            "name": "Proyecto inválido",
+            "document_slugs": ["doc-propio"],
+            "blueprint_document_slug": "doc-publico",
+        }
+        response = self.client.post(url, payload, format="json")
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("blueprint_document_slug", response.data)
+
     def test_create_project_rejects_forbidden_document(self):
         url = reverse("project-list")
         payload = {

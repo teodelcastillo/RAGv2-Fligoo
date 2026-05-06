@@ -33,6 +33,11 @@ class ExecutionStatus(models.TextChoices):
     FAILED = "failed", _("Failed")
 
 
+class ExecutionOutputMode(models.TextChoices):
+    TEXT = "text", _("Text")
+    TABLE = "table", _("Table")
+
+
 # ---------------------------------------------------------------------------
 # Skill definition
 # ---------------------------------------------------------------------------
@@ -116,6 +121,13 @@ class Skill(models.Model):
 
     # True = Ecofilia-provided, non-editable by regular users
     is_template = models.BooleanField(default=False)
+    is_default_enabled = models.BooleanField(
+        default=False,
+        help_text=(
+            "When true, this skill is enabled by default in every repository/project "
+            "workspace unless the user adds more plugins."
+        ),
+    )
 
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -206,6 +218,12 @@ class SkillExecution(models.Model):
 
     # Optional user-provided instructions that override / extend the skill
     extra_instructions = models.TextField(blank=True)
+    output_mode = models.CharField(
+        max_length=20,
+        choices=ExecutionOutputMode.choices,
+        default=ExecutionOutputMode.TEXT,
+        help_text="Requested output shape for this execution (text or table).",
+    )
 
     # Execution state
     status = models.CharField(

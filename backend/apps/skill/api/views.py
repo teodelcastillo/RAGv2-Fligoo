@@ -114,8 +114,9 @@ class SkillViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST,
             )
         if not self._skill_enabled_for_context(skill, context_type, data):
+            context_label = {"repository": "repository", "project": "project"}.get(context_type, "context")
             return Response(
-                {"detail": "This skill is not enabled for this workspace."},
+                {"detail": f"This skill is not enabled for this {context_label}. Add it via the Skills panel settings."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 

@@ -9,8 +9,12 @@ from apps.document.services import accessible_documents_for
 from apps.project.models import (
     Project,
     ProjectDocument,
+    ProjectSection,
+    ProjectSectionStatus,
     ProjectShare,
     ProjectShareRole,
+    ProjectStructureSection,
+    ProjectStructureTemplate,
 )
 from apps.skill.models import Skill
 
@@ -62,6 +66,11 @@ class ProjectSerializer(serializers.ModelSerializer):
         read_only=True,
         allow_null=True,
     )
+    structure_template_slug = serializers.SlugField(
+        source="structure_template.slug",
+        read_only=True,
+        allow_null=True,
+    )
 
     class Meta:
         model = Project
@@ -77,6 +86,9 @@ class ProjectSerializer(serializers.ModelSerializer):
             "skill_executions_count",
             "enabled_skill_slugs",
             "blueprint_document_slug",
+            "context_notes",
+            "copilot_enabled",
+            "structure_template_slug",
             "created_at",
             "updated_at",
         )
@@ -89,6 +101,7 @@ class ProjectSerializer(serializers.ModelSerializer):
             "skill_executions_count",
             "enabled_skill_slugs",
             "blueprint_document_slug",
+            "structure_template_slug",
             "created_at",
             "updated_at",
         )
@@ -111,6 +124,13 @@ class ProjectWriteSerializer(ProjectSerializer):
         required=False,
         allow_null=True,
         allow_blank=False,
+        write_only=True,
+    )
+    context_notes = serializers.JSONField(required=False)
+    copilot_enabled = serializers.BooleanField(required=False)
+    structure_template_slug = serializers.SlugField(
+        required=False,
+        allow_null=True,
         write_only=True,
     )
 
@@ -286,4 +306,69 @@ class ProjectShareWriteSerializer(serializers.Serializer):
         # Reemplazar user_email con user para que la vista lo use
         attrs['user'] = user
         return attrs
+
+
+# ---------------------------------------------------------------------------
+# Structure template serializers
+# ---------------------------------------------------------------------------
+
+class ProjectStructureSectionSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ProjectStructureSection
+        fields = ("id", "title", "description", "position", "suggested_skill_slugs")
+        read_only_fields = fields
+
+
+class ProjectStructureTemplateSerializer(serializers.ModelSerializer):
+    sections = ProjectStructureSectionSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = ProjectStructureTemplate
+        fields = ("id", "slug", "name", "description", "sections", "created_at")
+        read_only_fields = fields
+
+
+class ProjectStructureTemplateListSerializer(serializers.ModelSerializer):
+    section_count = serializers.IntegerField(read_only=True)
+
+    class Meta:
+        model = ProjectStructureTemplate
+        fields = ("id", "slug", "name", "description", "section_count", "created_at")
+        read_only_fields = fields
+
+
+# ---------------------------------------------------------------------------
+# Project section serializers
+# ---------------------------------------------------------------------------
+
+class ProjectSectionSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ProjectSection
+        fields = (
+            "id", "title", "description", "position", "status",
+            "notes", "output_snapshot", "updated_at", "created_at",
+        )
+        read_only_fields = (
+            "id", "title", "description", "position",
+            "output_snapshot", "updated_at", "created_at",
+        )
+
+
+class ProjectSectionUpdateSerializer(serializers.Serializer):
+    status = serializers.ChoiceField(
+        choices=ProjectSectionStatus.choices, required=False,
+    )
+    notes = serializers.CharField(required=False, allow_blank=True)
+
+
+# ---------------------------------------------------------------------------
+# Copilot message serializer
+# ---------------------------------------------------------------------------
+
+class CopilotMessageCreateSerializer(serializers.Serializer):
+    content = serializers.CharField(allow_blank=False, max_length=4000)
+
+
+class InitializeStructureSerializer(serializers.Serializer):
+    template_slug = serializers.SlugField()
 

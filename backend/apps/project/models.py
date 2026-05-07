@@ -9,6 +9,13 @@ from django.utils.translation import gettext_lazy as _
 from apps.document.models import Document
 
 
+class ProjectSectionStatus(models.TextChoices):
+    NOT_STARTED = "not_started", _("Not Started")
+    IN_PROGRESS = "in_progress", _("In Progress")
+    REVIEW = "review", _("Review")
+    COMPLETED = "completed", _("Completed")
+
+
 class ProjectQuerySet(models.QuerySet):
     def for_user(self, user):
         if user.is_staff:
@@ -45,6 +52,27 @@ class Project(models.Model):
         related_name="enabled_projects",
         blank=True,
         help_text="Skills/copilots shown in this project workspace.",
+    )
+    structure_template = models.ForeignKey(
+        "ProjectStructureTemplate",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="projects",
+        help_text="Structure template that defines the project's sections/phases.",
+    )
+    context_notes = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text=(
+            "Persistent context injected into every copilot prompt. "
+            'Example: {"company": "Acme Corp", "sector": "Manufacturing", '
+            '"framework": "GRI", "reporting_year": "2024"}'
+        ),
+    )
+    copilot_enabled = models.BooleanField(
+        default=False,
+        help_text="Whether the copilot assistant is active for this project.",
     )
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -151,4 +179,77 @@ class ProjectShare(models.Model):
 
     def __str__(self) -> str:
         return f"{self.project_id}-{self.user_id}-{self.role}"
+
+
+# ---------------------------------------------------------------------------
+# Project structure templates + sections
+# ---------------------------------------------------------------------------
+
+class ProjectStructureTemplate(models.Model):
+    name = models.CharField(max_length=255)
+    slug = models.SlugField(unique=True, max_length=255)
+    description = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ("name",)
+
+    def __str__(self) -> str:
+        return self.name
+
+
+class ProjectStructureSection(models.Model):
+    template = models.ForeignKey(
+        ProjectStructureTemplate,
+        related_name="sections",
+        on_delete=models.CASCADE,
+    )
+    title = models.CharField(max_length=255)
+    description = models.TextField(blank=True)
+    position = models.PositiveIntegerField(default=1)
+    suggested_skill_slugs = models.JSONField(
+        default=list,
+        blank=True,
+        help_text="Slugs of skills the copilot can suggest for this section.",
+    )
+
+    class Meta:
+        ordering = ("position",)
+        unique_together = ("template", "position")
+
+    def __str__(self) -> str:
+        return f"{self.template.name} — {self.position}. {self.title}"
+
+
+class ProjectSection(models.Model):
+    project = models.ForeignKey(
+        Project,
+        related_name="sections",
+        on_delete=models.CASCADE,
+    )
+    template_section = models.ForeignKey(
+        ProjectStructureSection,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+    )
+    title = models.CharField(max_length=255)
+    description = models.TextField(blank=True)
+    position = models.PositiveIntegerField(default=1)
+    status = models.CharField(
+        max_length=20,
+        choices=ProjectSectionStatus.choices,
+        default=ProjectSectionStatus.NOT_STARTED,
+    )
+    notes = models.TextField(blank=True)
+    output_snapshot = models.TextField(blank=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ("position",)
+        unique_together = ("project", "position")
+
+    def __str__(self) -> str:
+        return f"{self.project.name} — {self.position}. {self.title} ({self.status})"
 

@@ -29,6 +29,7 @@ class ChatSessionSerializer(serializers.ModelSerializer):
         model = ChatSession
         fields = (
             "id",
+            "session_type",
             "title",
             "system_prompt",
             "model",

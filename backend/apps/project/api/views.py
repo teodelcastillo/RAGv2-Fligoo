@@ -8,20 +8,29 @@ from rest_framework.exceptions import PermissionDenied
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
-from apps.chat.models import ChatSession
-from apps.chat.api.serializers import ChatSessionSerializer, ChatSessionCreateSerializer
+from apps.chat.models import ChatMessage, ChatSession, ChatSessionType, MessageRole
+from apps.chat.api.serializers import (
+    ChatMessageSerializer,
+    ChatSessionSerializer,
+    ChatSessionCreateSerializer,
+)
+from apps.chat.services.copilot import initialize_project_structure, process_copilot_message
 from apps.document.models import Document
 from apps.evaluation.api.serializers import EvaluationRunSerializer
 from apps.evaluation.models import EvaluationRun, PillarEvaluationResult
 from apps.project.api.permissions import ProjectAccessPermission
 from apps.project.api.serializers import (
+    CopilotMessageCreateSerializer,
+    InitializeStructureSerializer,
     ProjectDocumentAttachSerializer,
+    ProjectSectionSerializer,
+    ProjectSectionUpdateSerializer,
     ProjectSerializer,
     ProjectShareSerializer,
     ProjectShareWriteSerializer,
     ProjectWriteSerializer,
 )
-from apps.project.models import Project, ProjectDocument, ProjectShare
+from apps.project.models import Project, ProjectDocument, ProjectSection, ProjectShare
 
 
 def _skill_execution_count_subquery():
@@ -49,7 +58,7 @@ class ProjectViewSet(viewsets.ModelViewSet):
         user = self.request.user
         return (
             Project.objects.for_user(user)
-            .select_related("owner")
+            .select_related("owner", "blueprint_document", "structure_template")
             .prefetch_related(
                 Prefetch(
                     "project_documents",
@@ -284,6 +293,176 @@ class ProjectViewSet(viewsets.ModelViewSet):
         output = ChatSessionSerializer(session, context={"request": request})
         return Response(output.data, status=status.HTTP_201_CREATED)
 
+    # ------------------------------------------------------------------
+    # Structure endpoints
+    # ------------------------------------------------------------------
+
+    @action(detail=True, methods=["get"], url_path="structure", url_name="structure")
+    def structure(self, request, slug=None):
+        project = self.get_object()
+        sections = ProjectSection.objects.filter(project=project).order_by("position")
+        serializer = ProjectSectionSerializer(sections, many=True)
+        return Response({
+            "template_slug": project.structure_template.slug if project.structure_template else None,
+            "template_name": project.structure_template.name if project.structure_template else None,
+            "sections": serializer.data,
+        })
+
+    @action(detail=True, methods=["put"], url_path="structure/initialize", url_name="structure-initialize")
+    def structure_initialize(self, request, slug=None):
+        project = self.get_object()
+        self._ensure_editor(project)
+        serializer = InitializeStructureSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            sections = initialize_project_structure(
+                project, serializer.validated_data["template_slug"],
+            )
+        except Exception as exc:
+            return Response(
+                {"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST,
+            )
+        output = ProjectSectionSerializer(sections, many=True)
+        return Response(output.data, status=status.HTTP_200_OK)
+
+    @action(
+        detail=True, methods=["patch"],
+        url_path=r"structure/sections/(?P<position>\d+)",
+        url_name="structure-section-update",
+    )
+    def update_section(self, request, slug=None, position=None):
+        project = self.get_object()
+        self._ensure_editor(project)
+        section = get_object_or_404(
+            ProjectSection, project=project, position=int(position),
+        )
+        serializer = ProjectSectionUpdateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        update_fields = []
+        if "status" in data:
+            section.status = data["status"]
+            update_fields.append("status")
+        if "notes" in data:
+            section.notes = data["notes"]
+            update_fields.append("notes")
+        if update_fields:
+            section.save(update_fields=update_fields)
+        return Response(ProjectSectionSerializer(section).data)
+
+    # ------------------------------------------------------------------
+    # Copilot endpoints
+    # ------------------------------------------------------------------
+
+    @action(
+        detail=True, methods=["get", "post"],
+        url_path="copilot/sessions", url_name="copilot-sessions",
+    )
+    def copilot_sessions(self, request, slug=None):
+        project = self.get_object()
+
+        if request.method == "GET":
+            qs = (
+                ChatSession.objects.filter(
+                    owner=request.user,
+                    project=project,
+                    session_type=ChatSessionType.COPILOT,
+                )
+                .prefetch_related("allowed_documents")
+                .order_by("-updated_at")
+            )
+            serializer = ChatSessionSerializer(
+                qs, many=True, context={"request": request},
+            )
+            return Response(serializer.data)
+
+        doc_ids = (
+            ProjectDocument.objects.filter(project=project)
+            .values_list("document_id", flat=True)
+        )
+        docs = Document.objects.filter(id__in=doc_ids)
+
+        session = ChatSession.objects.create(
+            owner=request.user,
+            project=project,
+            session_type=ChatSessionType.COPILOT,
+            title=f"Copilot: {project.name}",
+            system_prompt="",
+            model=ChatSession._meta.get_field("model").default,
+            temperature=0.3,
+            language="es",
+        )
+        session.allowed_documents.set(docs)
+
+        output = ChatSessionSerializer(session, context={"request": request})
+        return Response(output.data, status=status.HTTP_201_CREATED)
+
+    @action(
+        detail=True, methods=["post"],
+        url_path="copilot/messages", url_name="copilot-messages",
+    )
+    def copilot_messages(self, request, slug=None):
+        project = self.get_object()
+        serializer = CopilotMessageCreateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        content = serializer.validated_data["content"]
+
+        session_id = request.data.get("session")
+        if session_id:
+            session = get_object_or_404(
+                ChatSession,
+                pk=session_id,
+                owner=request.user,
+                project=project,
+                session_type=ChatSessionType.COPILOT,
+            )
+        else:
+            session = (
+                ChatSession.objects.filter(
+                    owner=request.user,
+                    project=project,
+                    session_type=ChatSessionType.COPILOT,
+                )
+                .order_by("-updated_at")
+                .first()
+            )
+            if session is None:
+                return Response(
+                    {"detail": "No copilot session found. Create one first."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+        user_message = ChatMessage.objects.create(
+            session=session, role=MessageRole.USER, content=content,
+        )
+
+        try:
+            answer_text, metadata, chunk_ids = process_copilot_message(
+                session, content, request.user,
+            )
+        except Exception as exc:
+            user_message.delete()
+            return Response(
+                {"detail": f"Copilot error: {exc}"},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+
+        assistant_message = ChatMessage.objects.create(
+            session=session,
+            role=MessageRole.ASSISTANT,
+            content=answer_text,
+            chunk_ids=chunk_ids,
+            metadata=metadata,
+        )
+
+        return Response(
+            {
+                "user_message": ChatMessageSerializer(user_message).data,
+                "assistant_message": ChatMessageSerializer(assistant_message).data,
+            },
+            status=status.HTTP_201_CREATED,
+        )
+
     def _ensure_editor(self, project: Project):
         if not project.can_edit(self.request.user):
             raise PermissionDenied("No tienes permisos para modificar este proyecto.")
@@ -297,4 +476,32 @@ class ProjectViewSet(viewsets.ModelViewSet):
         return ProjectSerializer(
             refreshed, context=self.get_serializer_context()
         ).data
+
+
+class StructureTemplateViewSet(
+    viewsets.mixins.ListModelMixin,
+    viewsets.mixins.RetrieveModelMixin,
+    viewsets.GenericViewSet,
+):
+    """Read-only viewset for project structure templates."""
+
+    permission_classes = [IsAuthenticated]
+    lookup_field = "slug"
+
+    def get_queryset(self):
+        from apps.project.models import ProjectStructureTemplate
+
+        return ProjectStructureTemplate.objects.prefetch_related("sections").annotate(
+            section_count=Count("sections"),
+        )
+
+    def get_serializer_class(self):
+        from apps.project.api.serializers import (
+            ProjectStructureTemplateListSerializer,
+            ProjectStructureTemplateSerializer,
+        )
+
+        if self.action == "list":
+            return ProjectStructureTemplateListSerializer
+        return ProjectStructureTemplateSerializer
 

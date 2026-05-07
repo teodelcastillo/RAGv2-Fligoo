@@ -13,6 +13,11 @@ from apps.project.models import Project
 DEFAULT_CHAT_MODEL = os.environ.get("MODEL_COMPLETION", "gpt-4o-mini")
 
 
+class ChatSessionType(models.TextChoices):
+    STANDARD = "standard", _("Standard")
+    COPILOT = "copilot", _("Copilot")
+
+
 class MessageRole(models.TextChoices):
     SYSTEM = "system", _("System")
     USER = "user", _("User")
@@ -48,6 +53,11 @@ class ChatSession(models.Model):
         null=True,
         blank=True,
         help_text="Repositorio al que pertenece esta sesión de chat (si aplica)",
+    )
+    session_type = models.CharField(
+        max_length=20,
+        choices=ChatSessionType.choices,
+        default=ChatSessionType.STANDARD,
     )
     title = models.CharField(max_length=255)
     system_prompt = models.TextField(

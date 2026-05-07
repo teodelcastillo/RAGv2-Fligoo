@@ -260,7 +260,7 @@ class CopilotRunSkillToolTestCase(TestCase):
             project=self.project, document=self.doc, added_by=self.user
         )
 
-    @patch("apps.chat.services.copilot_tools.execute_skill")
+    @patch("apps.skill.services.execute_skill")
     def test_runs_quick_skill(self, mock_execute):
         from apps.skill.models import Skill, SkillExecution, SkillType, ExecutionStatus
         from apps.chat.services.copilot_tools import CopilotToolContext, _execute_run_skill

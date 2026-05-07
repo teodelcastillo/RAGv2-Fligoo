@@ -166,12 +166,21 @@ def _compose_messages(
 
     messages = base_messages + history_messages
     if response_mode:
+        mode_instructions = {
+            "tabla": (
+                "Responde en formato tabla Markdown (GFM) cuando sea posible. "
+                "Incluye encabezados claros y al menos 2 columnas. "
+                "Si no hay datos suficientes para tabular, explicá brevemente por qué."
+            ),
+        }
+        extra_instruction = mode_instructions.get(response_mode, "")
         messages.append(
             {
                 "role": str(MessageRole.SYSTEM),
                 "content": (
                     "El usuario seleccionó un modo de respuesta explícito. "
                     f"Prioriza este modo: '{response_mode}'."
+                    + (f" {extra_instruction}" if extra_instruction else "")
                 ),
             }
         )

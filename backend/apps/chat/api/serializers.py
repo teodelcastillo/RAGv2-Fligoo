@@ -148,7 +148,7 @@ class ChatMessageCreateSerializer(serializers.Serializer):
         required=False,
     )
     response_mode = serializers.ChoiceField(
-        choices=("puntual", "panorama", "comparacion", "extraccion"),
+        choices=("puntual", "panorama", "comparacion", "extraccion", "tabla"),
         required=False,
         allow_null=True,
     )

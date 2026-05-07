@@ -35,6 +35,7 @@ RESPONSE_MODE_PUNTUAL = "puntual"
 RESPONSE_MODE_PANORAMA = "panorama"
 RESPONSE_MODE_COMPARACION = "comparacion"
 RESPONSE_MODE_EXTRACCION = "extraccion"
+RESPONSE_MODE_TABLA = "tabla"
 
 _PANORAMA_PATTERNS = (
     r"\b(resumen|panorama|vision|visión|overview|síntesis|sintesis)\b",
@@ -208,6 +209,13 @@ def apply_response_mode_override(
         return analysis
 
     if mode == RESPONSE_MODE_EXTRACCION:
+        analysis.query_type = QUERY_TYPE_NUMERIC
+        analysis.coverage_mode = COVERAGE_MODE_FOCUSED
+        analysis.is_general = False
+        analysis.sub_queries = []
+        return analysis
+
+    if mode == RESPONSE_MODE_TABLA:
         analysis.query_type = QUERY_TYPE_NUMERIC
         analysis.coverage_mode = COVERAGE_MODE_FOCUSED
         analysis.is_general = False

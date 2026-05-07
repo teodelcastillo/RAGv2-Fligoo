@@ -142,6 +142,11 @@ class ChatMessageSerializer(serializers.ModelSerializer):
 class ChatMessageCreateSerializer(serializers.Serializer):
     session = serializers.PrimaryKeyRelatedField(queryset=ChatSession.objects.all())
     content = serializers.CharField(allow_blank=False, max_length=4000)
+    document_slugs = serializers.ListField(
+        child=serializers.SlugField(),
+        allow_empty=True,
+        required=False,
+    )
     response_mode = serializers.ChoiceField(
         choices=("puntual", "panorama", "comparacion", "extraccion"),
         required=False,
@@ -163,4 +168,24 @@ class ChatMessageCreateSerializer(serializers.Serializer):
                 "CHAT_MAX_DOCUMENTS_PER_SESSION si el entorno lo soporta."
             )
         return session
+
+    def validate_document_slugs(self, slugs: List[str]) -> List[str]:
+        unique_slugs = list(dict.fromkeys(slugs))
+        if len(unique_slugs) > CHAT_MAX_DOCUMENTS_PER_SESSION:
+            raise serializers.ValidationError(
+                "Demasiados documentos seleccionados para una consulta: "
+                f"{len(unique_slugs)} seleccionados, máximo "
+                f"{CHAT_MAX_DOCUMENTS_PER_SESSION}."
+            )
+        if not unique_slugs:
+            return unique_slugs
+        user = self.context["request"].user
+        available_docs = accessible_documents_for(user, unique_slugs)
+        found_slugs = set(available_docs.values_list("slug", flat=True))
+        missing = [slug for slug in unique_slugs if slug not in found_slugs]
+        if missing:
+            raise serializers.ValidationError(
+                f"Documentos no encontrados o sin permisos: {', '.join(missing)}"
+            )
+        return unique_slugs
 

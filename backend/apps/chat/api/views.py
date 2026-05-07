@@ -24,6 +24,7 @@ from apps.chat.models import ChatMessage, ChatSession, MessageRole
 from apps.chat.services.context_builder import build_citation_prompt
 from apps.chat.services.query_analysis import COVERAGE_MODE_ALL, classify_query
 from apps.chat.services.rag import RetrievalResult, retrieve_for_chat
+from apps.document.models import Document
 from apps.document.utils import client_openia
 
 logger = logging.getLogger(__name__)
@@ -260,8 +261,10 @@ class ChatMessageViewSet(
         serializer.is_valid(raise_exception=True)
         session = serializer.validated_data["session"]
         content = serializer.validated_data["content"]
+        document_slugs = serializer.validated_data.get("document_slugs")
         response_mode = serializer.validated_data.get("response_mode")
 
+        _sync_session_documents_for_request(session, document_slugs)
         retrieval = _run_retrieval(session, content, request.user, response_mode=response_mode)
         messages = _compose_messages(
             session,
@@ -348,6 +351,19 @@ def _build_chat_messages(
     return messages, retrieval
 
 
+def _sync_session_documents_for_request(
+    session: ChatSession, document_slugs: list[str] | None
+):
+    """
+    Optionally update session scope before retrieval so each message can use
+    the latest selected sources from the workspace UI.
+    """
+    if document_slugs is None:
+        return
+    docs = Document.objects.filter(slug__in=document_slugs)
+    session.allowed_documents.set(docs)
+
+
 class ChatMessageStreamView(APIView):
     """
     POST /chat/messages/stream/
@@ -370,8 +386,10 @@ class ChatMessageStreamView(APIView):
         serializer.is_valid(raise_exception=True)
         session = serializer.validated_data["session"]
         content = serializer.validated_data["content"]
+        document_slugs = serializer.validated_data.get("document_slugs")
         response_mode = serializer.validated_data.get("response_mode")
 
+        _sync_session_documents_for_request(session, document_slugs)
         messages, retrieval = _build_chat_messages(
             session,
             content,

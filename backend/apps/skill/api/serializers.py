@@ -13,6 +13,11 @@ from apps.skill.models import (
     SkillStep,
     SkillType,
 )
+from apps.skill.table_schema import (
+    TableSchemaError,
+    normalize_table_schema,
+    schema_has_columns,
+)
 
 User = get_user_model()
 
@@ -32,7 +37,6 @@ DOCUMENT_FIRST_KEYWORDS = (
     "matriz",
     "criter",
 )
-TABLE_COLUMN_TYPES = {"text", "boolean", "number", "enum", "date"}
 
 
 def _requires_document_first_analysis(
@@ -52,6 +56,13 @@ def _requires_document_first_analysis(
     return any(keyword in text for keyword in DOCUMENT_FIRST_KEYWORDS)
 
 
+def _normalize_table_schema_or_raise(raw, *, field: str) -> dict:
+    try:
+        return normalize_table_schema(raw)
+    except TableSchemaError as exc:
+        raise serializers.ValidationError({field: str(exc)})
+
+
 # ---------------------------------------------------------------------------
 # Skill
 # ---------------------------------------------------------------------------
@@ -59,7 +70,14 @@ def _requires_document_first_analysis(
 class SkillStepSerializer(serializers.ModelSerializer):
     class Meta:
         model = SkillStep
-        fields = ("id", "title", "instructions", "position")
+        fields = (
+            "id",
+            "title",
+            "instructions",
+            "position",
+            "output_mode",
+            "table_schema",
+        )
 
 
 class SkillSerializer(serializers.ModelSerializer):
@@ -74,6 +92,7 @@ class SkillSerializer(serializers.ModelSerializer):
             "model", "temperature",
             "comparative_mode_enabled", "strict_missing_evidence",
             "retrieval_strategy", "k_per_doc", "total_limit", "max_per_doc_after_rerank",
+            "default_output_mode", "table_schema",
             "is_template", "is_default_enabled",
             "owner", "owner_email", "steps",
             "created_at", "updated_at",
@@ -88,10 +107,38 @@ class SkillStepWriteSerializer(serializers.Serializer):
     title = serializers.CharField(max_length=255)
     instructions = serializers.CharField()
     position = serializers.IntegerField(min_value=1)
+    output_mode = serializers.ChoiceField(
+        choices=ExecutionOutputMode.choices,
+        required=False,
+        default=ExecutionOutputMode.TEXT,
+    )
+    table_schema = serializers.DictField(required=False)
+
+    def validate(self, attrs):
+        output_mode = attrs.get("output_mode", ExecutionOutputMode.TEXT)
+        table_schema = attrs.get("table_schema") or {}
+
+        if output_mode == ExecutionOutputMode.TABLE:
+            attrs["table_schema"] = _normalize_table_schema_or_raise(
+                table_schema, field="table_schema"
+            )
+        else:
+            if schema_has_columns(table_schema):
+                raise serializers.ValidationError(
+                    {"table_schema": "table_schema is only allowed when output_mode='table'."}
+                )
+            attrs["table_schema"] = {}
+        return attrs
 
 
 class SkillWriteSerializer(serializers.ModelSerializer):
     steps = SkillStepWriteSerializer(many=True, required=False)
+    table_schema = serializers.DictField(required=False)
+    default_output_mode = serializers.ChoiceField(
+        choices=ExecutionOutputMode.choices,
+        required=False,
+        default=ExecutionOutputMode.TEXT,
+    )
 
     class Meta:
         model = Skill
@@ -101,6 +148,7 @@ class SkillWriteSerializer(serializers.ModelSerializer):
             "model", "temperature",
             "comparative_mode_enabled", "strict_missing_evidence",
             "retrieval_strategy", "k_per_doc", "total_limit", "max_per_doc_after_rerank",
+            "default_output_mode", "table_schema",
             "steps",
         )
 
@@ -196,6 +244,42 @@ class SkillWriteSerializer(serializers.ModelSerializer):
             )
         if comparative_mode_enabled and retrieval_strategy == RetrievalStrategy.GLOBAL:
             attrs["retrieval_strategy"] = RetrievalStrategy.HYBRID_PER_DOCUMENT
+
+        # Validate skill-level table schema (only relevant for QUICK skills)
+        default_output_mode = attrs.get(
+            "default_output_mode",
+            existing.default_output_mode if existing else ExecutionOutputMode.TEXT,
+        )
+        table_schema = attrs.get(
+            "table_schema",
+            existing.table_schema if existing else {},
+        )
+        if skill_type == SkillType.QUICK and default_output_mode == ExecutionOutputMode.TABLE:
+            attrs["table_schema"] = _normalize_table_schema_or_raise(
+                table_schema, field="table_schema"
+            )
+        elif skill_type == SkillType.COPILOT:
+            if default_output_mode == ExecutionOutputMode.TABLE:
+                raise serializers.ValidationError(
+                    {
+                        "default_output_mode": (
+                            "Copilot skills cannot set default_output_mode='table'. "
+                            "Configure each step's output_mode instead."
+                        )
+                    }
+                )
+            attrs["table_schema"] = {}
+        else:
+            if schema_has_columns(table_schema):
+                raise serializers.ValidationError(
+                    {
+                        "table_schema": (
+                            "table_schema is only allowed when default_output_mode='table'."
+                        )
+                    }
+                )
+            attrs["table_schema"] = {}
+
         return attrs
 
     def create(self, validated_data):
@@ -255,7 +339,6 @@ class RunSkillSerializer(serializers.Serializer):
     output_mode = serializers.ChoiceField(
         choices=ExecutionOutputMode.choices,
         required=False,
-        default=ExecutionOutputMode.TEXT,
     )
     table_schema = serializers.DictField(required=False)
     table_columns = serializers.ListField(
@@ -293,82 +376,33 @@ class RunSkillSerializer(serializers.Serializer):
             except Document.DoesNotExist:
                 raise serializers.ValidationError({"context_slug": "Document not found."})
 
-        output_mode = attrs.get("output_mode", ExecutionOutputMode.TEXT)
+        # Override or fallback: the runner is the source of truth for resolving the
+        # *effective* output mode and schema. Here we only validate user-provided
+        # overrides for shape, leaving the merge with skill defaults to the view.
+        output_mode = attrs.get("output_mode")
         table_schema = attrs.get("table_schema") or {}
         table_columns = attrs.get("table_columns") or []
 
-        if table_schema and not table_columns:
-            table_columns = table_schema.get("columns", [])
-            attrs["table_columns"] = table_columns
+        if table_schema and not table_columns and isinstance(table_schema.get("columns"), list):
+            attrs["table_columns"] = [
+                c.get("key") if isinstance(c, dict) else c
+                for c in table_schema["columns"]
+            ]
 
-        if output_mode == ExecutionOutputMode.TABLE and not table_columns:
-            raise serializers.ValidationError(
-                {"table_columns": "table_columns is required when output_mode='table'."}
-            )
-        if output_mode != ExecutionOutputMode.TABLE and (table_columns or table_schema):
-            raise serializers.ValidationError(
-                {"table_schema": "table schema fields can only be used with output_mode='table'."}
-            )
         if output_mode == ExecutionOutputMode.TABLE:
-            attrs["table_schema"] = self._build_table_schema(table_schema, table_columns)
-        return attrs
-
-    def _build_table_schema(self, table_schema: dict, table_columns: list[str]) -> dict:
-        columns = table_schema.get("columns") if table_schema else None
-        if not columns:
-            columns = [{"key": c, "label": c, "type": "text"} for c in table_columns]
-        if not isinstance(columns, list):
-            raise serializers.ValidationError({"table_schema": "columns must be a list."})
-
-        normalized_columns = []
-        seen_keys = set()
-        for raw in columns:
-            if isinstance(raw, str):
-                raw = {"key": raw, "label": raw, "type": "text"}
-            if not isinstance(raw, dict):
-                raise serializers.ValidationError({"table_schema": "Invalid column entry."})
-            key = (raw.get("key") or "").strip()
-            label = (raw.get("label") or key).strip()
-            col_type = (raw.get("type") or "text").strip().lower()
-            prompt_hint = (raw.get("prompt_hint") or "").strip()
-            required = bool(raw.get("required", False))
-            allowed_values = raw.get("allowed_values") or []
-
-            if not key:
-                raise serializers.ValidationError({"table_schema": "Every column must include a key."})
-            if key in seen_keys:
-                raise serializers.ValidationError({"table_schema": f"Duplicate column key: {key}"})
-            if col_type not in TABLE_COLUMN_TYPES:
-                raise serializers.ValidationError(
-                    {"table_schema": f"Invalid type for column '{key}': {col_type}"}
+            if table_schema:
+                attrs["table_schema"] = _normalize_table_schema_or_raise(
+                    table_schema, field="table_schema"
                 )
-            if col_type == "enum":
-                if not isinstance(allowed_values, list) or len(allowed_values) == 0:
-                    raise serializers.ValidationError(
-                        {"table_schema": f"Column '{key}' of type enum requires allowed_values."}
-                    )
-                allowed_values = [str(v).strip() for v in allowed_values if str(v).strip()]
-                if not allowed_values:
-                    raise serializers.ValidationError(
-                        {"table_schema": f"Column '{key}' of type enum requires non-empty allowed_values."}
-                    )
-            else:
-                allowed_values = []
+            elif table_columns:
+                attrs["table_schema"] = _normalize_table_schema_or_raise(
+                    {"columns": [{"key": c, "label": c, "type": "text"} for c in table_columns]},
+                    field="table_schema",
+                )
+        elif output_mode == ExecutionOutputMode.TEXT:
+            if schema_has_columns(table_schema) or table_columns:
+                raise serializers.ValidationError(
+                    {"table_schema": "table schema fields can only be used with output_mode='table'."}
+                )
 
-            seen_keys.add(key)
-            normalized_columns.append(
-                {
-                    "key": key,
-                    "label": label,
-                    "type": col_type,
-                    "required": required,
-                    "prompt_hint": prompt_hint,
-                    "allowed_values": allowed_values,
-                }
-            )
-
-        return {
-            "name": (table_schema.get("name") or "").strip(),
-            "description": (table_schema.get("description") or "").strip(),
-            "columns": normalized_columns,
-        }
+        return attrs

@@ -13,8 +13,15 @@ from apps.skill.api.serializers import (
     SkillSerializer,
     SkillWriteSerializer,
 )
-from apps.skill.models import ExecutionStatus, Skill, SkillExecution, SkillStep
-from apps.skill.models import ExecutionOutputMode, SkillType
+from apps.skill.models import (
+    ExecutionOutputMode,
+    ExecutionStatus,
+    Skill,
+    SkillExecution,
+    SkillStep,
+    SkillType,
+)
+from apps.skill.table_schema import schema_has_columns
 from apps.skill.tasks import run_skill_task
 
 
@@ -109,14 +116,15 @@ class SkillViewSet(viewsets.ModelViewSet):
                 {"detail": "This skill is not enabled for this workspace."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-        if (
-            skill.skill_type == SkillType.COPILOT
-            and data.get("output_mode") == ExecutionOutputMode.TABLE
-        ):
-            return Response(
-                {"detail": "Table output mode is currently supported only for Quick skills."},
-                status=status.HTTP_400_BAD_REQUEST,
+
+        try:
+            effective_output_mode, effective_table_schema = self._resolve_effective_output(
+                skill=skill,
+                run_output_mode=data.get("output_mode"),
+                run_table_schema=data.get("table_schema") or {},
             )
+        except ValueError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
 
         execution = SkillExecution.objects.create(
             skill=skill,
@@ -125,10 +133,14 @@ class SkillViewSet(viewsets.ModelViewSet):
             project=data.get("project"),
             document=data.get("document"),
             extra_instructions=data.get("extra_instructions", ""),
-            output_mode=data.get("output_mode"),
+            output_mode=effective_output_mode,
             metadata={
-                "table_columns": data.get("table_columns", []),
-                "table_schema": data.get("table_schema", {}),
+                "table_columns": [
+                    col.get("key")
+                    for col in (effective_table_schema.get("columns") or [])
+                    if isinstance(col, dict) and col.get("key")
+                ],
+                "table_schema": effective_table_schema,
             },
             status=ExecutionStatus.PENDING,
         )
@@ -159,6 +171,46 @@ class SkillViewSet(viewsets.ModelViewSet):
             project = data.get("project")
             return bool(project and project.enabled_skills.filter(pk=skill.pk).exists())
         return False
+
+    def _resolve_effective_output(
+        self,
+        *,
+        skill: Skill,
+        run_output_mode,
+        run_table_schema: dict,
+    ) -> tuple[str, dict]:
+        """
+        Resolve the effective output_mode and table_schema for a run.
+
+        Precedence:
+          1. Explicit `output_mode` in the run payload (with optional override schema).
+          2. Skill `default_output_mode` (and its persisted `table_schema`).
+          3. Defaults to TEXT.
+
+        For Copilots the *skill-level* table_schema is intentionally ignored;
+        each step decides its own output_mode/table_schema, so we only honor a
+        run-level override when the user explicitly requests a single tabular
+        output for the whole copilot.
+        """
+        if run_output_mode:
+            mode = run_output_mode
+        else:
+            mode = skill.default_output_mode or ExecutionOutputMode.TEXT
+
+        if mode == ExecutionOutputMode.TABLE:
+            if skill.skill_type == SkillType.COPILOT and not run_table_schema:
+                raise ValueError(
+                    "Copilots produce tabular output per step. "
+                    "Either configure step output_mode='table' on the skill, or "
+                    "send a run-level table_schema to consolidate the result."
+                )
+            schema = run_table_schema or skill.table_schema or {}
+            if not schema_has_columns(schema):
+                raise ValueError(
+                    "Cannot run skill in table mode: no table_schema is configured."
+                )
+            return mode, schema
+        return ExecutionOutputMode.TEXT, {}
 
 
 class SkillExecutionViewSet(

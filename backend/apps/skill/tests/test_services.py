@@ -6,7 +6,13 @@ from django.test import TestCase
 
 from apps.document.models import Document
 from apps.project.models import Project, ProjectDocument
-from apps.skill.models import ExecutionOutputMode, Skill, SkillExecution, SkillType
+from apps.skill.models import (
+    ExecutionOutputMode,
+    Skill,
+    SkillExecution,
+    SkillStep,
+    SkillType,
+)
 from apps.skill.services import execute_skill
 
 
@@ -121,3 +127,127 @@ class SkillRunnerServiceTestCase(TestCase):
         self.assertEqual(execution.output_structured["type"], "table")
         self.assertEqual(execution.output_structured["rows"][0]["anio"], 2025)
         self.assertIs(execution.output_structured["rows"][0]["cumple"], True)
+
+
+class CopilotTabularStepsTestCase(TestCase):
+    def setUp(self):
+        self.user = User.objects.create_user(
+            email="copilot@example.com",
+            password="secret123",
+            username="copilot",
+        )
+        self.project = Project.objects.create(owner=self.user, name="Copilot Project")
+        self.doc = Document.objects.create(owner=self.user, name="Doc", slug="doc-copilot")
+        ProjectDocument.objects.create(project=self.project, document=self.doc, added_by=self.user)
+
+        self.skill = Skill.objects.create(
+            owner=self.user,
+            name="Mixed Copilot",
+            skill_type=SkillType.COPILOT,
+            allowed_contexts=["project"],
+            system_prompt="Be concise.",
+            prompt_template="",
+            comparative_mode_enabled=False,
+            retrieval_strategy="global",
+        )
+        SkillStep.objects.create(
+            skill=self.skill,
+            title="Resumen",
+            instructions="Resume el documento en un parrafo.",
+            position=1,
+        )
+        SkillStep.objects.create(
+            skill=self.skill,
+            title="Matriz",
+            instructions="Genera la matriz de cumplimiento.",
+            position=2,
+            output_mode=ExecutionOutputMode.TABLE,
+            table_schema={
+                "name": "Matriz",
+                "description": "",
+                "columns": [
+                    {
+                        "key": "criterio",
+                        "label": "Criterio",
+                        "type": "text",
+                        "required": True,
+                        "prompt_hint": "",
+                        "allowed_values": [],
+                    },
+                    {
+                        "key": "cumple",
+                        "label": "Cumple",
+                        "type": "boolean",
+                        "required": True,
+                        "prompt_hint": "",
+                        "allowed_values": [],
+                    },
+                ],
+            },
+        )
+
+    @patch("apps.skill.services.generate_chat_completion")
+    @patch("apps.skill.services.fetch_relevant_chunks")
+    def test_copilot_runs_text_then_table_step(self, mock_fetch_chunks, mock_completion):
+        chunk = SimpleNamespace(document=self.doc, chunk_index=0, content="Document chunk")
+        mock_fetch_chunks.return_value = [chunk]
+
+        mock_completion.side_effect = [
+            ("Resumen breve.", {"total_tokens": 5}),
+            (
+                '{"type":"table","rows":[{"criterio":"Inclusion","cumple":"si"},'
+                '{"criterio":"Mitigacion","cumple":"no"}]}',
+                {"total_tokens": 8},
+            ),
+        ]
+
+        execution = SkillExecution.objects.create(
+            skill=self.skill,
+            owner=self.user,
+            project=self.project,
+        )
+
+        execute_skill(execution)
+        execution.refresh_from_db()
+
+        self.assertEqual(execution.status, "completed")
+        steps = execution.output_structured.get("steps", [])
+        self.assertEqual(len(steps), 2)
+
+        text_step, table_step = steps[0], steps[1]
+        self.assertEqual(text_step["output_mode"], "text")
+        self.assertEqual(text_step["content"], "Resumen breve.")
+
+        self.assertEqual(table_step["output_mode"], "table")
+        self.assertIn("table", table_step)
+        self.assertEqual(table_step["table"]["columns"], ["criterio", "cumple"])
+        self.assertEqual(len(table_step["table"]["rows"]), 2)
+        self.assertIs(table_step["table"]["rows"][0]["cumple"], True)
+        self.assertIs(table_step["table"]["rows"][1]["cumple"], False)
+
+    @patch("apps.skill.services.generate_chat_completion")
+    @patch("apps.skill.services.fetch_relevant_chunks")
+    def test_copilot_table_step_invalid_json_falls_back_to_text(
+        self, mock_fetch_chunks, mock_completion
+    ):
+        chunk = SimpleNamespace(document=self.doc, chunk_index=0, content="Document chunk")
+        mock_fetch_chunks.return_value = [chunk]
+        mock_completion.side_effect = [
+            ("Resumen breve.", {"total_tokens": 5}),
+            ("Esto no es JSON valido", {"total_tokens": 4}),
+        ]
+
+        execution = SkillExecution.objects.create(
+            skill=self.skill,
+            owner=self.user,
+            project=self.project,
+        )
+
+        execute_skill(execution)
+        execution.refresh_from_db()
+
+        self.assertEqual(execution.status, "completed")
+        steps = execution.output_structured.get("steps", [])
+        self.assertEqual(steps[1]["output_mode"], "text")
+        self.assertIn("table_error", steps[1])
+        self.assertEqual(steps[1]["content"], "Esto no es JSON valido")

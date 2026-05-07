@@ -119,6 +119,24 @@ class Skill(models.Model):
         help_text="Max chunks kept per document after global reranking.",
     )
 
+    default_output_mode = models.CharField(
+        max_length=20,
+        choices=ExecutionOutputMode.choices,
+        default=ExecutionOutputMode.TEXT,
+        help_text=(
+            "Default output mode for this skill. When set to 'table', the skill produces "
+            "structured tabular output using the configured table_schema."
+        ),
+    )
+    table_schema = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text=(
+            "Persistent schema for tabular output. Expected shape: "
+            '{"name": str, "description": str, "columns": [TableColumn]}.'
+        ),
+    )
+
     # True = Ecofilia-provided, non-editable by regular users
     is_template = models.BooleanField(default=False)
     is_default_enabled = models.BooleanField(
@@ -172,6 +190,23 @@ class SkillStep(models.Model):
         help_text="What the AI should produce for this section of the output."
     )
     position = models.PositiveIntegerField(default=1)
+    output_mode = models.CharField(
+        max_length=20,
+        choices=ExecutionOutputMode.choices,
+        default=ExecutionOutputMode.TEXT,
+        help_text=(
+            "Output mode for this step. When set to 'table', the step must define a "
+            "table_schema so the runner produces structured rows."
+        ),
+    )
+    table_schema = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text=(
+            "Persistent schema for tabular output of this step. Expected shape: "
+            '{"name": str, "description": str, "columns": [TableColumn]}.'
+        ),
+    )
 
     class Meta:
         ordering = ("position",)

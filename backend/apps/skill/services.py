@@ -15,11 +15,11 @@ from apps.skill.models import (
     ExecutionOutputMode,
     ExecutionStatus,
     RetrievalStrategy,
-    Skill,
     SkillExecution,
     SkillStep,
     SkillType,
 )
+from apps.skill.table_schema import schema_has_columns
 
 logger = logging.getLogger(__name__)
 
@@ -69,7 +69,7 @@ def build_document_snapshot(documents: QuerySet[Document]) -> list:
 
 
 # ---------------------------------------------------------------------------
-# Quick skill runner
+# Prompt helpers
 # ---------------------------------------------------------------------------
 
 def _render_quick_prompt(template: str, context_block: str, extra_instructions: str) -> str:
@@ -110,6 +110,138 @@ def _collect_source_stats(chunks, total_docs: int) -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# Table prompt + validation helpers (reused by Quick and Copilot steps)
+# ---------------------------------------------------------------------------
+
+def build_table_system_prompt(base_system_prompt: str, table_schema: dict) -> str:
+    """
+    Build the system prompt that forces the model to emit JSON matching the
+    expected table schema, including per-column hints when provided.
+    """
+    columns = table_schema.get("columns") or []
+    columns_json = json.dumps(columns, ensure_ascii=False)
+    column_instructions = []
+    for column in columns:
+        prompt_hint = (column.get("prompt_hint") or "").strip()
+        if not prompt_hint:
+            continue
+        column_instructions.append(
+            f"- {column.get('key')} ({column.get('type')}): {prompt_hint}"
+        )
+    column_instructions_block = (
+        "\n".join(column_instructions) or "- No extra per-column hints."
+    )
+    return (
+        f"{base_system_prompt}\n\n"
+        "Debes responder EXCLUSIVAMENTE en JSON válido (sin markdown, sin texto adicional) "
+        "con este schema:\n"
+        '{"type":"table","columns":[string],"rows":[object]}\n'
+        "Usa EXACTAMENTE estas columnas y metadatos en este orden: "
+        f"{columns_json}. "
+        "Cada fila debe incluir todas las columnas con su tipo esperado."
+        "\n\nInstrucciones por columna:\n"
+        f"{column_instructions_block}"
+    )
+
+
+def coerce_table_output(*, output_text: str, table_schema: dict) -> dict:
+    """
+    Parse and normalize a model's tabular JSON response against the schema.
+
+    Returns:
+        {
+            "type": "table",
+            "columns": [str],          # ordered keys
+            "column_schema": [dict],   # full column metadata
+            "rows": [dict],            # normalized rows keyed by column key
+        }
+    """
+    schema_columns = table_schema.get("columns") or []
+    normalized_keys = [c.get("key") for c in schema_columns if c.get("key")]
+    if not normalized_keys or not schema_columns:
+        raise ValueError("Missing required columns for table output.")
+
+    try:
+        parsed = json.loads((output_text or "").strip())
+    except json.JSONDecodeError as exc:
+        raise ValueError("Model returned invalid JSON for table output.") from exc
+    if not isinstance(parsed, dict):
+        raise ValueError("Table output must be a JSON object.")
+    rows = parsed.get("rows")
+    if not isinstance(rows, list):
+        raise ValueError("Table output must contain a 'rows' array.")
+
+    type_map = {c["key"]: c.get("type", "text") for c in schema_columns}
+    required_map = {c["key"]: bool(c.get("required", False)) for c in schema_columns}
+    enum_map = {c["key"]: set(c.get("allowed_values") or []) for c in schema_columns}
+
+    normalized_rows: list[dict] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        normalized_row = {}
+        for col in normalized_keys:
+            value = row.get(col, None)
+            value = normalize_table_cell_value(
+                value=value,
+                col_type=type_map.get(col, "text"),
+                required=required_map.get(col, False),
+                allowed_values=enum_map.get(col, set()),
+            )
+            normalized_row[col] = value
+        normalized_rows.append(normalized_row)
+
+    return {
+        "type": "table",
+        "columns": normalized_keys,
+        "column_schema": schema_columns,
+        "rows": normalized_rows,
+    }
+
+
+def normalize_table_cell_value(*, value, col_type: str, required: bool, allowed_values: set):
+    """Best-effort normalization of a model-generated cell value to the column type."""
+    if value in (None, ""):
+        return ""
+    if col_type == "boolean":
+        if isinstance(value, bool):
+            return value
+        text = str(value).strip().lower()
+        if text in {"true", "1", "yes", "si", "sí"}:
+            return True
+        if text in {"false", "0", "no"}:
+            return False
+        return ""
+    if col_type == "number":
+        try:
+            number = float(value)
+            if number.is_integer():
+                return int(number)
+            return number
+        except (TypeError, ValueError):
+            return ""
+    if col_type == "enum":
+        text = str(value).strip()
+        if text in allowed_values:
+            return text
+        lowered = {str(v).lower(): v for v in allowed_values}
+        mapped = lowered.get(text.lower())
+        return mapped if mapped is not None else ""
+    return str(value).strip()
+
+
+def _table_summary_for_history(title: str, table: dict) -> str:
+    """Compact representation of a tabular step output for follow-up steps."""
+    columns = table.get("columns") or []
+    rows = table.get("rows") or []
+    return f"### {title}\n[Tabla generada con {len(rows)} fila(s) y columnas: {', '.join(columns)}]"
+
+
+# ---------------------------------------------------------------------------
+# Quick skill runner
+# ---------------------------------------------------------------------------
+
 def _run_quick(execution: SkillExecution, documents: QuerySet[Document]) -> None:
     skill = execution.skill
     query_text = f"{skill.name}. {skill.description}. {execution.extra_instructions}".strip()
@@ -138,31 +270,15 @@ def _run_quick(execution: SkillExecution, documents: QuerySet[Document]) -> None
         prompt = (
             f"{prompt}\n\n{_comparative_instruction_block(skill.strict_missing_evidence)}"
         ).strip()
-    system_prompt = skill.system_prompt
-    if execution.output_mode == ExecutionOutputMode.TABLE:
-        table_schema = execution.metadata.get("table_schema") or {}
-        columns = table_schema.get("columns") or []
-        columns_json = json.dumps(columns, ensure_ascii=False)
-        column_instructions = []
-        for column in columns:
-            prompt_hint = (column.get("prompt_hint") or "").strip()
-            if not prompt_hint:
-                continue
-            column_instructions.append(
-                f"- {column.get('key')} ({column.get('type')}): {prompt_hint}"
-            )
-        column_instructions_block = "\n".join(column_instructions) or "- No extra per-column hints."
-        system_prompt = (
-            f"{skill.system_prompt}\n\n"
-            "Debes responder EXCLUSIVAMENTE en JSON válido (sin markdown, sin texto adicional) "
-            "con este schema:\n"
-            '{"type":"table","columns":[string],"rows":[object]}\n'
-            "Usa EXACTAMENTE estas columnas y metadatos en este orden: "
-            f"{columns_json}. "
-            "Cada fila debe incluir todas las columnas con su tipo esperado."
-            "\n\nInstrucciones por columna:\n"
-            f"{column_instructions_block}"
-        )
+
+    is_table = execution.output_mode == ExecutionOutputMode.TABLE
+    table_schema = execution.metadata.get("table_schema") or {}
+
+    system_prompt = (
+        build_table_system_prompt(skill.system_prompt, table_schema)
+        if is_table
+        else skill.system_prompt
+    )
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": prompt},
@@ -171,16 +287,14 @@ def _run_quick(execution: SkillExecution, documents: QuerySet[Document]) -> None
         messages, model=skill.model, temperature=skill.temperature
     )
 
-    if execution.output_mode == ExecutionOutputMode.TABLE:
-        parsed = _coerce_table_output(
-            output_text=output_text,
-            table_schema=execution.metadata.get("table_schema") or {},
-        )
+    if is_table:
+        parsed = coerce_table_output(output_text=output_text, table_schema=table_schema)
         execution.output = ""
         execution.output_structured = parsed
     else:
         execution.output = output_text
         execution.output_structured = {}
+
     source_stats = _collect_source_stats(chunks, total_docs=documents.count())
     execution.metadata = {
         "usage": usage,
@@ -206,16 +320,30 @@ def _run_quick(execution: SkillExecution, documents: QuerySet[Document]) -> None
 # Copilot skill runner
 # ---------------------------------------------------------------------------
 
+def _resolve_step_output_config(step: SkillStep) -> tuple[str, dict]:
+    """
+    Resolve the effective output mode and table schema for a single step.
+
+    Steps default to TEXT. If the step is configured with TABLE but no
+    table_schema, the step is downgraded to text instead of failing — this
+    keeps the runner forgiving for legacy data while warnings are surfaced
+    in metadata.
+    """
+    output_mode = step.output_mode or ExecutionOutputMode.TEXT
+    table_schema = step.table_schema or {}
+    if output_mode == ExecutionOutputMode.TABLE and not schema_has_columns(table_schema):
+        return ExecutionOutputMode.TEXT, {}
+    return output_mode, table_schema
+
+
 def _run_copilot(execution: SkillExecution, documents: QuerySet[Document]) -> None:
     skill = execution.skill
     steps: List[SkillStep] = list(skill.steps.all())
     if not steps:
         raise ValueError("This Copilot skill has no steps defined.")
 
-    step_results = []
+    step_results: list[dict] = []
     total_usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
-
-    # Build a running summary of previous steps to feed as context
     previous_outputs: List[str] = []
     all_step_chunks = []
     effective_retrieval_strategy = (
@@ -225,8 +353,10 @@ def _run_copilot(execution: SkillExecution, documents: QuerySet[Document]) -> No
     )
 
     for step in steps:
-        query_text = f"{step.title}. {step.instructions}".strip()
+        step_output_mode, step_table_schema = _resolve_step_output_config(step)
+        is_table_step = step_output_mode == ExecutionOutputMode.TABLE
 
+        query_text = f"{step.title}. {step.instructions}".strip()
         chunks = fetch_relevant_chunks(
             user=execution.owner,
             query_text=query_text,
@@ -240,7 +370,7 @@ def _run_copilot(execution: SkillExecution, documents: QuerySet[Document]) -> No
         all_step_chunks.extend(chunks)
         context_block = build_context_block(chunks)
 
-        # Compose the full prompt for this step
+        # Compose the user prompt for this step
         lines = [
             f"## Task: {step.title}",
             "",
@@ -256,20 +386,55 @@ def _run_copilot(execution: SkillExecution, documents: QuerySet[Document]) -> No
             lines.append(f"\n## Document context:\n{context_block}")
         else:
             lines.append("\n(No document content found for this section — note this in your output.)")
-        if skill.comparative_mode_enabled:
-            lines.append(f"\n## Comparative constraints:\n{_comparative_instruction_block(skill.strict_missing_evidence)}")
+        if skill.comparative_mode_enabled and not is_table_step:
+            lines.append(
+                f"\n## Comparative constraints:\n{_comparative_instruction_block(skill.strict_missing_evidence)}"
+            )
 
         prompt = "\n".join(lines)
+        system_prompt = (
+            build_table_system_prompt(skill.system_prompt, step_table_schema)
+            if is_table_step
+            else skill.system_prompt
+        )
         messages = [
-            {"role": "system", "content": skill.system_prompt},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": prompt},
         ]
         content, usage = generate_chat_completion(
             messages, model=skill.model, temperature=skill.temperature
         )
 
-        step_results.append({"step_id": step.id, "title": step.title, "content": content})
-        previous_outputs.append(f"### {step.title}\n{content}")
+        step_entry: dict = {
+            "step_id": step.id,
+            "title": step.title,
+            "output_mode": step_output_mode,
+        }
+        if is_table_step:
+            try:
+                table = coerce_table_output(
+                    output_text=content, table_schema=step_table_schema
+                )
+            except ValueError as exc:
+                logger.warning(
+                    "Step %s of execution %s produced invalid table JSON: %s",
+                    step.id,
+                    execution.id,
+                    exc,
+                )
+                step_entry["output_mode"] = ExecutionOutputMode.TEXT
+                step_entry["content"] = content
+                step_entry["table_error"] = str(exc)
+                previous_outputs.append(f"### {step.title}\n{content}")
+            else:
+                step_entry["table"] = table
+                step_entry["content"] = ""
+                previous_outputs.append(_table_summary_for_history(step.title, table))
+        else:
+            step_entry["content"] = content
+            previous_outputs.append(f"### {step.title}\n{content}")
+
+        step_results.append(step_entry)
 
         for key in total_usage:
             total_usage[key] += usage.get(key, 0)
@@ -287,79 +452,12 @@ def _run_copilot(execution: SkillExecution, documents: QuerySet[Document]) -> No
     }
 
 
-def _coerce_table_output(*, output_text: str, table_schema: dict) -> dict:
-    schema_columns = table_schema.get("columns") or []
-    normalized_columns = [c.get("key") for c in schema_columns if c.get("key")]
-    if not normalized_columns or not schema_columns:
-        raise ValueError("Missing required columns for table output.")
-    try:
-        parsed = json.loads((output_text or "").strip())
-    except json.JSONDecodeError as exc:
-        raise ValueError("Model returned invalid JSON for table output.") from exc
-    if not isinstance(parsed, dict):
-        raise ValueError("Table output must be a JSON object.")
-    rows = parsed.get("rows")
-    if not isinstance(rows, list):
-        raise ValueError("Table output must contain a 'rows' array.")
+# ---------------------------------------------------------------------------
+# Backwards-compatible private aliases (kept for existing tests/imports)
+# ---------------------------------------------------------------------------
 
-    type_map = {c["key"]: c.get("type", "text") for c in schema_columns}
-    required_map = {c["key"]: bool(c.get("required", False)) for c in schema_columns}
-    enum_map = {c["key"]: set(c.get("allowed_values") or []) for c in schema_columns}
-
-    normalized_rows = []
-    for row in rows:
-        if not isinstance(row, dict):
-            continue
-        normalized_row = {}
-        for col in normalized_columns:
-            value = row.get(col, None)
-            value = _normalize_table_cell_value(
-                value=value,
-                col=col,
-                col_type=type_map.get(col, "text"),
-                required=required_map.get(col, False),
-                allowed_values=enum_map.get(col, set()),
-            )
-            normalized_row[col] = value
-        normalized_rows.append(normalized_row)
-    return {
-        "type": "table",
-        "columns": normalized_columns,
-        "column_schema": schema_columns,
-        "rows": normalized_rows,
-    }
-
-
-def _normalize_table_cell_value(*, value, col: str, col_type: str, required: bool, allowed_values: set):
-    if value in (None, ""):
-        if required:
-            return ""
-        return ""
-    if col_type == "boolean":
-        if isinstance(value, bool):
-            return value
-        text = str(value).strip().lower()
-        if text in {"true", "1", "yes", "si", "sí"}:
-            return True
-        if text in {"false", "0", "no"}:
-            return False
-        return ""
-    if col_type == "number":
-        try:
-            number = float(value)
-            if number.is_integer():
-                return int(number)
-            return number
-        except (TypeError, ValueError):
-            return ""
-    if col_type == "enum":
-        text = str(value).strip()
-        if text in allowed_values:
-            return text
-        lowered = {str(v).lower(): v for v in allowed_values}
-        mapped = lowered.get(text.lower())
-        return mapped if mapped is not None else ""
-    return str(value).strip()
+_coerce_table_output = coerce_table_output
+_normalize_table_cell_value = normalize_table_cell_value
 
 
 # ---------------------------------------------------------------------------

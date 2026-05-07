@@ -137,6 +137,37 @@ class Skill(models.Model):
         ),
     )
 
+    # ---------------------------------------------------------------------------
+    # Agentic capabilities (Sprint 1 + 2)
+    # ---------------------------------------------------------------------------
+
+    tools_enabled = models.BooleanField(
+        default=False,
+        help_text=(
+            "When enabled, the runner uses function-calling so the model can "
+            "invoke tools (search_more_context, calculate_ghg_emissions, etc.) "
+            "before producing its final answer."
+        ),
+    )
+
+    # Research phase: runs broad retrieval before authoring steps (Copilot only).
+    research_phase_enabled = models.BooleanField(
+        default=False,
+        help_text=(
+            "Copilot only. When enabled, the runner executes a research phase that "
+            "builds a shared scratchpad from the full document corpus before running "
+            "authoring steps. Each step receives the scratchpad as additional context."
+        ),
+    )
+    research_queries = models.JSONField(
+        default=list,
+        blank=True,
+        help_text=(
+            "Optional list of explicit queries for the research phase. "
+            "If empty, queries are auto-derived from step titles and instructions."
+        ),
+    )
+
     # True = Ecofilia-provided, non-editable by regular users
     is_template = models.BooleanField(default=False)
     is_default_enabled = models.BooleanField(
@@ -177,6 +208,61 @@ class Skill(models.Model):
         if self.is_template:
             return False
         return self.owner_id == user.id
+
+
+# ---------------------------------------------------------------------------
+# Typed input parameters  (Sprint 2 — replaces the free-text extra_instructions blob)
+# ---------------------------------------------------------------------------
+
+class SkillParameterType(models.TextChoices):
+    TEXT = "text", _("Text")
+    NUMBER = "number", _("Number")
+    ENUM = "enum", _("Enum (select)")
+    BOOLEAN = "boolean", _("Boolean")
+    DATE = "date", _("Date")
+
+
+class SkillParameter(models.Model):
+    """
+    A typed input parameter declared on a Skill.
+
+    Templates reference parameters with {{key}} — e.g. {{framework}}, {{target_year}}.
+    When the skill is run, the caller supplies values in SkillExecution.input_values.
+    """
+    skill = models.ForeignKey(Skill, related_name="parameters", on_delete=models.CASCADE)
+    key = models.SlugField(
+        max_length=80,
+        help_text="Template variable name, e.g. 'framework' → {{framework}}.",
+    )
+    label = models.CharField(max_length=255, help_text="Human-readable label shown in the UI.")
+    param_type = models.CharField(
+        max_length=20,
+        choices=SkillParameterType.choices,
+        default=SkillParameterType.TEXT,
+    )
+    description = models.TextField(
+        blank=True,
+        help_text="Help text shown beneath the input field.",
+    )
+    default_value = models.CharField(
+        max_length=500,
+        blank=True,
+        help_text="String representation of the default value.",
+    )
+    required = models.BooleanField(default=False)
+    options = models.JSONField(
+        default=list,
+        blank=True,
+        help_text="Allowed values for enum type. e.g. ['GRI', 'ISSB', 'CDP'].",
+    )
+    position = models.PositiveIntegerField(default=1)
+
+    class Meta:
+        ordering = ("position",)
+        unique_together = ("skill", "key")
+
+    def __str__(self) -> str:
+        return f"{self.skill.name} — {{{{ {self.key} }}}} ({self.param_type})"
 
 
 # ---------------------------------------------------------------------------
@@ -253,6 +339,16 @@ class SkillExecution(models.Model):
 
     # Optional user-provided instructions that override / extend the skill
     extra_instructions = models.TextField(blank=True)
+
+    # Typed parameter values supplied at run time, keyed by SkillParameter.key.
+    input_values = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text=(
+            "Values for the skill's declared SkillParameter inputs, keyed by parameter key. "
+            "Rendered into the prompt via {{key}} template tokens."
+        ),
+    )
     output_mode = models.CharField(
         max_length=20,
         choices=ExecutionOutputMode.choices,

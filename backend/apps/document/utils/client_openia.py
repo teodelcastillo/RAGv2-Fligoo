@@ -164,6 +164,104 @@ def generate_chat_completion(
     return completion_text, usage
 
 
+def generate_with_tools(
+    messages: List[dict],
+    *,
+    tools: List[dict],
+    tool_executor,  # Callable[[str, str], str]
+    model: str | None = None,
+    temperature: float = 0.1,
+    max_iterations: int = 6,
+) -> Tuple[str, dict]:
+    """
+    Agentic chat completion with tool-call loop.
+
+    Calls the model, executes any requested tools, appends results to the
+    conversation, and calls again — repeating until the model stops or
+    ``max_iterations`` is reached.
+
+    Args:
+        messages: Initial conversation (system + user).
+        tools: OpenAI-format tool definitions ([{"type":"function","function":{...}}]).
+        tool_executor: Callable(tool_name, args_json_str) → result_str.
+        model: Completion model (defaults to MODEL_COMPLETION).
+        temperature: Sampling temperature.
+        max_iterations: Hard cap on tool-call rounds to avoid infinite loops.
+
+    Returns:
+        Tuple[str, dict]: (final_text, aggregated_usage)
+    """
+    client = get_openai_client()
+    effective_model = model or MODEL_COMPLETION
+    conversation = [{"role": m["role"], "content": m["content"]} for m in messages]
+    total_usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+
+    for _ in range(max_iterations):
+        response = client.chat.completions.create(
+            model=effective_model,
+            temperature=temperature,
+            messages=conversation,
+            tools=tools,
+            tool_choice="auto",
+        )
+
+        usage_obj = getattr(response, "usage", None)
+        if usage_obj:
+            total_usage["input_tokens"] += usage_obj.prompt_tokens or 0
+            total_usage["output_tokens"] += usage_obj.completion_tokens or 0
+            total_usage["total_tokens"] += usage_obj.total_tokens or 0
+
+        if not response.choices:
+            raise ValueError("OpenAI API returned an empty response during tool loop.")
+
+        choice = response.choices[0]
+        finish_reason = choice.finish_reason
+        assistant_message = choice.message
+
+        # No tool calls — model is done.
+        if finish_reason != "tool_calls" or not assistant_message.tool_calls:
+            content = (assistant_message.content or "").strip()
+            if not content:
+                raise ValueError("OpenAI API returned an empty response.")
+            return content, total_usage
+
+        # Append the assistant's tool-call turn to the conversation.
+        conversation.append({
+            "role": "assistant",
+            "content": assistant_message.content,
+            "tool_calls": [tc.model_dump() for tc in assistant_message.tool_calls],
+        })
+
+        # Execute each tool and append the results.
+        for tool_call in assistant_message.tool_calls:
+            result = tool_executor(
+                tool_call.function.name,
+                tool_call.function.arguments,
+            )
+            conversation.append({
+                "role": "tool",
+                "tool_call_id": tool_call.id,
+                "content": result,
+            })
+
+    # Max iterations reached — do a final call without tools to force a response.
+    response = client.chat.completions.create(
+        model=effective_model,
+        temperature=temperature,
+        messages=conversation,
+    )
+    usage_obj = getattr(response, "usage", None)
+    if usage_obj:
+        total_usage["input_tokens"] += usage_obj.prompt_tokens or 0
+        total_usage["output_tokens"] += usage_obj.completion_tokens or 0
+        total_usage["total_tokens"] += usage_obj.total_tokens or 0
+
+    if not response.choices:
+        raise ValueError("OpenAI API returned an empty response after max tool iterations.")
+    content = (response.choices[0].message.content or "").strip()
+    return content, total_usage
+
+
 def generate_chat_completion_stream(
     messages: List[dict],
     *,

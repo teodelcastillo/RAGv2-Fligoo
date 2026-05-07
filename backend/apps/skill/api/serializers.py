@@ -10,6 +10,8 @@ from apps.skill.models import (
     Skill,
     SkillContext,
     SkillExecution,
+    SkillParameter,
+    SkillParameterType,
     SkillStep,
     SkillType,
 )
@@ -64,6 +66,48 @@ def _normalize_table_schema_or_raise(raw, *, field: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Skill parameters (Sprint 2B)
+# ---------------------------------------------------------------------------
+
+class SkillParameterSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = SkillParameter
+        fields = (
+            "id",
+            "key",
+            "label",
+            "param_type",
+            "description",
+            "default_value",
+            "required",
+            "options",
+            "position",
+        )
+
+
+class SkillParameterWriteSerializer(serializers.Serializer):
+    key = serializers.SlugField(max_length=80)
+    label = serializers.CharField(max_length=255)
+    param_type = serializers.ChoiceField(choices=SkillParameterType.choices, default=SkillParameterType.TEXT)
+    description = serializers.CharField(required=False, allow_blank=True, default="")
+    default_value = serializers.CharField(required=False, allow_blank=True, default="", max_length=500)
+    required = serializers.BooleanField(required=False, default=False)
+    options = serializers.ListField(
+        child=serializers.CharField(),
+        required=False,
+        default=list,
+    )
+    position = serializers.IntegerField(min_value=1, default=1)
+
+    def validate(self, attrs):
+        if attrs.get("param_type") == SkillParameterType.ENUM and not attrs.get("options"):
+            raise serializers.ValidationError(
+                {"options": "Enum parameters require at least one option."}
+            )
+        return attrs
+
+
+# ---------------------------------------------------------------------------
 # Skill
 # ---------------------------------------------------------------------------
 
@@ -83,6 +127,7 @@ class SkillStepSerializer(serializers.ModelSerializer):
 class SkillSerializer(serializers.ModelSerializer):
     owner_email = serializers.EmailField(source="owner.email", read_only=True, allow_null=True)
     steps = SkillStepSerializer(many=True, read_only=True)
+    parameters = SkillParameterSerializer(many=True, read_only=True)
 
     class Meta:
         model = Skill
@@ -93,6 +138,10 @@ class SkillSerializer(serializers.ModelSerializer):
             "comparative_mode_enabled", "strict_missing_evidence",
             "retrieval_strategy", "k_per_doc", "total_limit", "max_per_doc_after_rerank",
             "default_output_mode", "table_schema",
+            # Sprint 1 + 2
+            "tools_enabled",
+            "research_phase_enabled", "research_queries",
+            "parameters",
             "is_template", "is_default_enabled",
             "owner", "owner_email", "steps",
             "created_at", "updated_at",
@@ -133,6 +182,7 @@ class SkillStepWriteSerializer(serializers.Serializer):
 
 class SkillWriteSerializer(serializers.ModelSerializer):
     steps = SkillStepWriteSerializer(many=True, required=False)
+    parameters = SkillParameterWriteSerializer(many=True, required=False)
     table_schema = serializers.DictField(required=False)
     default_output_mode = serializers.ChoiceField(
         choices=ExecutionOutputMode.choices,
@@ -149,7 +199,11 @@ class SkillWriteSerializer(serializers.ModelSerializer):
             "comparative_mode_enabled", "strict_missing_evidence",
             "retrieval_strategy", "k_per_doc", "total_limit", "max_per_doc_after_rerank",
             "default_output_mode", "table_schema",
+            # Sprint 1 + 2
+            "tools_enabled",
+            "research_phase_enabled", "research_queries",
             "steps",
+            "parameters",
         )
 
     def validate_allowed_contexts(self, value):
@@ -284,13 +338,17 @@ class SkillWriteSerializer(serializers.ModelSerializer):
 
     def create(self, validated_data):
         steps_data = validated_data.pop("steps", [])
+        parameters_data = validated_data.pop("parameters", [])
         skill = Skill.objects.create(**validated_data)
         for step in steps_data:
             SkillStep.objects.create(skill=skill, **step)
+        for param in parameters_data:
+            SkillParameter.objects.create(skill=skill, **param)
         return skill
 
     def update(self, instance, validated_data):
         steps_data = validated_data.pop("steps", None)
+        parameters_data = validated_data.pop("parameters", None)
         for attr, value in validated_data.items():
             setattr(instance, attr, value)
         instance.save()
@@ -298,6 +356,10 @@ class SkillWriteSerializer(serializers.ModelSerializer):
             instance.steps.all().delete()
             for step in steps_data:
                 SkillStep.objects.create(skill=instance, **step)
+        if parameters_data is not None:
+            instance.parameters.all().delete()
+            for param in parameters_data:
+                SkillParameter.objects.create(skill=instance, **param)
         return instance
 
 
@@ -320,7 +382,7 @@ class SkillExecutionSerializer(serializers.ModelSerializer):
             "id", "skill", "skill_name", "skill_type",
             "status", "context_label",
             "repository_slug", "project_slug", "document_slug",
-            "extra_instructions", "output_mode",
+            "extra_instructions", "input_values", "output_mode",
             "output", "output_structured",
             "document_snapshot", "metadata", "error_message",
             "started_at", "finished_at", "created_at",
@@ -336,6 +398,14 @@ class RunSkillSerializer(serializers.Serializer):
     )
     context_slug = serializers.SlugField(required=True)
     extra_instructions = serializers.CharField(required=False, allow_blank=True, default="")
+    input_values = serializers.DictField(
+        required=False,
+        default=dict,
+        help_text=(
+            "Values for the skill's declared typed parameters, keyed by parameter key. "
+            "Example: {\"framework\": \"GRI\", \"target_year\": \"2024\"}."
+        ),
+    )
     output_mode = serializers.ChoiceField(
         choices=ExecutionOutputMode.choices,
         required=False,

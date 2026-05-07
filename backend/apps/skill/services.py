@@ -10,7 +10,7 @@ from django.utils import timezone
 
 from apps.chat.services.rag import build_context_block, fetch_relevant_chunks
 from apps.document.models import Document
-from apps.document.utils.client_openia import generate_chat_completion
+from apps.document.utils.client_openia import generate_chat_completion, generate_with_tools
 from apps.skill.models import (
     ExecutionOutputMode,
     ExecutionStatus,
@@ -24,6 +24,11 @@ from apps.skill.table_schema import schema_has_columns
 logger = logging.getLogger(__name__)
 
 DEFAULT_CHUNKS = int(os.environ.get("SKILL_CONTEXT_CHUNKS", "6"))
+
+# Maximum chunks assembled from the research phase scratchpad.
+RESEARCH_SCRATCHPAD_MAX_CHUNKS = int(os.environ.get("SKILL_RESEARCH_SCRATCHPAD_CHUNKS", "20"))
+# Maximum distinct research queries derived automatically from step instructions.
+RESEARCH_AUTO_QUERIES_MAX = int(os.environ.get("SKILL_RESEARCH_AUTO_QUERIES", "8"))
 
 
 # ---------------------------------------------------------------------------
@@ -72,10 +77,37 @@ def build_document_snapshot(documents: QuerySet[Document]) -> list:
 # Prompt helpers
 # ---------------------------------------------------------------------------
 
+def _render_prompt_variables(
+    template: str,
+    *,
+    context_block: str,
+    extra_instructions: str,
+    input_values: dict,
+) -> str:
+    """
+    Replace all template tokens in ``template``.
+
+    Token resolution order:
+    1. {{context}}            — RAG context block.
+    2. {{extra_instructions}} — free-text user override.
+    3. {{key}}                — typed SkillParameter values from input_values.
+    """
+    result = template
+    result = result.replace("{{context}}", context_block or "(No document content found)")
+    result = result.replace("{{extra_instructions}}", extra_instructions or "")
+    for key, value in (input_values or {}).items():
+        result = result.replace(f"{{{{{key}}}}}", str(value) if value is not None else "")
+    return result.strip()
+
+
+# Backward-compatible wrapper used by existing tests.
 def _render_quick_prompt(template: str, context_block: str, extra_instructions: str) -> str:
-    prompt = template.replace("{{context}}", context_block or "(No document content found)")
-    prompt = prompt.replace("{{extra_instructions}}", extra_instructions or "")
-    return prompt.strip()
+    return _render_prompt_variables(
+        template,
+        context_block=context_block,
+        extra_instructions=extra_instructions,
+        input_values={},
+    )
 
 
 def _comparative_instruction_block(strict_missing_evidence: bool) -> str:
@@ -239,10 +271,106 @@ def _table_summary_for_history(title: str, table: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Tool-aware completion helper
+# ---------------------------------------------------------------------------
+
+def _call_model(
+    messages: list[dict],
+    *,
+    skill,
+    tool_ctx=None,
+) -> tuple[str, dict]:
+    """
+    Dispatch to generate_with_tools or generate_chat_completion depending on
+    whether the skill has tools_enabled and a valid tool context is provided.
+    """
+    if skill.tools_enabled and tool_ctx is not None:
+        from apps.skill.tools import ALL_TOOLS, execute_tool
+
+        def _executor(name: str, args_json: str) -> str:
+            return execute_tool(name, args_json, tool_ctx)
+
+        return generate_with_tools(
+            messages,
+            tools=ALL_TOOLS,
+            tool_executor=_executor,
+            model=skill.model,
+            temperature=skill.temperature,
+        )
+    return generate_chat_completion(
+        messages, model=skill.model, temperature=skill.temperature
+    )
+
+
+# ---------------------------------------------------------------------------
+# Research phase  (Sprint 2A)
+# ---------------------------------------------------------------------------
+
+def _run_research_phase(
+    *,
+    execution: SkillExecution,
+    skill,
+    documents: QuerySet[Document],
+    steps: List[SkillStep],
+) -> tuple[str, list]:
+    """
+    Execute a broad retrieval pass before the authoring steps.
+
+    Returns:
+        (scratchpad_block, chunks_used)
+        - scratchpad_block: formatted context string injected into each step.
+        - chunks_used: list of SmartChunk objects for source tracking.
+    """
+    research_queries: list[str] = list(skill.research_queries or [])
+
+    if not research_queries:
+        # Auto-derive from step instructions, deduplicating by truncated content.
+        seen: set[str] = set()
+        for step in steps:
+            q = f"{step.title}. {step.instructions}"[:200].strip()
+            if q and q not in seen:
+                seen.add(q)
+                research_queries.append(q)
+            if len(research_queries) >= RESEARCH_AUTO_QUERIES_MAX:
+                break
+
+    all_chunks: list = []
+    seen_ids: set[int] = set()
+
+    for query in research_queries[:RESEARCH_AUTO_QUERIES_MAX]:
+        try:
+            chunks = fetch_relevant_chunks(
+                user=execution.owner,
+                query_text=query,
+                allowed_documents=documents,
+                top_n=4,
+                retrieval_strategy="hybrid_per_document",
+                k_per_doc=2,
+                total_limit=8,
+            )
+        except Exception as exc:
+            logger.warning("Research phase query %r failed: %s", query, exc)
+            continue
+
+        for c in chunks:
+            if c.id not in seen_ids:
+                seen_ids.add(c.id)
+                all_chunks.append(c)
+
+    capped = all_chunks[:RESEARCH_SCRATCHPAD_MAX_CHUNKS]
+    if not capped:
+        return "", []
+
+    return build_context_block(capped), capped
+
+
+# ---------------------------------------------------------------------------
 # Quick skill runner
 # ---------------------------------------------------------------------------
 
 def _run_quick(execution: SkillExecution, documents: QuerySet[Document]) -> None:
+    from apps.skill.tools import SkillToolContext
+
     skill = execution.skill
     query_text = f"{skill.name}. {skill.description}. {execution.extra_instructions}".strip()
     effective_retrieval_strategy = (
@@ -263,8 +391,11 @@ def _run_quick(execution: SkillExecution, documents: QuerySet[Document]) -> None
     )
     context_block = build_context_block(chunks)
 
-    prompt = _render_quick_prompt(
-        skill.prompt_template, context_block, execution.extra_instructions
+    prompt = _render_prompt_variables(
+        skill.prompt_template,
+        context_block=context_block,
+        extra_instructions=execution.extra_instructions,
+        input_values=execution.input_values,
     )
     if skill.comparative_mode_enabled:
         prompt = (
@@ -283,9 +414,10 @@ def _run_quick(execution: SkillExecution, documents: QuerySet[Document]) -> None
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": prompt},
     ]
-    output_text, usage = generate_chat_completion(
-        messages, model=skill.model, temperature=skill.temperature
-    )
+
+    tool_ctx = SkillToolContext(user=execution.owner, allowed_documents=documents)
+    output_text, usage = _call_model(messages, skill=skill, tool_ctx=tool_ctx)
+    all_chunks = chunks + tool_ctx.additional_chunks
 
     if is_table:
         parsed = coerce_table_output(output_text=output_text, table_schema=table_schema)
@@ -295,10 +427,11 @@ def _run_quick(execution: SkillExecution, documents: QuerySet[Document]) -> None
         execution.output = output_text
         execution.output_structured = {}
 
-    source_stats = _collect_source_stats(chunks, total_docs=documents.count())
+    source_stats = _collect_source_stats(all_chunks, total_docs=documents.count())
     execution.metadata = {
         "usage": usage,
-        "chunks_used": len(chunks),
+        "chunks_used": len(all_chunks),
+        "tool_calls_made": len(tool_ctx.additional_chunks) > 0,
         "comparative_mode_enabled": skill.comparative_mode_enabled,
         "strict_missing_evidence": skill.strict_missing_evidence,
         "retrieval_strategy_used": effective_retrieval_strategy,
@@ -309,7 +442,7 @@ def _run_quick(execution: SkillExecution, documents: QuerySet[Document]) -> None
                 "document_name": c.document.name,
                 "chunk_index": c.chunk_index,
             }
-            for c in chunks
+            for c in all_chunks
         ],
         "table_columns": execution.metadata.get("table_columns", []),
         "table_schema": execution.metadata.get("table_schema", {}),
@@ -337,6 +470,8 @@ def _resolve_step_output_config(step: SkillStep) -> tuple[str, dict]:
 
 
 def _run_copilot(execution: SkillExecution, documents: QuerySet[Document]) -> None:
+    from apps.skill.tools import SkillToolContext
+
     skill = execution.skill
     steps: List[SkillStep] = list(skill.steps.all())
     if not steps:
@@ -345,12 +480,30 @@ def _run_copilot(execution: SkillExecution, documents: QuerySet[Document]) -> No
     step_results: list[dict] = []
     total_usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
     previous_outputs: List[str] = []
-    all_step_chunks = []
+    all_step_chunks: list = []
     effective_retrieval_strategy = (
         RetrievalStrategy.HYBRID_PER_DOCUMENT
         if skill.comparative_mode_enabled
         else skill.retrieval_strategy
     )
+
+    # ------------------------------------------------------------------ #
+    # Research phase (Sprint 2A)                                          #
+    # ------------------------------------------------------------------ #
+    shared_scratchpad = ""
+    if skill.research_phase_enabled:
+        shared_scratchpad, research_chunks = _run_research_phase(
+            execution=execution,
+            skill=skill,
+            documents=documents,
+            steps=steps,
+        )
+        all_step_chunks.extend(research_chunks)
+        logger.debug(
+            "Research phase for execution %s: %d chunks collected.",
+            execution.id,
+            len(research_chunks),
+        )
 
     for step in steps:
         step_output_mode, step_table_schema = _resolve_step_output_config(step)
@@ -376,14 +529,27 @@ def _run_copilot(execution: SkillExecution, documents: QuerySet[Document]) -> No
             "",
             f"Instructions: {step.instructions}",
         ]
+        # Inject typed parameter values as a context note
+        if execution.input_values:
+            param_lines = [
+                f"- {k}: {v}"
+                for k, v in execution.input_values.items()
+                if v not in (None, "")
+            ]
+            if param_lines:
+                lines.append("\n## Run parameters:\n" + "\n".join(param_lines))
+
         if execution.extra_instructions:
             lines.append(f"\nAdditional instructions from user: {execution.extra_instructions}")
         if previous_outputs:
             lines.append("\n## Previous sections already written:")
             for prev in previous_outputs:
                 lines.append(prev)
+        # Shared research scratchpad (Sprint 2A)
+        if shared_scratchpad:
+            lines.append(f"\n## Research scratchpad (broad corpus overview):\n{shared_scratchpad}")
         if context_block:
-            lines.append(f"\n## Document context:\n{context_block}")
+            lines.append(f"\n## Document context (targeted for this section):\n{context_block}")
         else:
             lines.append("\n(No document content found for this section — note this in your output.)")
         if skill.comparative_mode_enabled and not is_table_step:
@@ -401,9 +567,10 @@ def _run_copilot(execution: SkillExecution, documents: QuerySet[Document]) -> No
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": prompt},
         ]
-        content, usage = generate_chat_completion(
-            messages, model=skill.model, temperature=skill.temperature
-        )
+
+        tool_ctx = SkillToolContext(user=execution.owner, allowed_documents=documents)
+        content, usage = _call_model(messages, skill=skill, tool_ctx=tool_ctx)
+        all_step_chunks.extend(tool_ctx.additional_chunks)
 
         step_entry: dict = {
             "step_id": step.id,
@@ -443,6 +610,7 @@ def _run_copilot(execution: SkillExecution, documents: QuerySet[Document]) -> No
     source_stats = _collect_source_stats(all_step_chunks, total_docs=documents.count())
     execution.metadata = {
         "usage": total_usage,
+        "research_phase_enabled": skill.research_phase_enabled,
         "comparative_mode_enabled": skill.comparative_mode_enabled,
         "strict_missing_evidence": skill.strict_missing_evidence,
         "retrieval_strategy_used": effective_retrieval_strategy,

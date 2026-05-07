@@ -133,6 +133,7 @@ class SkillViewSet(viewsets.ModelViewSet):
             project=data.get("project"),
             document=data.get("document"),
             extra_instructions=data.get("extra_instructions", ""),
+            input_values=data.get("input_values") or {},
             output_mode=effective_output_mode,
             metadata={
                 "table_columns": [

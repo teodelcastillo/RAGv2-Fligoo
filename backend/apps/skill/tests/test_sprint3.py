@@ -26,8 +26,12 @@ from apps.skill.services import execute_skill
 User = get_user_model()
 
 
+_chunk_id_counter = 0
+
 def _make_chunk(doc, index=0):
-    return SimpleNamespace(document=doc, chunk_index=index, content="chunk")
+    global _chunk_id_counter
+    _chunk_id_counter += 1
+    return SimpleNamespace(id=_chunk_id_counter, document=doc, chunk_index=index, content="chunk")
 
 
 class IncrementalStepOutputTestCase(TestCase):

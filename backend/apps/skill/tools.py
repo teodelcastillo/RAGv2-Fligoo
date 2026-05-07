@@ -7,6 +7,8 @@ from typing import Any, Callable
 
 from django.db.models import QuerySet
 
+from apps.chat.services.rag import build_context_block, fetch_relevant_chunks
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -126,8 +128,6 @@ class SkillToolContext:
 # ---------------------------------------------------------------------------
 
 def _execute_search_more_context(args: dict, ctx: SkillToolContext) -> str:
-    from apps.chat.services.rag import build_context_block, fetch_relevant_chunks
-
     query = (args.get("query") or "").strip()
     if not query:
         return "Error: 'query' parameter is required."

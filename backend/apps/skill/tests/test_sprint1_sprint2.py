@@ -37,8 +37,12 @@ User = get_user_model()
 # Helpers
 # ---------------------------------------------------------------------------
 
+_chunk_id_counter = 0
+
 def _make_chunk(doc, index=0):
-    return SimpleNamespace(document=doc, chunk_index=index, content="chunk content")
+    global _chunk_id_counter
+    _chunk_id_counter += 1
+    return SimpleNamespace(id=_chunk_id_counter, document=doc, chunk_index=index, content="chunk content")
 
 
 # ---------------------------------------------------------------------------
@@ -227,7 +231,9 @@ class SearchMoreContextToolTestCase(TestCase):
     @patch("apps.skill.tools.fetch_relevant_chunks")
     @patch("apps.skill.tools.build_context_block")
     def test_returns_context_block_on_success(self, mock_build, mock_fetch):
-        mock_fetch.return_value = [MagicMock()]
+        chunk = MagicMock()
+        chunk.id = 999
+        mock_fetch.return_value = [chunk]
         mock_build.return_value = "FOUND CONTENT"
         ctx = self._ctx()
         result = _execute_search_more_context({"query": "scope 1 emissions"}, ctx)
@@ -489,8 +495,12 @@ class CopilotResearchPhaseTestCase(TestCase):
     @patch("apps.skill.services.generate_chat_completion")
     @patch("apps.skill.services.fetch_relevant_chunks")
     def test_research_phase_fetches_before_steps(self, mock_fetch, mock_completion):
-        chunk = _make_chunk(self.doc)
-        mock_fetch.return_value = [chunk]
+        # Each call must return distinct chunk ids to avoid dedup dropping them
+        call_counter = [0]
+        def make_fresh_chunk(*args, **kwargs):
+            call_counter[0] += 1
+            return [SimpleNamespace(id=call_counter[0] * 100, document=self.doc, chunk_index=0, content="c")]
+        mock_fetch.side_effect = make_fresh_chunk
         mock_completion.return_value = ("Step output", {"total_tokens": 5})
 
         execution = SkillExecution.objects.create(
@@ -500,14 +510,17 @@ class CopilotResearchPhaseTestCase(TestCase):
         execution.refresh_from_db()
 
         self.assertEqual(execution.status, "completed")
-        # Research phase + 2 steps = at least 3 fetch calls
+        # Research phase (≥1 query) + 2 steps = at least 3 fetch calls
         self.assertGreaterEqual(mock_fetch.call_count, 3)
 
     @patch("apps.skill.services.generate_chat_completion")
     @patch("apps.skill.services.fetch_relevant_chunks")
     def test_research_phase_scratchpad_appears_in_step_prompt(self, mock_fetch, mock_completion):
-        chunk = _make_chunk(self.doc)
-        mock_fetch.return_value = [chunk]
+        call_counter = [0]
+        def make_fresh_chunk(*args, **kwargs):
+            call_counter[0] += 1
+            return [SimpleNamespace(id=call_counter[0] * 100, document=self.doc, chunk_index=0, content="c")]
+        mock_fetch.side_effect = make_fresh_chunk
         mock_completion.return_value = ("Step output", {"total_tokens": 5})
 
         execution = SkillExecution.objects.create(
@@ -525,7 +538,11 @@ class CopilotResearchPhaseTestCase(TestCase):
         self.skill.research_queries = ["What are the biodiversity risks?"]
         self.skill.save()
 
-        mock_fetch.return_value = [_make_chunk(self.doc)]
+        call_counter = [0]
+        def make_fresh_chunk(*args, **kwargs):
+            call_counter[0] += 1
+            return [SimpleNamespace(id=call_counter[0] * 100, document=self.doc, chunk_index=0, content="c")]
+        mock_fetch.side_effect = make_fresh_chunk
         mock_completion.return_value = ("Output", {"total_tokens": 5})
 
         execution = SkillExecution.objects.create(
@@ -559,7 +576,11 @@ class CopilotResearchPhaseTestCase(TestCase):
     @patch("apps.skill.services.generate_chat_completion")
     @patch("apps.skill.services.fetch_relevant_chunks")
     def test_research_metadata_recorded(self, mock_fetch, mock_completion):
-        mock_fetch.return_value = [_make_chunk(self.doc)]
+        call_counter = [0]
+        def make_fresh_chunk(*args, **kwargs):
+            call_counter[0] += 1
+            return [SimpleNamespace(id=call_counter[0] * 100, document=self.doc, chunk_index=0, content="c")]
+        mock_fetch.side_effect = make_fresh_chunk
         mock_completion.return_value = ("Output", {"total_tokens": 5})
 
         execution = SkillExecution.objects.create(

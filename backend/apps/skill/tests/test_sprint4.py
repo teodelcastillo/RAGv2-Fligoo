@@ -32,8 +32,12 @@ from apps.skill.services import approve_step, execute_skill, regenerate_step
 User = get_user_model()
 
 
+_chunk_id_counter = 0
+
 def _make_chunk(doc, index=0):
-    return SimpleNamespace(document=doc, chunk_index=index, content="chunk")
+    global _chunk_id_counter
+    _chunk_id_counter += 1
+    return SimpleNamespace(id=_chunk_id_counter, document=doc, chunk_index=index, content="chunk")
 
 
 class StepApprovalGateTestCase(TestCase):
@@ -355,7 +359,7 @@ class HumanInTheLoopAPITestCase(TestCase):
     def test_approve_returns_202(self, mock_task):
         mock_task.delay = mock_task
         execution = self._awaiting_execution()
-        response = self.client.post(f"/api/skill-executions/{execution.id}/approve/", {})
+        response = self.client.post(f"/api/skills/executions/{execution.id}/approve/", {})
         self.assertEqual(response.status_code, 202)
         execution.refresh_from_db()
         self.assertEqual(execution.status, ExecutionStatus.PENDING)
@@ -365,7 +369,7 @@ class HumanInTheLoopAPITestCase(TestCase):
         mock_task.delay = mock_task
         execution = self._awaiting_execution()
         response = self.client.post(
-            f"/api/skill-executions/{execution.id}/approve/",
+            f"/api/skills/executions/{execution.id}/approve/",
             {"override_content": "Edited."},
         )
         self.assertEqual(response.status_code, 202)
@@ -379,14 +383,14 @@ class HumanInTheLoopAPITestCase(TestCase):
             project=self.project,
             status=ExecutionStatus.COMPLETED,
         )
-        response = self.client.post(f"/api/skill-executions/{execution.id}/approve/", {})
+        response = self.client.post(f"/api/skills/executions/{execution.id}/approve/", {})
         self.assertEqual(response.status_code, 400)
 
     @patch("apps.skill.api.views.run_skill_task")
     def test_regenerate_step_returns_202(self, mock_task):
         mock_task.delay = mock_task
         execution = self._awaiting_execution()
-        response = self.client.post(f"/api/skill-executions/{execution.id}/regenerate-step/")
+        response = self.client.post(f"/api/skills/executions/{execution.id}/regenerate-step/")
         self.assertEqual(response.status_code, 202)
         execution.refresh_from_db()
         self.assertEqual(execution.status, ExecutionStatus.PENDING)
@@ -399,7 +403,7 @@ class HumanInTheLoopAPITestCase(TestCase):
             project=self.project,
             status=ExecutionStatus.RUNNING,
         )
-        response = self.client.post(f"/api/skill-executions/{execution.id}/regenerate-step/")
+        response = self.client.post(f"/api/skills/executions/{execution.id}/regenerate-step/")
         self.assertEqual(response.status_code, 400)
 
     def test_other_user_cannot_approve(self):
@@ -409,5 +413,5 @@ class HumanInTheLoopAPITestCase(TestCase):
         other_client = APIClient()
         other_client.force_authenticate(user=other_user)
         execution = self._awaiting_execution()
-        response = other_client.post(f"/api/skill-executions/{execution.id}/approve/", {})
+        response = other_client.post(f"/api/skills/executions/{execution.id}/approve/", {})
         self.assertEqual(response.status_code, 404)

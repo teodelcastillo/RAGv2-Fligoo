@@ -729,10 +729,18 @@ class SkillRunner:
             execution.error_message = str(exc)
         finally:
             execution.finished_at = timezone.now()
-            execution.save(update_fields=[
-                "status", "output", "output_structured", "metadata",
-                "error_message", "finished_at", "current_step_position",
-            ])
+            # For copilot runs, output_structured was already persisted incrementally
+            # per step — avoid a redundant final save of that field.
+            if execution.skill.skill_type == SkillType.QUICK:
+                execution.save(update_fields=[
+                    "status", "output", "output_structured", "metadata",
+                    "error_message", "finished_at", "current_step_position",
+                ])
+            else:
+                execution.save(update_fields=[
+                    "status", "metadata", "error_message",
+                    "finished_at", "current_step_position",
+                ])
 
         return execution
 

@@ -8,6 +8,7 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
 from apps.skill.api.serializers import (
+    ApproveStepSerializer,
     RunSkillSerializer,
     SkillExecutionSerializer,
     SkillSerializer,
@@ -22,6 +23,7 @@ from apps.skill.models import (
     SkillType,
 )
 from apps.skill.table_schema import schema_has_columns
+from apps.skill.services import approve_step, regenerate_step
 from apps.skill.tasks import run_skill_task
 
 
@@ -243,3 +245,45 @@ class SkillExecutionViewSet(
         if status_filter := self.request.query_params.get("status"):
             qs = qs.filter(status=status_filter)
         return qs
+
+    @action(detail=True, methods=["post"], url_path="approve")
+    def approve(self, request, pk=None):
+        """
+        Approve the current awaiting step and continue the run.
+
+        Optionally accepts ``override_content`` to replace the step's text
+        output before resuming — letting the consultant edit the draft.
+
+        POST /api/skill-executions/{id}/approve/
+        Body: { "override_content": "..." }   (optional)
+        """
+        execution = self.get_object()
+        serializer = ApproveStepSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        try:
+            execution = approve_step(
+                execution,
+                override_content=serializer.validated_data.get("override_content"),
+            )
+        except ValueError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        run_skill_task.delay(execution.id)
+        return Response(SkillExecutionSerializer(execution).data, status=status.HTTP_202_ACCEPTED)
+
+    @action(detail=True, methods=["post"], url_path="regenerate-step")
+    def regenerate_step_action(self, request, pk=None):
+        """
+        Discard the last completed step and re-run it from scratch.
+
+        POST /api/skill-executions/{id}/regenerate-step/
+        """
+        execution = self.get_object()
+        try:
+            execution = regenerate_step(execution)
+        except ValueError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        run_skill_task.delay(execution.id)
+        return Response(SkillExecutionSerializer(execution).data, status=status.HTTP_202_ACCEPTED)

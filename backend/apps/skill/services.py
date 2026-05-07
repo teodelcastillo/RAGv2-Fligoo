@@ -23,6 +23,14 @@ from apps.skill.table_schema import schema_has_columns
 
 logger = logging.getLogger(__name__)
 
+
+class StepAwaitingApproval(Exception):
+    """
+    Raised by _run_copilot when a step with approval_required=True has been
+    completed and persisted. The runner catches this and sets status=AWAITING_APPROVAL
+    instead of FAILED.
+    """
+
 DEFAULT_CHUNKS = int(os.environ.get("SKILL_CONTEXT_CHUNKS", "6"))
 
 # Maximum chunks assembled from the research phase scratchpad.
@@ -469,6 +477,21 @@ def _resolve_step_output_config(step: SkillStep) -> tuple[str, dict]:
     return output_mode, table_schema
 
 
+def _rebuild_previous_outputs(step_results: list[dict]) -> List[str]:
+    """
+    Reconstruct the previous_outputs list from already-completed step entries.
+    Used when resuming a paused execution so context is preserved for later steps.
+    """
+    previous_outputs: List[str] = []
+    for entry in step_results:
+        title = entry.get("title", "")
+        if entry.get("output_mode") == ExecutionOutputMode.TABLE and "table" in entry:
+            previous_outputs.append(_table_summary_for_history(title, entry["table"]))
+        else:
+            previous_outputs.append(f"### {title}\n{entry.get('content', '')}")
+    return previous_outputs
+
+
 def _run_copilot(execution: SkillExecution, documents: QuerySet[Document]) -> None:
     from apps.skill.tools import SkillToolContext
 
@@ -477,9 +500,16 @@ def _run_copilot(execution: SkillExecution, documents: QuerySet[Document]) -> No
     if not steps:
         raise ValueError("This Copilot skill has no steps defined.")
 
-    step_results: list[dict] = []
+    # Resume: load any steps already completed in a previous run segment.
+    already_done: list[dict] = list(
+        (execution.output_structured or {}).get("steps", [])
+    )
+    resume_from_position = len(already_done)
+
+    step_results: list[dict] = list(already_done)
     total_usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
-    previous_outputs: List[str] = []
+    # Rebuild conversation context from completed steps so later steps have full history.
+    previous_outputs: List[str] = _rebuild_previous_outputs(already_done)
     all_step_chunks: list = []
     effective_retrieval_strategy = (
         RetrievalStrategy.HYBRID_PER_DOCUMENT
@@ -505,7 +535,11 @@ def _run_copilot(execution: SkillExecution, documents: QuerySet[Document]) -> No
             len(research_chunks),
         )
 
-    for step in steps:
+    for step_index, step in enumerate(steps):
+        # Skip steps already completed in a prior run segment (resume support).
+        if step_index < resume_from_position:
+            continue
+
         step_output_mode, step_table_schema = _resolve_step_output_config(step)
         is_table_step = step_output_mode == ExecutionOutputMode.TABLE
 
@@ -606,6 +640,20 @@ def _run_copilot(execution: SkillExecution, documents: QuerySet[Document]) -> No
         for key in total_usage:
             total_usage[key] += usage.get(key, 0)
 
+        # Persist this step immediately (Sprint 3: incremental output for polling).
+        execution.output_structured = {"steps": step_results}
+        execution.steps_completed = len(step_results)
+        execution.save(update_fields=["output_structured", "steps_completed"])
+
+        # Sprint 4: if this step requires human approval, pause the run here.
+        if step.approval_required:
+            execution.current_step_position = step.position
+            execution.save(update_fields=["current_step_position"])
+            raise StepAwaitingApproval(
+                f"Step '{step.title}' (position {step.position}) is awaiting approval."
+            )
+
+    # Final metadata written once all steps complete.
     execution.output_structured = {"steps": step_results}
     source_stats = _collect_source_stats(all_step_chunks, total_docs=documents.count())
     execution.metadata = {
@@ -641,7 +689,11 @@ class SkillRunner:
             .get(pk=execution_id)
         )
 
-        if execution.status not in (ExecutionStatus.PENDING, ExecutionStatus.FAILED):
+        if execution.status not in (
+            ExecutionStatus.PENDING,
+            ExecutionStatus.FAILED,
+            ExecutionStatus.AWAITING_APPROVAL,
+        ):
             return execution
 
         documents = resolve_documents(execution)
@@ -667,6 +719,10 @@ class SkillRunner:
             else:
                 _run_copilot(execution, documents)
             execution.status = ExecutionStatus.COMPLETED
+            execution.current_step_position = None
+        except StepAwaitingApproval:
+            # Not a failure — the run is intentionally paused.
+            execution.status = ExecutionStatus.AWAITING_APPROVAL
         except Exception as exc:
             logger.exception("SkillExecution %s failed", execution.id)
             execution.status = ExecutionStatus.FAILED
@@ -675,7 +731,7 @@ class SkillRunner:
             execution.finished_at = timezone.now()
             execution.save(update_fields=[
                 "status", "output", "output_structured", "metadata",
-                "error_message", "finished_at",
+                "error_message", "finished_at", "current_step_position",
             ])
 
         return execution
@@ -683,3 +739,69 @@ class SkillRunner:
 
 def execute_skill(execution: SkillExecution) -> SkillExecution:
     return SkillRunner().run(execution.id)
+
+
+# ---------------------------------------------------------------------------
+# Sprint 4 — Human-in-the-loop helpers
+# ---------------------------------------------------------------------------
+
+def approve_step(execution: SkillExecution, *, override_content: str | None = None) -> SkillExecution:
+    """
+    Approve the current awaiting step and continue the run.
+
+    If ``override_content`` is provided the last completed step's text content
+    is replaced before the run resumes. This lets the consultant edit the output
+    and have subsequent steps use the corrected version as context.
+
+    Returns the execution object (status will be PENDING until the async task
+    picks it up and starts running again).
+    """
+    if execution.status != ExecutionStatus.AWAITING_APPROVAL:
+        raise ValueError(
+            f"Cannot approve: execution {execution.id} is not awaiting approval "
+            f"(current status: {execution.status})."
+        )
+
+    if override_content is not None:
+        steps = list((execution.output_structured or {}).get("steps", []))
+        if steps:
+            last = dict(steps[-1])
+            # Only override text steps — table steps are left as-is.
+            if last.get("output_mode") != ExecutionOutputMode.TABLE:
+                last["content"] = override_content
+                last["human_edited"] = True
+                steps[-1] = last
+                execution.output_structured = {"steps": steps}
+
+    execution.status = ExecutionStatus.PENDING
+    execution.error_message = ""
+    execution.save(update_fields=["status", "output_structured", "error_message"])
+    return execution
+
+
+def regenerate_step(execution: SkillExecution) -> SkillExecution:
+    """
+    Discard the last completed step and re-run it.
+
+    Strips the last step from output_structured, decrements steps_completed,
+    and resets status to PENDING so the Celery task re-runs from that step.
+    """
+    if execution.status != ExecutionStatus.AWAITING_APPROVAL:
+        raise ValueError(
+            f"Cannot regenerate: execution {execution.id} is not awaiting approval "
+            f"(current status: {execution.status})."
+        )
+
+    steps = list((execution.output_structured or {}).get("steps", []))
+    if steps:
+        steps.pop()
+    execution.output_structured = {"steps": steps}
+    execution.steps_completed = max(0, execution.steps_completed - 1)
+    execution.status = ExecutionStatus.PENDING
+    execution.current_step_position = None
+    execution.error_message = ""
+    execution.save(update_fields=[
+        "status", "output_structured", "steps_completed",
+        "current_step_position", "error_message",
+    ])
+    return execution

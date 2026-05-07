@@ -121,6 +121,7 @@ class SkillStepSerializer(serializers.ModelSerializer):
             "position",
             "output_mode",
             "table_schema",
+            "approval_required",
         )
 
 
@@ -162,6 +163,7 @@ class SkillStepWriteSerializer(serializers.Serializer):
         default=ExecutionOutputMode.TEXT,
     )
     table_schema = serializers.DictField(required=False)
+    approval_required = serializers.BooleanField(required=False, default=False)
 
     def validate(self, attrs):
         output_mode = attrs.get("output_mode", ExecutionOutputMode.TEXT)
@@ -375,6 +377,8 @@ class SkillExecutionSerializer(serializers.ModelSerializer):
     repository_slug = serializers.SlugField(source="repository.slug", read_only=True, allow_null=True)
     project_slug = serializers.SlugField(source="project.slug", read_only=True, allow_null=True)
     document_slug = serializers.SlugField(source="document.slug", read_only=True, allow_null=True)
+    # Sprint 3 — incremental progress
+    steps_total = serializers.IntegerField(read_only=True)
 
     class Meta:
         model = SkillExecution
@@ -384,10 +388,25 @@ class SkillExecutionSerializer(serializers.ModelSerializer):
             "repository_slug", "project_slug", "document_slug",
             "extra_instructions", "input_values", "output_mode",
             "output", "output_structured",
+            "steps_completed", "steps_total", "current_step_position",
             "document_snapshot", "metadata", "error_message",
             "started_at", "finished_at", "created_at",
         )
         read_only_fields = fields
+
+
+class ApproveStepSerializer(serializers.Serializer):
+    """Input for POST /api/skill-executions/{id}/approve/"""
+    override_content = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        allow_null=True,
+        default=None,
+        help_text=(
+            "Optional replacement text for the current step's output. "
+            "When provided, subsequent steps will use this edited version as context."
+        ),
+    )
 
 
 class RunSkillSerializer(serializers.Serializer):

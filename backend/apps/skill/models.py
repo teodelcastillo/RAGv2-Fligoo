@@ -29,6 +29,7 @@ class SkillContext(models.TextChoices):
 class ExecutionStatus(models.TextChoices):
     PENDING = "pending", _("Pending")
     RUNNING = "running", _("Running")
+    AWAITING_APPROVAL = "awaiting_approval", _("Awaiting Approval")
     COMPLETED = "completed", _("Completed")
     FAILED = "failed", _("Failed")
 
@@ -285,6 +286,13 @@ class SkillStep(models.Model):
             "table_schema so the runner produces structured rows."
         ),
     )
+    approval_required = models.BooleanField(
+        default=False,
+        help_text=(
+            "When enabled, the copilot pauses after this step completes and waits for "
+            "the consultant to review, optionally edit, and approve before continuing."
+        ),
+    )
     table_schema = models.JSONField(
         default=dict,
         blank=True,
@@ -367,6 +375,21 @@ class SkillExecution(models.Model):
     # COPILOT output: {"steps": [{"step_id": 1, "title": "...", "content": "..."}]}
     output_structured = models.JSONField(default=dict, blank=True)
 
+    # How many copilot steps have been written so far (updated incrementally during execution).
+    steps_completed = models.PositiveSmallIntegerField(
+        default=0,
+        help_text="Number of copilot steps that have been written to output_structured so far.",
+    )
+    # Sprint 4 — human-in-the-loop
+    current_step_position = models.PositiveSmallIntegerField(
+        null=True,
+        blank=True,
+        help_text=(
+            "When status=awaiting_approval, holds the position of the step currently "
+            "awaiting review. Null when the execution is not paused."
+        ),
+    )
+
     # Snapshot of which documents were used (for reproducibility)
     document_snapshot = models.JSONField(default=list)
 
@@ -386,6 +409,13 @@ class SkillExecution(models.Model):
 
     def __str__(self) -> str:
         return f"Execution {self.id} — {self.skill.name} ({self.status})"
+
+    @property
+    def steps_total(self) -> int:
+        """Total number of steps defined for this copilot execution."""
+        if self.skill.skill_type == "copilot":
+            return self.skill.steps.count()
+        return 0
 
     @property
     def context_label(self) -> str:

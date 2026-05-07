@@ -156,6 +156,30 @@ class RepositoryViewSet(viewsets.ModelViewSet):
         )
         create_serializer.is_valid(raise_exception=True)
         validated = create_serializer.validated_data
+        force_new = str(request.data.get("force_new", "")).lower() in {
+            "1",
+            "true",
+            "yes",
+        }
+
+        # By default, resume the latest active repository chat session so users
+        # keep conversational continuity across workspace visits.
+        if not force_new:
+            existing_session = (
+                ChatSession.objects.filter(
+                    owner=request.user,
+                    repository=repo,
+                    is_active=True,
+                )
+                .prefetch_related("allowed_documents")
+                .order_by("-updated_at")
+                .first()
+            )
+            if existing_session is not None:
+                output = ChatSessionSerializer(
+                    existing_session, context={"request": request}
+                )
+                return Response(output.data, status=status.HTTP_200_OK)
 
         session = ChatSession.objects.create(
             owner=request.user,

@@ -3,6 +3,7 @@ from __future__ import annotations
 from django.contrib.auth import get_user_model
 from rest_framework import serializers
 
+from apps.document.services import accessible_documents_for
 from apps.skill.models import (
     ExecutionOutputMode,
     ExecutionStatus,
@@ -15,7 +16,6 @@ from apps.skill.models import (
     SkillStep,
     SkillType,
 )
-from apps.document.services import accessible_documents_for
 from apps.skill.table_schema import (
     TableSchemaError,
     normalize_table_schema,

@@ -203,17 +203,19 @@ class ProjectViewSet(viewsets.ModelViewSet):
         url_name="skill-executions",
     )
     def skill_executions(self, request, slug=None):
-        """List all skill executions for a project."""
+        """List skill executions for this project (current user only; staff sees all)."""
         project = self.get_object()
         if not project.can_view(request.user):
             raise PermissionDenied("No tienes permisos para ver este proyecto.")
         from apps.skill.models import SkillExecution
         from apps.skill.api.serializers import SkillExecutionSerializer
-        executions = (
+        qs = (
             SkillExecution.objects.filter(project=project)
             .select_related("skill", "owner", "document")
-            .order_by("-created_at")
         )
+        if not request.user.is_staff:
+            qs = qs.filter(owner=request.user)
+        executions = qs.order_by("-created_at")
         serializer = SkillExecutionSerializer(executions, many=True)
         return Response(serializer.data)
 
@@ -224,15 +226,13 @@ class ProjectViewSet(viewsets.ModelViewSet):
         url_name="evaluation-runs",
     )
     def evaluation_runs(self, request, slug=None):
-        """Listar todas las ejecuciones de evaluaciones de un proyecto"""
+        """Runs de evaluación en este proyecto (solo del usuario; staff ve todos)."""
         project = self.get_object()
-        
-        # Verificar permisos de visualización del proyecto
+
         if not project.can_view(request.user):
             raise PermissionDenied("No tienes permisos para ver este proyecto.")
-        
-        # Obtener los runs del proyecto con sus relaciones
-        runs = (
+
+        qs = (
             EvaluationRun.objects.filter(project=project)
             .select_related("evaluation", "owner", "project")
             .prefetch_related(
@@ -241,9 +241,11 @@ class ProjectViewSet(viewsets.ModelViewSet):
                     queryset=PillarEvaluationResult.objects.prefetch_related("metric_results"),
                 )
             )
-            .order_by("-created_at")
         )
-        
+        if not request.user.is_staff:
+            qs = qs.filter(owner=request.user)
+        runs = qs.order_by("-created_at")
+
         serializer = EvaluationRunSerializer(runs, many=True)
         return Response(serializer.data)
 

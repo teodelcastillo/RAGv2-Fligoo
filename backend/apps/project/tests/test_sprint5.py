@@ -574,17 +574,146 @@ class StructureTemplateAPITestCase(TestCase):
         ProjectStructureSection.objects.create(
             template=self.template, title="S1", position=1
         )
+        self.user_template = ProjectStructureTemplate.objects.create(
+            owner=self.user, name="My Template", slug="my-template", description="Mine."
+        )
+        ProjectStructureSection.objects.create(
+            template=self.user_template, title="Mine S1", position=1
+        )
+        self.other = User.objects.create_user(
+            email="tmpl-other@example.com", password="secret123", username="tmpl-other"
+        )
+        self.other_template = ProjectStructureTemplate.objects.create(
+            owner=self.other, name="Other Template", slug="other-template", description="Other."
+        )
 
     def test_list_templates(self):
         response = self.client.get("/api/projects/structure-templates/")
         self.assertEqual(response.status_code, 200)
-        self.assertTrue(len(response.data) >= 1)
+        slugs = {row["slug"] for row in response.data}
+        # Non-staff user sees global + own templates, not others' private templates.
+        self.assertIn("api-template", slugs)
+        self.assertIn("my-template", slugs)
+        self.assertNotIn("other-template", slugs)
 
     def test_retrieve_template(self):
         response = self.client.get("/api/projects/structure-templates/api-template/")
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.data["slug"], "api-template")
         self.assertEqual(len(response.data["sections"]), 1)
+
+    def test_create_template_with_sections(self):
+        response = self.client.post(
+            "/api/projects/structure-templates/",
+            {
+                "name": "Custom Template",
+                "slug": "custom-template",
+                "description": "Custom desc",
+                "sections": [
+                    {"title": "Intro", "description": "A", "position": 1},
+                    {"title": "Resultados", "description": "B", "position": 2},
+                ],
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, 201)
+        created = ProjectStructureTemplate.objects.get(slug="custom-template")
+        self.assertEqual(created.sections.count(), 2)
+
+    def test_partial_update_template_replaces_sections(self):
+        response = self.client.patch(
+            "/api/projects/structure-templates/api-template/",
+            {
+                "description": "Updated desc",
+                "sections": [
+                    {"title": "Nuevo alcance", "description": "N", "position": 1},
+                    {"title": "Nuevo cierre", "description": "C", "position": 2},
+                ],
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, 200)
+        self.template.refresh_from_db()
+        self.assertEqual(self.template.description, "Updated desc")
+        self.assertEqual(self.template.sections.count(), 2)
+        self.assertTrue(
+            self.template.sections.filter(title="Nuevo alcance", position=1).exists()
+        )
+
+    def test_delete_template(self):
+        response = self.client.delete("/api/projects/structure-templates/api-template/")
+        self.assertEqual(response.status_code, 403)
+
+    def test_non_staff_cannot_create_global_template(self):
+        response = self.client.post(
+            "/api/projects/structure-templates/",
+            {
+                "name": "Illegal Global",
+                "slug": "illegal-global",
+                "description": "Nope",
+                "is_global": True,
+                "sections": [{"title": "S1", "position": 1}],
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, 403)
+
+    def test_non_staff_cannot_edit_global_template(self):
+        response = self.client.patch(
+            "/api/projects/structure-templates/api-template/",
+            {"description": "hack"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 403)
+
+    def test_non_staff_cannot_delete_other_private_template(self):
+        response = self.client.delete("/api/projects/structure-templates/other-template/")
+        self.assertEqual(response.status_code, 404)
+
+    def test_non_staff_can_edit_own_template(self):
+        response = self.client.patch(
+            "/api/projects/structure-templates/my-template/",
+            {"description": "updated mine"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 200)
+        self.user_template.refresh_from_db()
+        self.assertEqual(self.user_template.description, "updated mine")
+
+    def test_staff_can_manage_global_templates(self):
+        admin = User.objects.create_user(
+            email="tmpl-admin@example.com",
+            password="secret123",
+            username="tmpl-admin",
+            role="admin",
+            is_staff=True,
+        )
+        staff_client = APIClient()
+        staff_client.force_authenticate(user=admin)
+
+        create = staff_client.post(
+            "/api/projects/structure-templates/",
+            {
+                "name": "Global By Staff",
+                "slug": "global-by-staff",
+                "is_global": True,
+                "sections": [{"title": "S1", "position": 1}],
+            },
+            format="json",
+        )
+        self.assertEqual(create.status_code, 201)
+        created = ProjectStructureTemplate.objects.get(slug="global-by-staff")
+        self.assertIsNone(created.owner_id)
+
+        patch = staff_client.patch(
+            "/api/projects/structure-templates/api-template/",
+            {"description": "staff updated"},
+            format="json",
+        )
+        self.assertEqual(patch.status_code, 200)
+
+        delete = staff_client.delete("/api/projects/structure-templates/api-template/")
+        self.assertEqual(delete.status_code, 204)
 
 
 class ProjectStructureAPITestCase(TestCase):

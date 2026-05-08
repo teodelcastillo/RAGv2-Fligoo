@@ -112,7 +112,15 @@ class Document(models.Model):
             return True
         if self.is_public:
             return True
-        return self.shares.filter(user=user).exists()
+        if self.shares.filter(user=user).exists():
+            return True
+        # Align with list/retrieve/RAG: project collaborators may read linked docs.
+        from apps.project.models import ProjectShare
+
+        shared_project_ids = ProjectShare.objects.filter(user=user).values_list(
+            "project_id", flat=True
+        )
+        return self.projects.filter(id__in=shared_project_ids).exists()
 
     def can_edit(self, user) -> bool:
         """Verifica si el usuario puede editar el documento"""

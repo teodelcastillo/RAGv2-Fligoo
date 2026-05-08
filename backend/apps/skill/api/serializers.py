@@ -15,6 +15,7 @@ from apps.skill.models import (
     SkillStep,
     SkillType,
 )
+from apps.document.services import accessible_documents_for
 from apps.skill.table_schema import (
     TableSchemaError,
     normalize_table_schema,
@@ -459,11 +460,12 @@ class RunSkillSerializer(serializers.Serializer):
                 raise serializers.ValidationError({"context_slug": "Project not found."})
 
         elif context_type == "document":
-            from apps.document.models import Document
-            try:
-                attrs["document"] = Document.objects.get(slug=context_slug)
-            except Document.DoesNotExist:
+            user = self.context["request"].user
+            doc_qs = accessible_documents_for(user, [context_slug])
+            doc = doc_qs.filter(slug=context_slug).first()
+            if doc is None:
                 raise serializers.ValidationError({"context_slug": "Document not found."})
+            attrs["document"] = doc
 
         # Override or fallback: the runner is the source of truth for resolving the
         # *effective* output mode and schema. Here we only validate user-provided

@@ -186,6 +186,14 @@ class ProjectShare(models.Model):
 # ---------------------------------------------------------------------------
 
 class ProjectStructureTemplate(models.Model):
+    owner = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        related_name="project_structure_templates",
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        help_text="Owner of the template. Null means global template.",
+    )
     name = models.CharField(max_length=255)
     slug = models.SlugField(unique=True, max_length=255)
     description = models.TextField(blank=True)

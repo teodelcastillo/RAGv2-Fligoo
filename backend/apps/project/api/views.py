@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from django.db.models import Count, OuterRef, Prefetch, Subquery  # Count used in subquery helper
+from django.db.models import Count, OuterRef, Prefetch, Q, Subquery  # Count used in subquery helper
 from django.shortcuts import get_object_or_404
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
@@ -527,29 +527,69 @@ class ProjectViewSet(viewsets.ModelViewSet):
 
 
 class StructureTemplateViewSet(
-    viewsets.mixins.ListModelMixin,
-    viewsets.mixins.RetrieveModelMixin,
-    viewsets.GenericViewSet,
+    viewsets.ModelViewSet,
 ):
-    """Read-only viewset for project structure templates."""
+    """CRUD viewset for project structure templates."""
 
     permission_classes = [IsAuthenticated]
     lookup_field = "slug"
 
     def get_queryset(self):
         from apps.project.models import ProjectStructureTemplate
-
-        return ProjectStructureTemplate.objects.prefetch_related("sections").annotate(
+        qs = ProjectStructureTemplate.objects.prefetch_related("sections").annotate(
             section_count=Count("sections"),
         )
+        user = self.request.user
+        if user.is_staff:
+            return qs
+        return qs.filter(Q(owner=user) | Q(owner__isnull=True))
 
     def get_serializer_class(self):
         from apps.project.api.serializers import (
             ProjectStructureTemplateListSerializer,
             ProjectStructureTemplateSerializer,
+            ProjectStructureTemplateWriteSerializer,
         )
 
         if self.action == "list":
             return ProjectStructureTemplateListSerializer
+        if self.action in {"create", "update", "partial_update"}:
+            return ProjectStructureTemplateWriteSerializer
         return ProjectStructureTemplateSerializer
+
+    def perform_create(self, serializer):
+        is_global = bool(serializer.validated_data.get("is_global", False))
+        if is_global:
+            if not self.request.user.is_staff:
+                raise PermissionDenied("Solo usuarios staff pueden crear plantillas globales.")
+            serializer.save(owner=None)
+            return
+        serializer.save(owner=self.request.user)
+
+    def perform_update(self, serializer):
+        instance = self.get_object()
+        is_global_target = bool(serializer.validated_data.get("is_global", instance.owner_id is None))
+        if instance.owner_id is None:
+            if not self.request.user.is_staff:
+                raise PermissionDenied("Solo usuarios staff pueden editar plantillas globales.")
+        else:
+            if instance.owner_id != self.request.user.id and not self.request.user.is_staff:
+                raise PermissionDenied("No puedes editar una plantilla que no te pertenece.")
+        if is_global_target and not self.request.user.is_staff:
+            raise PermissionDenied("Solo usuarios staff pueden convertir plantillas a globales.")
+        if is_global_target:
+            serializer.save(owner=None)
+        elif instance.owner_id is None and not self.request.user.is_staff:
+            raise PermissionDenied("Solo staff puede reasignar plantillas globales.")
+        else:
+            # Keep owner if already set; if global->local by staff, make owner current user.
+            owner = instance.owner if instance.owner_id is not None else self.request.user
+            serializer.save(owner=owner)
+
+    def perform_destroy(self, instance):
+        if instance.owner_id is None and not self.request.user.is_staff:
+            raise PermissionDenied("Solo usuarios staff pueden eliminar plantillas globales.")
+        if instance.owner_id is not None and instance.owner_id != self.request.user.id and not self.request.user.is_staff:
+            raise PermissionDenied("No puedes eliminar una plantilla que no te pertenece.")
+        instance.delete()
 

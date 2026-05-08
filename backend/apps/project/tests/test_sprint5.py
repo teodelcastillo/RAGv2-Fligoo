@@ -198,6 +198,24 @@ class CopilotSystemPromptTestCase(TestCase):
         prompt = build_copilot_system_prompt(self.project, documents)
         self.assertIn("report-prompt", prompt)
 
+    def test_marks_blueprint_when_set(self):
+        from apps.chat.services.copilot import build_copilot_system_prompt
+
+        self.project.blueprint_document = self.doc
+        self.project.save(update_fields=["blueprint_document"])
+        documents = Document.objects.filter(id=self.doc.id)
+        prompt = build_copilot_system_prompt(self.project, documents)
+        self.assertIn("[BLUEPRINT]", prompt)
+        self.assertIn("Documento principal (blueprint)", prompt)
+
+    def test_includes_draft_delimiters_instruction(self):
+        from apps.chat.services.copilot import build_copilot_system_prompt
+
+        documents = Document.objects.filter(id=self.doc.id)
+        prompt = build_copilot_system_prompt(self.project, documents)
+        self.assertIn("<<<DRAFT", prompt)
+        self.assertIn("<<<END>>>", prompt)
+
 
 # ---------------------------------------------------------------------------
 # Copilot tools
@@ -447,12 +465,52 @@ class CopilotMessageProcessingTestCase(TestCase):
 
         self.assertEqual(text, "Here is my analysis.")
         self.assertTrue(metadata["copilot"])
+        self.assertNotIn("draft_markdown", metadata)
         mock_gen.assert_called_once()
         call_args = mock_gen.call_args
         messages = call_args.args[0]
         self.assertEqual(messages[0]["role"], "system")
         self.assertIn("MsgProject", messages[0]["content"])
         self.assertIn("TestCo", messages[0]["content"])
+
+    @patch("apps.chat.services.copilot.generate_with_tools")
+    def test_extracts_draft_block_into_metadata(self, mock_gen):
+        from apps.chat.services.copilot import process_copilot_message
+
+        ProjectSection.objects.create(
+            project=self.project, title="Resumen", position=1,
+        )
+        reply = (
+            "Listo, te dejo un primer borrador.\n\n"
+            "<<<DRAFT section=1>>>\n"
+            "## Resumen ejecutivo\n\n"
+            "Este informe sintetiza los hallazgos clave.\n"
+            "<<<END>>>\n\n"
+            "¿Querés que lo expanda?"
+        )
+        mock_gen.return_value = (reply, {"total_tokens": 70})
+
+        _, metadata, _ = process_copilot_message(
+            self.session, "Redactá el resumen.", self.user,
+        )
+
+        self.assertEqual(metadata["draft_section_position"], 1)
+        self.assertIn("Resumen ejecutivo", metadata["draft_markdown"])
+        section = ProjectSection.objects.get(project=self.project, position=1)
+        self.assertIn("Resumen ejecutivo", section.output_snapshot)
+
+    @patch("apps.chat.services.copilot.generate_with_tools")
+    def test_extracts_draft_without_section_target(self, mock_gen):
+        from apps.chat.services.copilot import process_copilot_message
+
+        reply = "Aquí va.\n<<<DRAFT>>>\n# Título\n\nCuerpo.\n<<<END>>>"
+        mock_gen.return_value = (reply, {"total_tokens": 40})
+
+        _, metadata, _ = process_copilot_message(
+            self.session, "Necesito un encabezado.", self.user,
+        )
+        self.assertIsNone(metadata["draft_section_position"])
+        self.assertIn("Cuerpo", metadata["draft_markdown"])
 
     @patch("apps.chat.services.copilot.generate_with_tools")
     def test_no_project_raises_error(self, mock_gen):
@@ -465,6 +523,37 @@ class CopilotMessageProcessingTestCase(TestCase):
         )
         with self.assertRaises(ValueError):
             process_copilot_message(session, "hello", self.user)
+
+
+class ExtractDraftBlockTestCase(TestCase):
+    def test_extracts_with_section_attribute(self):
+        from apps.chat.services.copilot import extract_draft_block
+
+        body, position = extract_draft_block(
+            "lead\n<<<DRAFT section=3>>>\nMD body\n<<<END>>>"
+        )
+        self.assertEqual(body, "MD body")
+        self.assertEqual(position, 3)
+
+    def test_returns_none_when_no_block(self):
+        from apps.chat.services.copilot import extract_draft_block
+
+        body, position = extract_draft_block("plain text only")
+        self.assertIsNone(body)
+        self.assertIsNone(position)
+
+    def test_returns_none_when_unclosed_block(self):
+        from apps.chat.services.copilot import extract_draft_block
+
+        body, position = extract_draft_block("<<<DRAFT>>> incomplete")
+        self.assertIsNone(body)
+        self.assertIsNone(position)
+
+    def test_strips_padding_whitespace(self):
+        from apps.chat.services.copilot import extract_draft_block
+
+        body, _ = extract_draft_block("<<<DRAFT>>>\n\n  body  \n\n<<<END>>>")
+        self.assertEqual(body, "body")
 
 
 # ---------------------------------------------------------------------------
@@ -543,6 +632,61 @@ class ProjectStructureAPITestCase(TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.data["status"], "in_progress")
         self.assertEqual(response.data["notes"], "Working on it.")
+
+    def test_update_section_title_and_output_snapshot(self):
+        ProjectSection.objects.create(
+            project=self.project, title="Phase 1", position=1
+        )
+        response = self.client.patch(
+            f"/api/projects/{self.project.slug}/structure/sections/1/",
+            {
+                "title": "Resumen ejecutivo",
+                "description": "Síntesis del informe.",
+                "output_snapshot": "## Resumen\n\nContenido inicial.",
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["title"], "Resumen ejecutivo")
+        self.assertEqual(response.data["description"], "Síntesis del informe.")
+        self.assertIn("Contenido inicial", response.data["output_snapshot"])
+
+    def test_create_section_at_end(self):
+        response = self.client.post(
+            f"/api/projects/{self.project.slug}/structure/sections/",
+            {"title": "Anexos", "description": "Tablas y figuras."},
+        )
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.data["position"], 1)
+        self.assertEqual(response.data["title"], "Anexos")
+
+    def test_create_section_inserted_in_middle_shifts_positions(self):
+        ProjectSection.objects.create(project=self.project, title="A", position=1)
+        ProjectSection.objects.create(project=self.project, title="B", position=2)
+        response = self.client.post(
+            f"/api/projects/{self.project.slug}/structure/sections/",
+            {"title": "Inserted", "position": 2},
+        )
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.data["position"], 2)
+        positions = list(
+            ProjectSection.objects.filter(project=self.project)
+            .order_by("position").values_list("title", flat=True)
+        )
+        self.assertEqual(positions, ["A", "Inserted", "B"])
+
+    def test_delete_section_compacts_positions(self):
+        ProjectSection.objects.create(project=self.project, title="A", position=1)
+        ProjectSection.objects.create(project=self.project, title="B", position=2)
+        ProjectSection.objects.create(project=self.project, title="C", position=3)
+        response = self.client.delete(
+            f"/api/projects/{self.project.slug}/structure/sections/2/"
+        )
+        self.assertEqual(response.status_code, 204)
+        remaining = list(
+            ProjectSection.objects.filter(project=self.project)
+            .order_by("position").values_list("title", "position")
+        )
+        self.assertEqual(remaining, [("A", 1), ("C", 2)])
 
 
 class CopilotSessionAPITestCase(TestCase):

@@ -23,6 +23,7 @@ from apps.project.api.serializers import (
     CopilotMessageCreateSerializer,
     InitializeStructureSerializer,
     ProjectDocumentAttachSerializer,
+    ProjectSectionCreateSerializer,
     ProjectSectionSerializer,
     ProjectSectionUpdateSerializer,
     ProjectSerializer,
@@ -326,7 +327,7 @@ class ProjectViewSet(viewsets.ModelViewSet):
         return Response(output.data, status=status.HTTP_200_OK)
 
     @action(
-        detail=True, methods=["patch"],
+        detail=True, methods=["patch", "delete"],
         url_path=r"structure/sections/(?P<position>\d+)",
         url_name="structure-section-update",
     )
@@ -336,19 +337,66 @@ class ProjectViewSet(viewsets.ModelViewSet):
         section = get_object_or_404(
             ProjectSection, project=project, position=int(position),
         )
-        serializer = ProjectSectionUpdateSerializer(data=request.data)
+
+        if request.method == "DELETE":
+            removed_position = section.position
+            section.delete()
+            # Compact remaining positions so the next section becomes N.
+            following = ProjectSection.objects.filter(
+                project=project, position__gt=removed_position,
+            ).order_by("position")
+            for sec in following:
+                sec.position -= 1
+                sec.save(update_fields=["position"])
+            return Response(status=status.HTTP_204_NO_CONTENT)
+
+        serializer = ProjectSectionUpdateSerializer(data=request.data, partial=True)
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
         update_fields = []
-        if "status" in data:
-            section.status = data["status"]
-            update_fields.append("status")
-        if "notes" in data:
-            section.notes = data["notes"]
-            update_fields.append("notes")
+        for field in ("title", "description", "status", "notes", "output_snapshot"):
+            if field in data:
+                setattr(section, field, data[field])
+                update_fields.append(field)
         if update_fields:
             section.save(update_fields=update_fields)
         return Response(ProjectSectionSerializer(section).data)
+
+    @action(
+        detail=True, methods=["post"],
+        url_path="structure/sections", url_name="structure-section-create",
+    )
+    def create_section(self, request, slug=None):
+        project = self.get_object()
+        self._ensure_editor(project)
+        serializer = ProjectSectionCreateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        last_position = (
+            ProjectSection.objects.filter(project=project)
+            .order_by("-position").values_list("position", flat=True).first()
+        )
+        position = data.get("position") or ((last_position or 0) + 1)
+        # Shift conflicting positions one by one (highest first) to keep the
+        # (project, position) unique_together constraint satisfied at every step.
+        conflicting = list(
+            ProjectSection.objects.filter(
+                project=project, position__gte=position,
+            ).order_by("-position")
+        )
+        for sec in conflicting:
+            sec.position += 1
+            sec.save(update_fields=["position"])
+        section = ProjectSection.objects.create(
+            project=project,
+            title=data["title"],
+            description=data.get("description", ""),
+            position=position,
+        )
+        return Response(
+            ProjectSectionSerializer(section).data,
+            status=status.HTTP_201_CREATED,
+        )
 
     # ------------------------------------------------------------------
     # Copilot endpoints

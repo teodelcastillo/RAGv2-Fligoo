@@ -349,16 +349,24 @@ class ProjectSectionSerializer(serializers.ModelSerializer):
             "notes", "output_snapshot", "updated_at", "created_at",
         )
         read_only_fields = (
-            "id", "title", "description", "position",
-            "output_snapshot", "updated_at", "created_at",
+            "id", "position", "updated_at", "created_at",
         )
 
 
 class ProjectSectionUpdateSerializer(serializers.Serializer):
+    title = serializers.CharField(required=False, allow_blank=False, max_length=255)
+    description = serializers.CharField(required=False, allow_blank=True)
     status = serializers.ChoiceField(
         choices=ProjectSectionStatus.choices, required=False,
     )
     notes = serializers.CharField(required=False, allow_blank=True)
+    output_snapshot = serializers.CharField(required=False, allow_blank=True)
+
+
+class ProjectSectionCreateSerializer(serializers.Serializer):
+    title = serializers.CharField(allow_blank=False, max_length=255)
+    description = serializers.CharField(required=False, allow_blank=True)
+    position = serializers.IntegerField(required=False, min_value=1)
 
 
 # ---------------------------------------------------------------------------

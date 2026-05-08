@@ -321,20 +321,122 @@ class ProjectStructureSectionSerializer(serializers.ModelSerializer):
 
 class ProjectStructureTemplateSerializer(serializers.ModelSerializer):
     sections = ProjectStructureSectionSerializer(many=True, read_only=True)
+    owner_email = serializers.EmailField(source="owner.email", read_only=True, allow_null=True)
+    is_global = serializers.SerializerMethodField()
 
     class Meta:
         model = ProjectStructureTemplate
-        fields = ("id", "slug", "name", "description", "sections", "created_at")
+        fields = (
+            "id",
+            "slug",
+            "name",
+            "description",
+            "sections",
+            "owner_email",
+            "is_global",
+            "created_at",
+        )
         read_only_fields = fields
+
+    def get_is_global(self, obj: ProjectStructureTemplate) -> bool:
+        return obj.owner_id is None
 
 
 class ProjectStructureTemplateListSerializer(serializers.ModelSerializer):
     section_count = serializers.IntegerField(read_only=True)
+    owner_email = serializers.EmailField(source="owner.email", read_only=True, allow_null=True)
+    is_global = serializers.SerializerMethodField()
 
     class Meta:
         model = ProjectStructureTemplate
-        fields = ("id", "slug", "name", "description", "section_count", "created_at")
+        fields = (
+            "id",
+            "slug",
+            "name",
+            "description",
+            "section_count",
+            "owner_email",
+            "is_global",
+            "created_at",
+        )
         read_only_fields = fields
+
+    def get_is_global(self, obj: ProjectStructureTemplate) -> bool:
+        return obj.owner_id is None
+
+
+class ProjectStructureSectionWriteSerializer(serializers.Serializer):
+    title = serializers.CharField(max_length=255)
+    description = serializers.CharField(required=False, allow_blank=True)
+    position = serializers.IntegerField(min_value=1)
+    suggested_skill_slugs = serializers.ListField(
+        child=serializers.SlugField(),
+        required=False,
+        allow_empty=True,
+    )
+
+
+class ProjectStructureTemplateWriteSerializer(serializers.ModelSerializer):
+    sections = ProjectStructureSectionWriteSerializer(many=True, required=False)
+    slug = serializers.SlugField(required=False, allow_blank=True)
+
+    is_global = serializers.BooleanField(required=False, write_only=True)
+
+    class Meta:
+        model = ProjectStructureTemplate
+        fields = ("name", "slug", "description", "sections", "is_global")
+
+    def validate(self, attrs):
+        sections = attrs.get("sections")
+        if sections is None:
+            return attrs
+        positions = [sec["position"] for sec in sections]
+        if len(set(positions)) != len(positions):
+            raise serializers.ValidationError(
+                {"sections": "Each section position must be unique within a template."}
+            )
+        return attrs
+
+    def validate_slug(self, value: str):
+        from django.utils.text import slugify
+
+        return slugify(value) if value else value
+
+    def create(self, validated_data):
+        from django.utils.text import slugify
+
+        sections = validated_data.pop("sections", [])
+        validated_data.pop("is_global", None)
+        slug = validated_data.pop("slug", "")
+        if not slug:
+            slug = slugify(validated_data["name"])
+        template = ProjectStructureTemplate.objects.create(slug=slug, **validated_data)
+        self._replace_sections(template, sections)
+        return template
+
+    def update(self, instance, validated_data):
+        sections = validated_data.pop("sections", None)
+        validated_data.pop("is_global", None)
+        slug = validated_data.pop("slug", None)
+        for attr, value in validated_data.items():
+            setattr(instance, attr, value)
+        if slug is not None and slug != "":
+            instance.slug = slug
+        instance.save()
+        if sections is not None:
+            self._replace_sections(instance, sections)
+        return instance
+
+    def _replace_sections(self, template: ProjectStructureTemplate, sections: list[dict]):
+        template.sections.all().delete()
+        for sec in sorted(sections, key=lambda s: s["position"]):
+            ProjectStructureSection.objects.create(
+                template=template,
+                title=sec["title"],
+                description=sec.get("description", ""),
+                position=sec["position"],
+                suggested_skill_slugs=sec.get("suggested_skill_slugs", []),
+            )
 
 
 # ---------------------------------------------------------------------------

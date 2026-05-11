@@ -13,6 +13,7 @@ from apps.chat.services.copilot_tools import (
     CopilotToolContext,
     execute_copilot_tool,
 )
+from apps.chat.services.rag import suggest_related_library_documents
 from apps.document.models import Document
 from apps.document.utils.client_openia import generate_with_tools
 from apps.project.models import Project, ProjectSection
@@ -278,6 +279,16 @@ def process_copilot_message(
         "tools_used": len(tool_ctx.additional_chunks) > 0,
         "chunks_retrieved": len(tool_ctx.additional_chunks),
     }
+    try:
+        recs = suggest_related_library_documents(
+            user=user,
+            query_text=user_content,
+            exclude_document_ids=[d.id for d in documents],
+        )
+        if recs:
+            metadata["recommended_documents"] = recs
+    except Exception as rec_exc:
+        logger.warning("Copilot: recomendaciones de biblioteca omitidas: %s", rec_exc)
     if draft_markdown is not None:
         metadata["draft_markdown"] = draft_markdown
         metadata["draft_section_position"] = draft_section_position

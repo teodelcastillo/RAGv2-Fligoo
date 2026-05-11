@@ -23,7 +23,7 @@ from apps.chat.api.serializers import (
 from apps.chat.models import ChatMessage, ChatSession, MessageRole, touch_chat_session_activity
 from apps.chat.services.context_builder import build_citation_prompt
 from apps.chat.services.query_analysis import COVERAGE_MODE_ALL, classify_query
-from apps.chat.services.rag import RetrievalResult, retrieve_for_chat
+from apps.chat.services.rag import RetrievalResult, retrieve_for_chat, suggest_related_library_documents
 from apps.document.models import Document
 from apps.document.utils import client_openia
 
@@ -93,6 +93,11 @@ def _build_coverage_instruction(session: ChatSession, retrieval: RetrievalResult
     )
 
 
+def _workspace_session(session: ChatSession) -> bool:
+    """Sesión ligada a proyecto o repositorio: tiene sentido sugerir docs de la biblioteca global."""
+    return session.project_id is not None or session.repository_id is not None
+
+
 def _run_retrieval(
     session: ChatSession,
     content: str,
@@ -108,13 +113,27 @@ def _run_retrieval(
     if not allowed_docs.exists():
         return RetrievalResult()
     try:
-        return retrieve_for_chat(
+        result = retrieve_for_chat(
             user=user,
             query_text=content,
             allowed_documents=allowed_docs,
             response_mode=response_mode,
             **_chat_retrieval_params(session, content, response_mode=response_mode),
         )
+        if _workspace_session(session):
+            try:
+                result.recommended_documents = suggest_related_library_documents(
+                    user=user,
+                    query_text=content,
+                    exclude_document_ids=list(allowed_docs.values_list("id", flat=True)),
+                )
+            except Exception as rec_exc:
+                logger.warning(
+                    "Recomendaciones de biblioteca omitidas (session=%s): %s",
+                    session.id,
+                    rec_exc,
+                )
+        return result
     except Exception as exc:
         logger.exception("Chat RAG pipeline failed (session=%s): %s", session.id, exc)
         return RetrievalResult()
@@ -321,6 +340,8 @@ class ChatMessageViewSet(
                 metadata["query_analysis"] = retrieval.analysis.to_dict()
             if response_mode:
                 metadata["response_mode"] = response_mode
+            if retrieval.recommended_documents:
+                metadata["recommended_documents"] = retrieval.recommended_documents
 
             assistant_message = ChatMessage.objects.create(
                 session=session,
@@ -442,6 +463,8 @@ class ChatMessageStreamView(APIView):
                     metadata["query_analysis"] = retrieval.analysis.to_dict()
                 if response_mode:
                     metadata["response_mode"] = response_mode
+                if retrieval.recommended_documents:
+                    metadata["recommended_documents"] = retrieval.recommended_documents
                 assistant_message = ChatMessage.objects.create(
                     session=session,
                     role=MessageRole.ASSISTANT,

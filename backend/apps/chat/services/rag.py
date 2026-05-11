@@ -22,6 +22,7 @@ import logging
 import os
 import re
 import time
+from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Iterable, List
 
@@ -89,6 +90,7 @@ class RetrievalResult:
     context_block: str = ""
     analysis: QueryAnalysis | None = None
     diagnostics: dict = field(default_factory=dict)
+    recommended_documents: list[dict] = field(default_factory=list)
 
     @property
     def chunk_ids(self) -> List[int]:
@@ -97,6 +99,94 @@ class RetrievalResult:
     @property
     def covered_document_ids(self) -> set:
         return {c.document_id for c in self.chunks}
+
+
+def suggest_related_library_documents(
+    *,
+    user,
+    query_text: str,
+    exclude_document_ids: Iterable[int],
+    top_n: int | None = None,
+    chunk_pool: int | None = None,
+    doc_pool: int | None = None,
+) -> list[dict]:
+    """
+    Busca en toda la biblioteca accesible fragmentos similares a la pregunta,
+    excluyendo documentos ya vinculados a la sesión/proyecto. Devuelve filas
+    ``{id, slug, name, relevance_score}`` para mostrar como "documentos relacionados".
+    """
+    from apps.document.services import accessible_library_documents
+
+    text = (query_text or "").strip()
+    if not text:
+        return []
+
+    exclude = {int(x) for x in exclude_document_ids}
+    top_n = top_n or int(os.environ.get("CHAT_LIBRARY_RECOMMEND_TOP_DOCS", "5"))
+    chunk_pool = chunk_pool or int(os.environ.get("CHAT_LIBRARY_RECOMMEND_CHUNK_POOL", "56"))
+    doc_pool = doc_pool or int(os.environ.get("CHAT_LIBRARY_RECOMMEND_DOC_POOL", "500"))
+
+    lib = accessible_library_documents(user).exclude(id__in=exclude)
+    lib = lib.filter(chunks__embedding__isnull=False).distinct()
+    candidate_ids = list(lib.values_list("id", flat=True)[:doc_pool])
+    if not candidate_ids:
+        return []
+
+    chunk_qs = SmartChunk.objects.filter(document_id__in=candidate_ids).exclude(
+        embedding__isnull=True
+    )
+    if not user.is_staff:
+        from apps.project.models import ProjectShare
+
+        shared_project_ids = ProjectShare.objects.filter(user=user).values_list(
+            "project_id", flat=True
+        )
+        chunk_qs = chunk_qs.filter(
+            Q(document__owner=user)
+            | Q(document__is_public=True)
+            | Q(document__shares__user=user)
+            | Q(document__projects__id__in=shared_project_ids)
+        ).distinct()
+
+    chunks = list(chunk_qs.top_similar(text, top_n=chunk_pool))
+    if not chunks:
+        return []
+
+    doc_scores: dict[int, float] = defaultdict(float)
+    doc_hits: dict[int, int] = defaultdict(int)
+    for chunk in chunks:
+        dist = getattr(chunk, "distance", None)
+        if dist is not None:
+            sim = max(0.0, 1.0 - float(dist))
+        else:
+            sim = 0.5
+        doc_scores[chunk.document_id] += sim
+        doc_hits[chunk.document_id] += 1
+
+    ranked_ids = sorted(
+        doc_scores.keys(),
+        key=lambda did: (doc_scores[did], doc_hits[did]),
+        reverse=True,
+    )[:top_n]
+
+    rows = list(Document.objects.filter(id__in=ranked_ids).values("id", "slug", "name"))
+    by_id = {r["id"]: r for r in rows}
+    out: list[dict] = []
+    for did in ranked_ids:
+        row = by_id.get(did)
+        if not row:
+            continue
+        raw = doc_scores[did]
+        relevance_score = min(100, round(20.0 * raw + 5 * doc_hits[did]))
+        out.append(
+            {
+                "id": row["id"],
+                "slug": row["slug"],
+                "name": row["name"],
+                "relevance_score": max(1, relevance_score),
+            }
+        )
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -488,4 +578,5 @@ __all__ = [
     "fetch_relevant_chunks",
     "is_general_query",
     "retrieve_for_chat",
+    "suggest_related_library_documents",
 ]

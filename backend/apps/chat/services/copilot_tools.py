@@ -231,7 +231,7 @@ def _execute_search_documents(args: dict, ctx: CopilotToolContext) -> str:
             query_text=query,
             allowed_documents=ctx.allowed_documents,
             top_n=top_n,
-            retrieval_strategy="global",
+            retrieval_strategy="auto",
         )
     except Exception as exc:
         logger.warning("search_documents tool failed: %s", exc)

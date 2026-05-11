@@ -33,3 +33,24 @@ def accessible_documents_for(user, slugs: Iterable[str]) -> QuerySet[Document]:
         | Q(projects__id__in=shared_project_ids)
     ).distinct()
 
+
+def accessible_library_documents(user) -> QuerySet[Document]:
+    """
+    Full library visibility for the authenticated user (same rules as
+    ``DocumentListAPIView`` with scope ``all`` for non-staff).
+    """
+    qs = Document.objects.all()
+    if user.is_staff:
+        return qs
+    from apps.project.models import ProjectShare
+
+    shared_project_ids = ProjectShare.objects.filter(user=user).values_list(
+        "project_id", flat=True
+    )
+    return qs.filter(
+        Q(owner=user)
+        | Q(is_public=True)
+        | Q(shares__user=user)
+        | Q(projects__id__in=shared_project_ids)
+    ).distinct()
+

@@ -100,6 +100,13 @@ class ChatSession(models.Model):
         return f"{self.title} ({self.owner})"
 
 
+def touch_chat_session_activity(session_id: int) -> None:
+    """Actualiza ``updated_at`` para que los listados ordenen por última actividad."""
+    from django.utils import timezone
+
+    ChatSession.objects.filter(pk=session_id).update(updated_at=timezone.now())
+
+
 class ChatMessage(models.Model):
     session = models.ForeignKey(
         ChatSession,

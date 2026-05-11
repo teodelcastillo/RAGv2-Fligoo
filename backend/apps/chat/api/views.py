@@ -20,7 +20,7 @@ from apps.chat.api.serializers import (
     ChatSessionCreateSerializer,
     ChatSessionSerializer,
 )
-from apps.chat.models import ChatMessage, ChatSession, MessageRole
+from apps.chat.models import ChatMessage, ChatSession, MessageRole, touch_chat_session_activity
 from apps.chat.services.context_builder import build_citation_prompt
 from apps.chat.services.query_analysis import COVERAGE_MODE_ALL, classify_query
 from apps.chat.services.rag import RetrievalResult, retrieve_for_chat
@@ -227,7 +227,7 @@ class ChatSessionViewSet(
                 base = base.annotate(_ecofilia_msg_count=Count("messages")).filter(
                     _ecofilia_msg_count__gt=0
                 )
-        return base
+        return base.order_by("-updated_at", "-created_at", "-id")
 
     def get_serializer_class(self):
         if self.action == "create":
@@ -329,6 +329,7 @@ class ChatMessageViewSet(
                 chunk_ids=retrieval.chunk_ids,
                 metadata=metadata,
             )
+            touch_chat_session_activity(session.pk)
 
         response_payload = {
             "user_message": ChatMessageSerializer(user_message).data,
@@ -448,6 +449,7 @@ class ChatMessageStreamView(APIView):
                     chunk_ids=retrieval.chunk_ids,
                     metadata=metadata,
                 )
+                touch_chat_session_activity(session.pk)
                 yield _event(
                     {
                         "type": "done",

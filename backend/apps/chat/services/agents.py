@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Tuple
 
 from django.db import transaction
 
-from apps.chat.models import ChatMessage, ChatSession, MessageRole
+from apps.chat.models import ChatMessage, ChatSession, MessageRole, touch_chat_session_activity
 from apps.chat.services.context_builder import build_citation_prompt
 from apps.chat.services.rag import (
     MAX_CONTEXT_CHUNKS,
@@ -400,6 +400,8 @@ class ChatAgentService:
                 chunk_ids=unique_chunk_ids,
                 metadata=assistant_metadata,
             )
+
+        touch_chat_session_activity(self.session.pk)
 
         logger.info(
             "ChatAgentService completado en modo '%s' (pasos=%d, latencia_total=%.2fs, chunks=%d).",

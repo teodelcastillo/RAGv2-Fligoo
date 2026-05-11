@@ -58,6 +58,52 @@ def get_openai_client() -> OpenAI:
     return _client
 
 
+def generate_document_content_summary(
+    *,
+    title: str,
+    body_text: str,
+    max_input_chars: int | None = None,
+    model: str | None = None,
+    temperature: float = 0.2,
+) -> str:
+    """
+    Genera un resumen corto del documento para enriquecer embeddings (chunk inicial)
+    y APIs. No sustituye al campo ``description`` manual del usuario.
+    """
+    limit = max_input_chars or int(os.environ.get("DOCUMENT_SUMMARY_INPUT_CHARS", "14000"))
+    text = (body_text or "")[:limit].strip()
+    if not text:
+        return ""
+
+    title_clean = (title or "").strip() or "Sin título"
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "Eres un asistente que resume documentos para un sistema de búsqueda "
+                "(RAG). Escribe en español, entre 4 y 8 oraciones, sin saludos ni meta-comentarios. "
+                "Incluye: de qué trata el documento, tipo de instrumento o contenido "
+                "(informe, préstamo, norma, plan, etc.), país/región/sector si aparece, "
+                "y los temas centrales. Sé fiel al texto; no inventes datos."
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"Título o nombre del archivo: {title_clean}\n\n"
+                f"Extracto del documento (puede estar truncado):\n{text}"
+            ),
+        },
+    ]
+    completion, _ = generate_chat_completion(
+        messages,
+        model=model,
+        temperature=temperature,
+        max_tokens=int(os.environ.get("DOCUMENT_SUMMARY_MAX_TOKENS", "450")),
+    )
+    return (completion or "").strip()
+
+
 def embed_text(text: str, model: str | None = None) -> List[float]:
     """
     Generate embeddings for text using OpenAI's embedding model.

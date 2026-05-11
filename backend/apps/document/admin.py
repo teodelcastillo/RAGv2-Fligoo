@@ -17,7 +17,14 @@ class DocumentAdmin(admin.ModelAdmin):
     search_fields = ("name", "extracted_text", "extracted_text")
     list_filter = ("chunking_status", "chunking_done", "created_at")
     ordering = ("-created_at",)
-    readonly_fields = ("created_at", "chunking_status", "chunking_done", "last_error", "retry_count")
+    readonly_fields = (
+        "created_at",
+        "chunking_status",
+        "chunking_done",
+        "last_error",
+        "retry_count",
+        "content_summary",
+    )
 
     def created(self, obj):
         return obj.created_at.strftime("%Y/%m/%d %H:%M:%S")

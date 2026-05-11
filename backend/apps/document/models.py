@@ -40,6 +40,13 @@ class Document(models.Model):
         related_name="documents",
     )
     description = models.TextField(blank=True)
+    content_summary = models.TextField(
+        blank=True,
+        help_text=(
+            "Resumen automático del archivo al ingerirlo (para RAG y documentos relacionados). "
+            "Distinto del campo `description`, que suele ser manual."
+        ),
+    )
     file = models.FileField(upload_to='documents/', null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     extracted_text = models.TextField(blank=True)

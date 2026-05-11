@@ -6,9 +6,18 @@ from celery import shared_task
 from django.db import transaction
 from apps.document.models import Document, SmartChunk, ChunkingStatus
 from apps.document.utils.chunker import chunk_text_and_embed
+from apps.document.utils.client_openia import generate_document_content_summary
 from apps.document.utils.parser import parse_file
 
 logger = logging.getLogger(__name__)
+
+
+def _document_auto_summary_enabled() -> bool:
+    return str(os.environ.get("DOCUMENT_AUTO_SUMMARY", "1")).lower() in (
+        "1",
+        "true",
+        "yes",
+    )
 
 @shared_task(bind=True, max_retries=3, default_retry_delay=30)
 def process_document_chunks(self, doc_id: int) -> str:
@@ -42,7 +51,26 @@ def process_document_chunks(self, doc_id: int) -> str:
 
         text = parse_file(tmp_path) or ""
 
-        chunks = chunk_text_and_embed(text, doc.id) or []
+        content_summary = ""
+        if _document_auto_summary_enabled() and text.strip():
+            try:
+                content_summary = generate_document_content_summary(
+                    title=doc.name or doc.slug or "Sin título",
+                    body_text=text,
+                )
+            except Exception as sum_exc:
+                logger.warning(
+                    "Document %s: resumen automático omitido (%s)",
+                    doc_id,
+                    sum_exc,
+                )
+
+        chunks = chunk_text_and_embed(
+            text,
+            doc.id,
+            document_name=doc.name or "",
+            content_summary=content_summary or None,
+        ) or []
         if not chunks:
             logger.warning("No chunks produced for document %s.", doc_id)
 
@@ -54,6 +82,7 @@ def process_document_chunks(self, doc_id: int) -> str:
                 .filter(pk=doc_id)
                 .update(
                     extracted_text=text,
+                    content_summary=content_summary,
                     chunking_done=True,
                     chunking_status=ChunkingStatus.DONE,
                     last_error=""

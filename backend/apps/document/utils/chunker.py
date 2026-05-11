@@ -1,7 +1,6 @@
 from apps.document.models import SmartChunk
 from apps.document.utils.client_openia import embed_text
 from apps.document.utils.client_tiktoken import encode_text, decode_text, token_count
-import uuid
 
 
 def chunk_text(text: str, max_tokens: int = 500, overlap: int = 50)-> list[str]:
@@ -31,21 +30,54 @@ def chunk_text(text: str, max_tokens: int = 500, overlap: int = 50)-> list[str]:
     
 #     return result
 
-def chunk_text_and_embed(text: str, document_id: uuid.UUID) -> list[SmartChunk]:
-    raw_chunks = chunk_text(text)
-    result = [
-        SmartChunk(
-            document_id=document_id,
-            chunk_index=i,
-            content=chunk,
-            token_count=token_count(chunk),
-            embedding=embed_text(chunk),
+def chunk_text_and_embed(
+    text: str,
+    document_id: int,
+    *,
+    document_name: str = "",
+    content_summary: str | None = None,
+) -> list[SmartChunk]:
+    """
+    Parte el texto en chunks con embeddings. Si ``content_summary`` está presente,
+    inserta un primer fragmento con título + resumen para que la búsqueda vectorial
+    refleje el propósito del documento aunque el PDF empiece con portada o texto poco útil.
+    """
+    result: list[SmartChunk] = []
+    idx = 0
+    title = (document_name or "").strip()
+    summary = (content_summary or "").strip()
+    if summary:
+        parts: list[str] = []
+        if title:
+            parts.append(f"Documento: {title}")
+        parts.append(f"Resumen general: {summary}")
+        brief = "\n".join(parts)
+        result.append(
+            SmartChunk(
+                document_id=document_id,
+                chunk_index=idx,
+                content=brief,
+                token_count=token_count(brief),
+                embedding=embed_text(brief),
+            )
         )
-        for i, chunk in enumerate(raw_chunks)
-    ]
+        idx += 1
+
+    raw_chunks = chunk_text(text)
+    for chunk in raw_chunks:
+        result.append(
+            SmartChunk(
+                document_id=document_id,
+                chunk_index=idx,
+                content=chunk,
+                token_count=token_count(chunk),
+                embedding=embed_text(chunk),
+            )
+        )
+        idx += 1
     return result
 
-def chunk_text_and_embed_origin(text: str, document_id: uuid.UUID) -> list[SmartChunk]:
+def chunk_text_and_embed_origin(text: str, document_id: int) -> list[SmartChunk]:
     raw_chunks = chunk_text(text)
     result = [
         SmartChunk(

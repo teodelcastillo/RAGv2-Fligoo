@@ -238,6 +238,7 @@ class DocumentSerializer(serializers.ModelSerializer):
             'category_slug',
             'category_path',
             'description',
+            'content_summary',
             'file',
             'is_public',
             'is_owner',
@@ -259,6 +260,7 @@ class DocumentSerializer(serializers.ModelSerializer):
             'name',
             'category',
             'description',
+            'content_summary',
         ]
     
     def get_is_owner(self, obj):
@@ -299,6 +301,7 @@ class DocumentDetailSerializer(serializers.ModelSerializer):
             'category_slug',
             'category_path',
             'description',
+            'content_summary',
             'file',
             'created_at',
             'chunking_status',
@@ -313,6 +316,7 @@ class DocumentDetailSerializer(serializers.ModelSerializer):
             'chunking_status',
             'chunking_done',
             'owner_email',
+            'content_summary',
         ]
 
     def get_category_slug(self, obj):

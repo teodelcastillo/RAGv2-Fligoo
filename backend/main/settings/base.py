@@ -283,6 +283,9 @@ EMAIL_BACKEND = os.environ.get(
 AWS_SES_REGION_NAME = os.environ.get("AWS_SES_REGION_NAME", "us-east-2")
 AWS_SES_REGION_ENDPOINT = f"email.{AWS_SES_REGION_NAME}.amazonaws.com"
 AWS_SES_FROM_EMAIL = DEFAULT_FROM_EMAIL
+# Deshabilita la llamada a ses:GetSendQuota que django-ses hace para throttling.
+# El task role solo necesita ses:SendEmail y ses:SendRawEmail.
+AWS_SES_AUTO_THROTTLE = None
 
 SECURE_SSL_REDIRECT = _env_bool("SECURE_SSL_REDIRECT", "False")
 SESSION_COOKIE_SECURE = _env_bool("SESSION_COOKIE_SECURE", "False")

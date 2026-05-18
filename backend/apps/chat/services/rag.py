@@ -429,7 +429,12 @@ def retrieve_for_chat(
 
     # Sizing the candidate pools.
     base_top_n = top_n or MAX_CONTEXT_CHUNKS
-    if requires_all_docs:
+    multi_doc = len(doc_ids) > 1
+    if requires_all_docs and multi_doc:
+        # Coverage mode makes sense only with multiple documents: ensure at
+        # least one chunk per document.  For single-document sessions we keep
+        # the caller-supplied limits so "give me a summary" still retrieves
+        # enough chunks instead of being hard-capped to 1.
         base_top_n = max(base_top_n, len(doc_ids))
         total_limit = max(total_limit or base_top_n, len(doc_ids))
         max_chunks_per_doc = 1
@@ -446,7 +451,7 @@ def retrieve_for_chat(
     # Strategy: panorama/comparative -> hybrid_per_document; else auto.
     vector_strategy = (
         "hybrid_per_document"
-        if requires_all_docs or analysis.query_type == QUERY_TYPE_PANORAMA or len(doc_ids) > 3
+        if (requires_all_docs and multi_doc) or analysis.query_type == QUERY_TYPE_PANORAMA or len(doc_ids) > 3
         else "auto"
     )
 
@@ -454,9 +459,9 @@ def retrieve_for_chat(
     vector_lists: list[list[SmartChunk]] = []
     for q in queries:
         try:
-            vector_total_limit = len(doc_ids) if requires_all_docs else vector_per_query
-            vector_k_per_doc = 1 if requires_all_docs else k_per_doc
-            vector_max_per_doc = 1 if requires_all_docs else max(2, k_per_doc + 1)
+            vector_total_limit = len(doc_ids) if (requires_all_docs and multi_doc) else vector_per_query
+            vector_k_per_doc = 1 if (requires_all_docs and multi_doc) else k_per_doc
+            vector_max_per_doc = 1 if (requires_all_docs and multi_doc) else max(2, k_per_doc + 1)
             v_chunks = fetch_relevant_chunks(
                 user=user,
                 query_text=q,
@@ -504,14 +509,14 @@ def retrieve_for_chat(
         diagnostics["reranked"] = True
 
     # --- Diversity / per-doc cap ---
-    safe_per_doc = max_chunks_per_doc or max(1, min(3, k_per_doc + 1))
+    safe_per_doc = max_chunks_per_doc if max_chunks_per_doc else max(1, min(3, k_per_doc + 1))
     capped = cap_per_document(
         fused,
         max_per_doc=safe_per_doc,
         total_limit=safe_total,
     )
 
-    if requires_all_docs:
+    if requires_all_docs and multi_doc:
         covered_ids = {c.document_id for c in capped}
         target_count = max(1, int(round(len(doc_ids) * RAG_ALL_DOCS_MIN_COVERAGE_RATIO)))
         missing_doc_ids = [doc_id for doc_id in doc_ids if doc_id not in covered_ids]

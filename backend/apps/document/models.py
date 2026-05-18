@@ -192,6 +192,10 @@ class SmartChunk(models.Model):
     title = models.CharField(max_length=255, blank=True, null=True)
     summary = models.TextField(blank=True)
     keywords = ArrayField(models.TextField(), blank=True, default=list)
+    context_summary = models.TextField(
+        blank=True,
+        default="",
+    )
     embedding = VectorField(dimensions=1536, blank=True, null=True)
     created_at = models.DateTimeField(auto_now_add=True)
 

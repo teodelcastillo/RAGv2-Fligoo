@@ -1,9 +1,13 @@
+import logging
+
 from apps.document.models import SmartChunk
-from apps.document.utils.client_openia import embed_text
+from apps.document.utils.client_openia import embed_text, generate_chunk_context
 from apps.document.utils.client_tiktoken import encode_text, decode_text, token_count
 
+logger = logging.getLogger(__name__)
 
-def chunk_text(text: str, max_tokens: int = 500, overlap: int = 50)-> list[str]:
+
+def chunk_text(text: str, max_tokens: int = 500, overlap: int = 100)-> list[str]:
     tokens = encode_text(text)
     chunks = []
     i = 0
@@ -65,13 +69,26 @@ def chunk_text_and_embed(
 
     raw_chunks = chunk_text(text)
     for chunk in raw_chunks:
+        ctx = ""
+        try:
+            ctx = generate_chunk_context(
+                chunk_content=chunk,
+                doc_name=document_name,
+                doc_summary=content_summary or "",
+                chunk_index=idx,
+            )
+        except Exception as exc:
+            logger.warning("Chunk context generation failed for chunk %d: %s", idx, exc)
+
+        embed_input = f"{ctx}\n\n{chunk}" if ctx else chunk
         result.append(
             SmartChunk(
                 document_id=document_id,
                 chunk_index=idx,
                 content=chunk,
+                context_summary=ctx,
                 token_count=token_count(chunk),
-                embedding=embed_text(chunk),
+                embedding=embed_text(embed_input),
             )
         )
         idx += 1

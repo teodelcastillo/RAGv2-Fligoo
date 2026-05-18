@@ -104,6 +104,60 @@ def generate_document_content_summary(
     return (completion or "").strip()
 
 
+def generate_chunk_context(
+    chunk_content: str,
+    doc_name: str,
+    doc_summary: str,
+    chunk_index: int,
+    *,
+    model: str | None = None,
+    max_tokens: int = 150,
+) -> str:
+    """
+    Genera 2-3 oraciones que sitúan un chunk dentro de su documento.
+    Se usa para contextual retrieval: el resultado se antepone al contenido
+    del chunk tanto en el embedding como en el prompt del LLM.
+    """
+    content = (chunk_content or "").strip()[:1200]
+    if not content:
+        return ""
+
+    title = (doc_name or "").strip() or "Sin título"
+    summary = (doc_summary or "").strip()[:500] or "No disponible"
+
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "Eres un asistente especializado en análisis de documentos ESG y sostenibilidad. "
+                "Tu tarea es situar un fragmento de texto dentro de su documento para mejorar "
+                "la comprensión contextual en un sistema RAG. "
+                "Responde ÚNICAMENTE con 2-3 oraciones concisas. Sin introducción ni explicación adicional."
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f'Documento: "{title}"\n'
+                f"Resumen del documento: {summary}\n\n"
+                f"Fragmento #{chunk_index + 1}:\n{content}\n\n"
+                "Escribe 2-3 oraciones que expliquen qué sección o tema del documento representa "
+                "este fragmento y qué información concreta aporta."
+            ),
+        },
+    ]
+    try:
+        result, _ = generate_chat_completion(
+            messages,
+            model=model,
+            temperature=0.1,
+            max_tokens=max_tokens,
+        )
+        return (result or "").strip()
+    except Exception:
+        return ""
+
+
 def embed_text(text: str, model: str | None = None) -> List[float]:
     """
     Generate embeddings for text using OpenAI's embedding model.

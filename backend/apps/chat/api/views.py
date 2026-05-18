@@ -22,7 +22,7 @@ from apps.chat.api.serializers import (
 )
 from apps.chat.models import ChatMessage, ChatSession, MessageRole, touch_chat_session_activity
 from apps.chat.services.context_builder import build_citation_prompt
-from apps.chat.services.query_analysis import COVERAGE_MODE_ALL, classify_query
+from apps.chat.services.query_analysis import COVERAGE_MODE_ALL, classify_query, contextualize_query
 from apps.chat.services.rag import RetrievalResult, retrieve_for_chat, suggest_related_library_documents
 from apps.document.models import Document
 from apps.document.utils import client_openia
@@ -49,15 +49,19 @@ def _chat_retrieval_params(
     if analysis.coverage_mode == COVERAGE_MODE_ALL:
         total_limit = doc_count
         max_chunks_per_doc = 1
+    elif doc_count == 1:
+        # Single-document chat: retrieve more chunks for richer context
+        total_limit = 10
+        max_chunks_per_doc = 10
     else:
         total_limit = min(18, max(8, doc_count * 2))
         max_chunks_per_doc = 2
-    if not broad_question and analysis.coverage_mode != COVERAGE_MODE_ALL:
+    if not broad_question and analysis.coverage_mode != COVERAGE_MODE_ALL and doc_count > 1:
         total_limit = min(total_limit, 12)
     return {
         "top_n": total_limit,
         "total_limit": total_limit,
-        "k_per_doc": 2,
+        "k_per_doc": max_chunks_per_doc,
         "max_chunks_per_doc": max_chunks_per_doc,
     }
 
@@ -112,13 +116,27 @@ def _run_retrieval(
     allowed_docs = session.allowed_documents.all()
     if not allowed_docs.exists():
         return RetrievalResult()
+
+    retrieval_query = content
+    history_qs = (
+        session.messages
+        .exclude(role=MessageRole.SYSTEM)
+        .order_by("-created_at")[:6]
+    )
+    history = [
+        {"role": str(m.role), "content": m.content or ""}
+        for m in reversed(list(history_qs))
+    ]
+    if history:
+        retrieval_query = contextualize_query(content, history)
+
     try:
         result = retrieve_for_chat(
             user=user,
-            query_text=content,
+            query_text=retrieval_query,
             allowed_documents=allowed_docs,
             response_mode=response_mode,
-            **_chat_retrieval_params(session, content, response_mode=response_mode),
+            **_chat_retrieval_params(session, retrieval_query, response_mode=response_mode),
         )
         if _workspace_session(session):
             try:
@@ -157,16 +175,31 @@ def _compose_messages(
     ]
 
     if retrieval.context_block:
+        doc_count = session.allowed_documents.count()
+        if doc_count == 1:
+            single_doc = session.allowed_documents.first()
+            doc_label = f'del documento "{single_doc.name}"' if single_doc else "del documento"
+            context_preamble = (
+                f"El siguiente contexto proviene {doc_label}. "
+                "Este es el único documento en esta sesión. Todas las preguntas del usuario son sobre este documento exclusivamente. "
+                "Basate en este contexto para responder con precisión. "
+                "Si la información solicitada no aparece en el contexto, indícalo claramente. "
+                "No hagas referencia a otros documentos ni a información que no esté en este contexto. "
+            )
+        else:
+            context_preamble = (
+                "El siguiente contexto proviene de los documentos del usuario. "
+                "Prioriza este contexto para responder. "
+                "Si la información del contexto es suficiente, basate principalmente en ella. "
+                "Si el contexto no contiene información relevante o es insuficiente, "
+                "puedes complementar con tu conocimiento general, pero indica claramente "
+                "qué parte proviene del documento y qué parte de tu conocimiento general. "
+            )
         base_messages.append(
             {
                 "role": str(MessageRole.SYSTEM),
                 "content": (
-                    "El siguiente contexto proviene de los documentos del usuario. "
-                    "Prioriza este contexto para responder. "
-                    "Si la información del contexto es suficiente, basate principalmente en ella. "
-                    "Si el contexto no contiene información relevante o es insuficiente, "
-                    "puedes complementar con tu conocimiento general, pero indica claramente "
-                    "qué parte proviene del documento y qué parte de tu conocimiento general. "
+                    context_preamble
                     + build_citation_prompt()
                     + _build_coverage_instruction(session, retrieval)
                     + f"\n\n{retrieval.context_block}"

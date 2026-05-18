@@ -294,6 +294,73 @@ def expand_query_with_llm(
     return []
 
 
+def contextualize_query(
+    current_query: str,
+    history: list[dict],
+    *,
+    model: str | None = None,
+) -> str:
+    """
+    Rewrite a follow-up question as a standalone query using conversation
+    history. If the question is already self-contained, returns it unchanged.
+
+    ``history`` is a list of ``{"role": "user"|"assistant", "content": ...}``
+    messages, most recent last. Only the last few turns are used.
+    """
+    text = (current_query or "").strip()
+    if not text:
+        return text
+
+    if not history:
+        return text
+
+    recent = history[-6:]
+
+    history_block = "\n".join(
+        f"{'Usuario' if m['role'] == 'user' else 'Asistente'}: {(m.get('content') or '')[:300]}"
+        for m in recent
+    )
+
+    try:
+        from apps.document.utils.client_openia import generate_chat_completion
+
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "Tu tarea es reformular la última pregunta del usuario para que sea "
+                    "una consulta de búsqueda autocontenida, incorporando contexto del "
+                    "historial de conversación cuando sea necesario. "
+                    "Si la pregunta ya es autocontenida, devuélvela tal cual. "
+                    "Responde ÚNICAMENTE con la consulta reformulada, sin explicaciones."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Historial de conversación:\n{history_block}\n\n"
+                    f"Última pregunta del usuario: {text}\n\n"
+                    "Consulta reformulada:"
+                ),
+            },
+        ]
+        result, _ = generate_chat_completion(
+            messages,
+            model=model or os.environ.get("RAG_QUERY_REWRITE_MODEL", "gpt-4o-mini"),
+            temperature=0.0,
+            max_tokens=200,
+            timeout=10,
+        )
+        rewritten = (result or "").strip()
+        if rewritten:
+            logger.debug("Query rewrite: %r -> %r", text, rewritten)
+            return rewritten
+    except Exception as exc:
+        logger.warning("Query contextualization failed, using original: %s", exc)
+
+    return text
+
+
 def build_query_set(analysis: QueryAnalysis) -> List[str]:
     """
     Produce the final list of search queries to execute.

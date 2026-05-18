@@ -2,11 +2,16 @@ from __future__ import annotations
 import logging
 import os
 import tempfile
+import time
 from celery import shared_task
 from django.db import transaction
 from apps.document.models import Document, SmartChunk, ChunkingStatus
 from apps.document.utils.chunker import chunk_text_and_embed
-from apps.document.utils.client_openia import generate_document_content_summary
+from apps.document.utils.client_openia import (
+    embed_text,
+    generate_chunk_context,
+    generate_document_content_summary,
+)
 from apps.document.utils.parser import parse_file
 
 logger = logging.getLogger(__name__)
@@ -113,3 +118,59 @@ def process_document_chunks(self, doc_id: int) -> str:
                 os.remove(tmp_path)
             except Exception:
                 logger.warning("Could not remove temp file %s", tmp_path)
+
+
+@shared_task(bind=True, max_retries=3, default_retry_delay=60)
+def backfill_chunk_context_for_document(self, doc_id: int, batch_size: int = 50) -> str:
+    try:
+        doc = Document.objects.get(pk=doc_id)
+    except Document.DoesNotExist:
+        logger.error("Backfill: document %s not found.", doc_id)
+        return "missing"
+
+    doc_name = doc.name or doc.slug or ""
+    doc_summary = doc.content_summary or ""
+
+    qs = SmartChunk.objects.filter(
+        document_id=doc_id,
+        context_summary="",
+    ).order_by("chunk_index")
+
+    total = qs.count()
+    if total == 0:
+        logger.info("Backfill: document %s has no chunks pending.", doc_id)
+        return "already_done"
+
+    logger.info("Backfill: document %s — %d chunks pending.", doc_id, total)
+    processed = 0
+
+    while True:
+        batch = list(qs[:batch_size])
+        if not batch:
+            break
+
+        for chunk in batch:
+            ctx = generate_chunk_context(
+                chunk_content=chunk.content or "",
+                doc_name=doc_name,
+                doc_summary=doc_summary,
+                chunk_index=chunk.chunk_index,
+            )
+            if not ctx:
+                continue
+
+            embed_input = f"{ctx}\n\n{chunk.content}"
+            new_embedding = embed_text(embed_input)
+
+            SmartChunk.objects.filter(pk=chunk.pk).update(
+                context_summary=ctx,
+                embedding=new_embedding,
+            )
+            processed += 1
+            time.sleep(0.5)
+
+    logger.info(
+        "Backfill: document %s complete — %d/%d chunks enriched.",
+        doc_id, processed, total,
+    )
+    return f"ok:{processed}/{total}"

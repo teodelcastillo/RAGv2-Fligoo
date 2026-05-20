@@ -167,7 +167,8 @@ def backfill_chunk_context_for_document(self, doc_id: int, batch_size: int = 50)
                 embedding=new_embedding,
             )
             processed += 1
-            time.sleep(0.5)
+            sleep_secs = float(os.environ.get("BACKFILL_CHUNK_SLEEP", "2.0"))
+            time.sleep(sleep_secs)
 
     logger.info(
         "Backfill: document %s complete — %d/%d chunks enriched.",

@@ -302,6 +302,10 @@ class EvaluationShareSerializer(serializers.ModelSerializer):
         read_only_fields = ("id", "user_email", "created_at")
 
 
+class EvaluationShareRoleUpdateSerializer(serializers.Serializer):
+    role = serializers.ChoiceField(choices=EvaluationShareRole.choices)
+
+
 class EvaluationShareWriteSerializer(serializers.Serializer):
     user_email = serializers.EmailField()
     role = serializers.ChoiceField(choices=EvaluationShareRole.choices)

@@ -437,6 +437,10 @@ class DocumentShareSerializer(serializers.ModelSerializer):
         read_only_fields = ("id", "user_email", "created_at")
 
 
+class DocumentShareRoleUpdateSerializer(serializers.Serializer):
+    role = serializers.ChoiceField(choices=DocumentShareRole.choices)
+
+
 class DocumentShareWriteSerializer(serializers.Serializer):
     """Serializer for creating/updating document shares"""
     user_email = serializers.EmailField()

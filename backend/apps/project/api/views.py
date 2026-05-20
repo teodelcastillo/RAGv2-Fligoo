@@ -27,6 +27,7 @@ from apps.project.api.serializers import (
     ProjectSectionSerializer,
     ProjectSectionUpdateSerializer,
     ProjectSerializer,
+    ProjectShareRoleUpdateSerializer,
     ProjectShareSerializer,
     ProjectShareWriteSerializer,
     ProjectWriteSerializer,
@@ -184,10 +185,7 @@ class ProjectViewSet(viewsets.ModelViewSet):
         share = get_object_or_404(ProjectShare, project=project, pk=share_id)
 
         if request.method == "PATCH":
-            serializer = ProjectShareWriteSerializer(
-                data=request.data,
-                context={"project": project},
-            )
+            serializer = ProjectShareRoleUpdateSerializer(data=request.data)
             serializer.is_valid(raise_exception=True)
             share.role = serializer.validated_data["role"]
             share.save(update_fields=["role"])
@@ -203,7 +201,7 @@ class ProjectViewSet(viewsets.ModelViewSet):
         url_name="skill-executions",
     )
     def skill_executions(self, request, slug=None):
-        """List skill executions for this project (current user only; staff sees all)."""
+        """List skill executions for this project (shared collaborators see all runs)."""
         project = self.get_object()
         if not project.can_view(request.user):
             raise PermissionDenied("No tienes permisos para ver este proyecto.")
@@ -213,8 +211,6 @@ class ProjectViewSet(viewsets.ModelViewSet):
             SkillExecution.objects.filter(project=project)
             .select_related("skill", "owner", "document")
         )
-        if not request.user.is_staff:
-            qs = qs.filter(owner=request.user)
         executions = qs.order_by("-created_at")
         serializer = SkillExecutionSerializer(executions, many=True)
         return Response(serializer.data)
@@ -226,7 +222,7 @@ class ProjectViewSet(viewsets.ModelViewSet):
         url_name="evaluation-runs",
     )
     def evaluation_runs(self, request, slug=None):
-        """Runs de evaluación en este proyecto (solo del usuario; staff ve todos)."""
+        """Runs de evaluación en este proyecto (colaboradores con acceso ven todos)."""
         project = self.get_object()
 
         if not project.can_view(request.user):
@@ -242,8 +238,6 @@ class ProjectViewSet(viewsets.ModelViewSet):
                 )
             )
         )
-        if not request.user.is_staff:
-            qs = qs.filter(owner=request.user)
         runs = qs.order_by("-created_at")
 
         serializer = EvaluationRunSerializer(runs, many=True)

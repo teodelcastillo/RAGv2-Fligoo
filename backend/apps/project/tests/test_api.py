@@ -104,7 +104,7 @@ class ProjectAPITestCase(APITestCase):
     def test_share_management(self):
         project = Project.objects.create(owner=self.owner, name="Proyecto Share")
         url = reverse("project-shares", kwargs={"slug": project.slug})
-        payload = {"user_id": self.viewer.id, "role": ProjectShareRole.EDITOR}
+        payload = {"user_email": self.viewer.email, "role": ProjectShareRole.EDITOR}
         response = self.client.post(url, payload, format="json")
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
         self.assertEqual(response.data["role"], ProjectShareRole.EDITOR)
@@ -120,7 +120,7 @@ class ProjectAPITestCase(APITestCase):
         )
         patch_response = self.client.patch(
             detail_url,
-            {"role": ProjectShareRole.VIEWER, "user_id": self.viewer.id},
+            {"role": ProjectShareRole.VIEWER},
             format="json",
         )
         self.assertEqual(patch_response.status_code, status.HTTP_200_OK)
@@ -128,4 +128,29 @@ class ProjectAPITestCase(APITestCase):
 
         delete_response = self.client.delete(detail_url)
         self.assertEqual(delete_response.status_code, status.HTTP_204_NO_CONTENT)
+
+    def test_shared_viewer_sees_all_skill_executions(self):
+        from apps.skill.models import ExecutionStatus, Skill, SkillExecution, SkillType
+
+        project = Project.objects.create(owner=self.owner, name="Proyecto Outputs")
+        project.shares.create(user=self.viewer, role=ProjectShareRole.VIEWER)
+        skill = Skill.objects.create(
+            name="Test Skill",
+            slug="test-skill-exec",
+            skill_type=SkillType.QUICK,
+            allowed_contexts=["project"],
+            owner=self.owner,
+        )
+        SkillExecution.objects.create(
+            skill=skill,
+            owner=self.owner,
+            project=project,
+            status=ExecutionStatus.COMPLETED,
+        )
+
+        self.client.force_authenticate(self.viewer)
+        url = reverse("project-skill-executions", kwargs={"slug": project.slug})
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data), 1)
 

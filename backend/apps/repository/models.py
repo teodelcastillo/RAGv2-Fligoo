@@ -16,11 +16,13 @@ class RepositoryType(models.TextChoices):
 
 class RepositoryQuerySet(models.QuerySet):
     def for_user(self, user):
-        """Return all PUBLIC repositories plus the user's own PRIVATE ones."""
+        """Return PUBLIC repositories, owned PRIVATE repos, and shared PRIVATE repos."""
         if user.is_staff:
             return self
         return self.filter(
-            Q(repo_type=RepositoryType.PUBLIC) | Q(owner=user)
+            Q(repo_type=RepositoryType.PUBLIC)
+            | Q(owner=user)
+            | Q(shares__user=user)
         ).distinct()
 
 
@@ -87,16 +89,65 @@ class Repository(models.Model):
             counter += 1
         return slug
 
+    def can_view(self, user) -> bool:
+        if user.is_staff:
+            return True
+        if self.repo_type == RepositoryType.PUBLIC:
+            return True
+        if self.owner_id == user.id:
+            return True
+        return self.shares.filter(user=user).exists()
+
     def can_edit(self, user) -> bool:
         if user.is_staff:
             return True
         if self.repo_type == RepositoryType.PUBLIC:
             return False
-        return self.owner_id == user.id
+        if self.owner_id == user.id:
+            return True
+        return self.shares.filter(
+            user=user, role=RepositoryShareRole.EDITOR
+        ).exists()
+
+    def can_manage_shares(self, user) -> bool:
+        if self.repo_type == RepositoryType.PUBLIC:
+            return user.is_staff
+        return user.is_staff or self.owner_id == user.id
 
     def can_manage_sources(self, user) -> bool:
-        """Toggle active sources. Owners can manage their PRIVATE repos."""
+        """Toggle active sources. Owners and editors can manage PRIVATE repos."""
         return self.can_edit(user)
+
+
+class RepositoryShareRole(models.TextChoices):
+    VIEWER = "viewer", _("Viewer")
+    EDITOR = "editor", _("Editor")
+
+
+class RepositoryShare(models.Model):
+    repository = models.ForeignKey(
+        Repository,
+        related_name="shares",
+        on_delete=models.CASCADE,
+    )
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        related_name="repository_shares",
+        on_delete=models.CASCADE,
+    )
+    role = models.CharField(
+        max_length=20,
+        choices=RepositoryShareRole.choices,
+        default=RepositoryShareRole.VIEWER,
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        unique_together = ("repository", "user")
+        ordering = ("repository", "user")
+
+    def __str__(self) -> str:
+        return f"{self.repository_id}-{self.user_id}-{self.role}"
 
 
 class RepositoryDocument(models.Model):

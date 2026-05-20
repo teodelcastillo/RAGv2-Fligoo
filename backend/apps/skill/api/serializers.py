@@ -440,31 +440,41 @@ class RunSkillSerializer(serializers.Serializer):
     def validate(self, attrs):
         context_type = attrs["context_type"]
         context_slug = attrs["context_slug"]
+        user = self.context["request"].user
 
         if context_type == "repository":
             from apps.repository.models import Repository
             try:
-                attrs["repository"] = Repository.objects.for_user(
-                    self.context["request"].user
-                ).get(slug=context_slug)
+                repository = Repository.objects.for_user(user).get(slug=context_slug)
             except Repository.DoesNotExist:
                 raise serializers.ValidationError({"context_slug": "Repository not found."})
+            if not repository.can_edit(user):
+                raise serializers.ValidationError(
+                    {"context_slug": "No tienes permisos de edición en este repositorio."}
+                )
+            attrs["repository"] = repository
 
         elif context_type == "project":
             from apps.project.models import Project
             try:
-                attrs["project"] = Project.objects.for_user(
-                    self.context["request"].user
-                ).get(slug=context_slug)
+                project = Project.objects.for_user(user).get(slug=context_slug)
             except Project.DoesNotExist:
                 raise serializers.ValidationError({"context_slug": "Project not found."})
+            if not project.can_edit(user):
+                raise serializers.ValidationError(
+                    {"context_slug": "No tienes permisos de edición en este proyecto."}
+                )
+            attrs["project"] = project
 
         elif context_type == "document":
-            user = self.context["request"].user
             doc_qs = accessible_documents_for(user, [context_slug])
             doc = doc_qs.filter(slug=context_slug).first()
             if doc is None:
                 raise serializers.ValidationError({"context_slug": "Document not found."})
+            if not doc.can_edit(user):
+                raise serializers.ValidationError(
+                    {"context_slug": "No tienes permisos de edición en este documento."}
+                )
             attrs["document"] = doc
 
         # Override or fallback: the runner is the source of truth for resolving the

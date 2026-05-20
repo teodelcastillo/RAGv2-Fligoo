@@ -71,6 +71,8 @@ class ProjectSerializer(serializers.ModelSerializer):
         read_only=True,
         allow_null=True,
     )
+    can_edit = serializers.SerializerMethodField()
+    can_manage_shares = serializers.SerializerMethodField()
 
     class Meta:
         model = Project
@@ -89,6 +91,8 @@ class ProjectSerializer(serializers.ModelSerializer):
             "context_notes",
             "copilot_enabled",
             "structure_template_slug",
+            "can_edit",
+            "can_manage_shares",
             "created_at",
             "updated_at",
         )
@@ -102,9 +106,19 @@ class ProjectSerializer(serializers.ModelSerializer):
             "enabled_skill_slugs",
             "blueprint_document_slug",
             "structure_template_slug",
+            "can_edit",
+            "can_manage_shares",
             "created_at",
             "updated_at",
         )
+
+    def get_can_edit(self, obj):
+        request = self.context.get("request")
+        return bool(request and obj.can_edit(request.user))
+
+    def get_can_manage_shares(self, obj):
+        request = self.context.get("request")
+        return bool(request and obj.can_manage_shares(request.user))
 
 
 class ProjectWriteSerializer(ProjectSerializer):
@@ -281,6 +295,10 @@ class ProjectShareSerializer(serializers.ModelSerializer):
         model = ProjectShare
         fields = ("id", "user", "user_email", "role", "created_at")
         read_only_fields = ("id", "user_email", "created_at")
+
+
+class ProjectShareRoleUpdateSerializer(serializers.Serializer):
+    role = serializers.ChoiceField(choices=ProjectShareRole.choices)
 
 
 class ProjectShareWriteSerializer(serializers.Serializer):

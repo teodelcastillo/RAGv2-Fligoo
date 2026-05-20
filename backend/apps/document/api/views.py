@@ -25,6 +25,7 @@ from apps.document.api.serializers import (
     DocumentBulkPublicSerializer,
     DocumentDetailSerializer,
     DocumentUpdateSerializer,
+    DocumentShareRoleUpdateSerializer,
     DocumentShareSerializer,
     DocumentShareWriteSerializer,
     CategorySerializer,
@@ -653,10 +654,7 @@ class DocumentViewSet(
         share = get_object_or_404(DocumentShare, document=document, pk=share_id)
         
         if request.method == "PATCH":
-            serializer = DocumentShareWriteSerializer(
-                data=request.data,
-                context={"document": document, "request": request},
-            )
+            serializer = DocumentShareRoleUpdateSerializer(data=request.data)
             serializer.is_valid(raise_exception=True)
             share.role = serializer.validated_data["role"]
             share.save(update_fields=["role"])

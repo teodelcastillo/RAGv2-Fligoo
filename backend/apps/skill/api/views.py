@@ -7,6 +7,12 @@ from rest_framework.exceptions import PermissionDenied
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
+from apps.skill.access import (
+    executions_queryset_for_user,
+    user_can_mutate_execution,
+    user_can_view_execution,
+)
+
 from apps.skill.api.serializers import (
     ApproveStepSerializer,
     RunSkillSerializer,
@@ -224,7 +230,7 @@ class SkillExecutionViewSet(
     viewsets.GenericViewSet,
 ):
     """
-    Read-only view of skill executions for the current user.
+    Read-only view of skill executions for the current user and shared contexts.
     Supports filtering by skill, status, repository, project.
     """
     permission_classes = [IsAuthenticated]
@@ -233,8 +239,7 @@ class SkillExecutionViewSet(
     def get_queryset(self):
         user = self.request.user
         qs = (
-            SkillExecution.objects
-            .filter(owner=user)
+            executions_queryset_for_user(user)
             .select_related("skill", "repository", "project", "document")
         )
         if skill_slug := self.request.query_params.get("skill"):
@@ -246,6 +251,17 @@ class SkillExecutionViewSet(
         if status_filter := self.request.query_params.get("status"):
             qs = qs.filter(status=status_filter)
         return qs
+
+    def get_object(self):
+        execution = super().get_object()
+        if not user_can_view_execution(self.request.user, execution):
+            raise PermissionDenied("No tienes permisos para ver esta ejecución.")
+        return execution
+
+    def perform_destroy(self, instance):
+        if not user_can_mutate_execution(self.request.user, instance):
+            raise PermissionDenied("No tienes permisos para eliminar esta ejecución.")
+        instance.delete()
 
     @action(detail=True, methods=["post"], url_path="approve")
     def approve(self, request, pk=None):
@@ -259,6 +275,8 @@ class SkillExecutionViewSet(
         Body: { "override_content": "..." }   (optional)
         """
         execution = self.get_object()
+        if not user_can_mutate_execution(request.user, execution):
+            raise PermissionDenied("No tienes permisos para modificar esta ejecución.")
         serializer = ApproveStepSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
@@ -281,6 +299,8 @@ class SkillExecutionViewSet(
         POST /api/skill-executions/{id}/regenerate-step/
         """
         execution = self.get_object()
+        if not user_can_mutate_execution(request.user, execution):
+            raise PermissionDenied("No tienes permisos para modificar esta ejecución.")
         try:
             execution = regenerate_step(execution)
         except ValueError as exc:

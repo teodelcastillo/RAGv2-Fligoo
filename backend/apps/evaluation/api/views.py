@@ -13,6 +13,7 @@ from apps.evaluation.api.serializers import (
     EvaluationRunCreateSerializer,
     EvaluationRunSerializer,
     EvaluationSerializer,
+    EvaluationShareRoleUpdateSerializer,
     EvaluationShareSerializer,
     EvaluationShareWriteSerializer,
     EvaluationWriteSerializer,
@@ -138,10 +139,7 @@ class EvaluationViewSet(viewsets.ModelViewSet):
         share = get_object_or_404(EvaluationShare, evaluation=evaluation, pk=share_id)
 
         if request.method == "PATCH":
-            serializer = EvaluationShareWriteSerializer(
-                data=request.data,
-                context={"evaluation": evaluation},
-            )
+            serializer = EvaluationShareRoleUpdateSerializer(data=request.data)
             serializer.is_valid(raise_exception=True)
             share.role = serializer.validated_data["role"]
             share.save(update_fields=["role"])

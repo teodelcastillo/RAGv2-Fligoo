@@ -11,17 +11,21 @@ from rest_framework.response import Response
 from apps.chat.models import ChatSession
 from apps.chat.api.serializers import ChatSessionSerializer, ChatSessionCreateSerializer
 from apps.document.models import Document
+from apps.repository.api.permissions import RepositoryAccessPermission
 from apps.repository.api.serializers import (
     RepositoryDocumentAttachSerializer,
     RepositorySerializer,
+    RepositoryShareRoleUpdateSerializer,
+    RepositoryShareSerializer,
+    RepositoryShareWriteSerializer,
     RepositoryWriteSerializer,
 )
-from apps.repository.models import Repository, RepositoryDocument, RepositoryType
+from apps.repository.models import Repository, RepositoryDocument, RepositoryShare
 
 
 class RepositoryViewSet(viewsets.ModelViewSet):
     queryset = Repository.objects.none()
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, RepositoryAccessPermission]
     serializer_class = RepositorySerializer
     lookup_field = "slug"
 
@@ -33,6 +37,10 @@ class RepositoryViewSet(viewsets.ModelViewSet):
                 Prefetch(
                     "repository_documents",
                     queryset=RepositoryDocument.objects.select_related("document"),
+                ),
+                Prefetch(
+                    "shares",
+                    queryset=RepositoryShare.objects.select_related("user"),
                 ),
                 "enabled_skills",
             )
@@ -127,6 +135,56 @@ class RepositoryViewSet(viewsets.ModelViewSet):
         repo_doc.save(update_fields=["is_active"])
         return Response({"slug": document_slug, "is_active": repo_doc.is_active})
 
+    @action(
+        detail=True,
+        methods=["get", "post"],
+        url_path="shares",
+        url_name="shares",
+    )
+    def shares(self, request, slug=None):
+        repo = self.get_object()
+        self._ensure_share_manager(repo)
+        if request.method == "GET":
+            serializer = RepositoryShareSerializer(
+                repo.shares.select_related("user"),
+                many=True,
+            )
+            return Response(serializer.data)
+
+        serializer = RepositoryShareWriteSerializer(
+            data=request.data,
+            context={"repository": repo},
+        )
+        serializer.is_valid(raise_exception=True)
+        share, _ = RepositoryShare.objects.update_or_create(
+            repository=repo,
+            user=serializer.validated_data["user"],
+            defaults={"role": serializer.validated_data["role"]},
+        )
+        output = RepositoryShareSerializer(share)
+        return Response(output.data, status=status.HTTP_201_CREATED)
+
+    @action(
+        detail=True,
+        methods=["patch", "delete"],
+        url_path=r"shares/(?P<share_id>[^/]+)",
+        url_name="share-detail",
+    )
+    def manage_share(self, request, slug=None, share_id=None):
+        repo = self.get_object()
+        self._ensure_share_manager(repo)
+        share = get_object_or_404(RepositoryShare, repository=repo, pk=share_id)
+
+        if request.method == "PATCH":
+            serializer = RepositoryShareRoleUpdateSerializer(data=request.data)
+            serializer.is_valid(raise_exception=True)
+            share.role = serializer.validated_data["role"]
+            share.save(update_fields=["role"])
+            return Response(RepositoryShareSerializer(share).data)
+
+        share.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
     # ------------------------------------------------------------------ #
     # Chat sessions                                                        #
     # ------------------------------------------------------------------ #
@@ -206,3 +264,7 @@ class RepositoryViewSet(viewsets.ModelViewSet):
     def _serialize_repo(self, repo: Repository):
         refreshed = self.get_queryset().get(pk=repo.pk)
         return RepositorySerializer(refreshed, context=self.get_serializer_context()).data
+
+    def _ensure_share_manager(self, repo: Repository):
+        if not repo.can_manage_shares(self.request.user):
+            raise PermissionDenied("No puedes administrar los permisos de este repositorio.")

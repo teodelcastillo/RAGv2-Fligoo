@@ -6,7 +6,13 @@ from rest_framework import serializers
 
 from apps.document.models import Document
 from apps.document.services import accessible_documents_for
-from apps.repository.models import Repository, RepositoryDocument, RepositoryType
+from apps.repository.models import (
+    Repository,
+    RepositoryDocument,
+    RepositoryShare,
+    RepositoryShareRole,
+    RepositoryType,
+)
 from apps.skill.models import Skill
 
 User = get_user_model()
@@ -37,6 +43,8 @@ class RepositorySerializer(serializers.ModelSerializer):
         read_only=True,
         slug_field="slug",
     )
+    can_edit = serializers.SerializerMethodField()
+    can_manage_shares = serializers.SerializerMethodField()
 
     class Meta:
         model = Repository
@@ -52,6 +60,8 @@ class RepositorySerializer(serializers.ModelSerializer):
             "documents",
             "document_count",
             "enabled_skill_slugs",
+            "can_edit",
+            "can_manage_shares",
             "created_at",
             "updated_at",
         )
@@ -64,9 +74,19 @@ class RepositorySerializer(serializers.ModelSerializer):
             "documents",
             "document_count",
             "enabled_skill_slugs",
+            "can_edit",
+            "can_manage_shares",
             "created_at",
             "updated_at",
         )
+
+    def get_can_edit(self, obj):
+        request = self.context.get("request")
+        return bool(request and obj.can_edit(request.user))
+
+    def get_can_manage_shares(self, obj):
+        request = self.context.get("request")
+        return bool(request and obj.can_manage_shares(request.user))
 
     def get_document_count(self, obj) -> int:
         return obj.repository_documents.count()
@@ -138,3 +158,39 @@ class RepositoryDocumentAttachSerializer(serializers.Serializer):
 
     def get_documents(self):
         return self.context.get("validated_documents", [])
+
+
+class RepositoryShareSerializer(serializers.ModelSerializer):
+    user_email = serializers.EmailField(source="user.email", read_only=True)
+
+    class Meta:
+        model = RepositoryShare
+        fields = ("id", "user", "user_email", "role", "created_at")
+        read_only_fields = ("id", "user_email", "created_at")
+
+
+class RepositoryShareRoleUpdateSerializer(serializers.Serializer):
+    role = serializers.ChoiceField(choices=RepositoryShareRole.choices)
+
+
+class RepositoryShareWriteSerializer(serializers.Serializer):
+    user_email = serializers.EmailField()
+    role = serializers.ChoiceField(choices=RepositoryShareRole.choices)
+
+    def validate(self, attrs):
+        email = attrs.get("user_email")
+        try:
+            user = User.objects.get(email=email)
+        except User.DoesNotExist:
+            raise serializers.ValidationError({
+                "user_email": f"No existe un usuario con el email: {email}"
+            })
+
+        repository = self.context.get("repository")
+        if repository and repository.owner_id == user.id:
+            raise serializers.ValidationError({
+                "user_email": "No puedes compartir el repositorio contigo mismo."
+            })
+
+        attrs["user"] = user
+        return attrs

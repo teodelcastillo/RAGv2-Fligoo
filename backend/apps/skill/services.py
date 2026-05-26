@@ -56,7 +56,11 @@ def resolve_documents(execution: SkillExecution) -> QuerySet[Document]:
     preserves the legacy behaviour of using the full context.
     """
     metadata = execution.metadata or {}
-    slug_filter = metadata.get("document_slugs_filter") or []
+    slug_filter = (
+        metadata.get("document_slugs_filter")
+        or execution.skill.pinned_document_slugs
+        or []
+    )
     slug_filter = [s for s in slug_filter if isinstance(s, str) and s.strip()]
 
     if execution.repository_id:
@@ -758,6 +762,58 @@ class SkillRunner:
                 ])
 
         return execution
+
+
+def execution_to_markdown(execution: SkillExecution) -> str:
+    """Return the best available markdown representation of a skill execution."""
+    if execution.edited_output and execution.edited_output.strip():
+        return execution.edited_output.strip()
+
+    if execution.skill.skill_type == SkillType.QUICK:
+        if execution.output_mode == ExecutionOutputMode.TABLE:
+            structured = execution.output_structured or {}
+            columns = structured.get("columns") or []
+            rows = structured.get("rows") or []
+            if not columns:
+                return execution.output or ""
+            header = "| " + " | ".join(str(c) for c in columns) + " |"
+            separator = "| " + " | ".join("---" for _ in columns) + " |"
+            body = []
+            for row in rows:
+                if isinstance(row, dict):
+                    body.append(
+                        "| "
+                        + " | ".join(str(row.get(col, "")) for col in columns)
+                        + " |"
+                    )
+            return "\n".join([header, separator, *body])
+        return execution.output or ""
+
+    steps = (execution.output_structured or {}).get("steps") or []
+    parts = []
+    for step in steps:
+        title = step.get("title") or "Step"
+        if step.get("output_mode") == "table" and step.get("table"):
+            table = step["table"]
+            columns = table.get("columns") or []
+            rows = table.get("rows") or []
+            if columns:
+                header = "| " + " | ".join(str(c) for c in columns) + " |"
+                separator = "| " + " | ".join("---" for _ in columns) + " |"
+                body = []
+                for row in rows:
+                    if isinstance(row, dict):
+                        body.append(
+                            "| "
+                            + " | ".join(str(row.get(col, "")) for col in columns)
+                            + " |"
+                        )
+                parts.append(f"## {title}\n\n" + "\n".join([header, separator, *body]))
+            else:
+                parts.append(f"## {title}\n\n{step.get('content') or ''}")
+        else:
+            parts.append(f"## {title}\n\n{step.get('content') or ''}")
+    return "\n\n---\n\n".join(parts)
 
 
 def execute_skill(execution: SkillExecution) -> SkillExecution:

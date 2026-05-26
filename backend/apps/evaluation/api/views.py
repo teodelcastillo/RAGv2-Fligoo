@@ -10,6 +10,7 @@ from rest_framework.response import Response
 
 from apps.evaluation.api.permissions import EvaluationAccessPermission
 from apps.evaluation.api.serializers import (
+    ApplySkillEvidenceSerializer,
     EvaluationRunCreateSerializer,
     EvaluationRunSerializer,
     EvaluationSerializer,
@@ -17,6 +18,7 @@ from apps.evaluation.api.serializers import (
     EvaluationShareSerializer,
     EvaluationShareWriteSerializer,
     EvaluationWriteSerializer,
+    MetricEvaluationResultSerializer,
 )
 from apps.evaluation.models import (
     Evaluation,
@@ -26,6 +28,7 @@ from apps.evaluation.models import (
     EvaluationShare,
     PillarEvaluationResult,
 )
+from apps.evaluation.services import apply_skill_execution_to_metric
 from apps.evaluation.tasks import run_evaluation_task
 
 
@@ -207,6 +210,36 @@ class EvaluationViewSet(viewsets.ModelViewSet):
             raise PermissionDenied("No tienes permisos para ver esta ejecución.")
         serializer = EvaluationRunSerializer(run)
         return Response(serializer.data)
+
+    @action(
+        detail=True,
+        methods=["post"],
+        url_path=r"runs/(?P<run_id>[^/]+)/apply-skill-evidence",
+        url_name="apply-skill-evidence",
+    )
+    def apply_skill_evidence(self, request, slug=None, run_id=None):
+        evaluation = self.get_object()
+        if not evaluation.can_edit(request.user):
+            raise PermissionDenied("No tienes permisos para editar esta evaluación.")
+
+        run = get_object_or_404(self._run_queryset(), evaluation=evaluation, pk=run_id)
+        serializer = ApplySkillEvidenceSerializer(
+            data=request.data,
+            context={"request": request, "run": run},
+        )
+        serializer.is_valid(raise_exception=True)
+        validated = serializer.validated_data
+
+        try:
+            metric_result = apply_skill_execution_to_metric(
+                run=run,
+                metric_id=validated["metric_id"],
+                execution=validated["execution"],
+            )
+        except ValueError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        return Response(MetricEvaluationResultSerializer(metric_result).data)
 
     def _ensure_share_manager(self, evaluation: Evaluation):
         if not evaluation.can_manage_shares(self.request.user):

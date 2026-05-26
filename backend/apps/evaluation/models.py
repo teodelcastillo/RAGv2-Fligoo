@@ -229,6 +229,11 @@ class EvaluationMetric(models.Model):
     scale_label_min = models.CharField(max_length=255, blank=True)
     scale_label_max = models.CharField(max_length=255, blank=True)
     expected_units = models.CharField(max_length=255, blank=True)
+    linked_skill_slug = models.SlugField(
+        null=True,
+        blank=True,
+        help_text="Optional skill to pre-populate this metric's response.",
+    )
     position = models.PositiveIntegerField(default=1)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)

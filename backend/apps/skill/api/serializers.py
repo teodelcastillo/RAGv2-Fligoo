@@ -141,6 +141,7 @@ class SkillSerializer(serializers.ModelSerializer):
             "comparative_mode_enabled", "strict_missing_evidence",
             "retrieval_strategy", "k_per_doc", "total_limit", "max_per_doc_after_rerank",
             "default_output_mode", "table_schema",
+            "pinned_document_slugs",
             # Sprint 1 + 2
             "tools_enabled",
             "research_phase_enabled", "research_queries",
@@ -203,6 +204,7 @@ class SkillWriteSerializer(serializers.ModelSerializer):
             "comparative_mode_enabled", "strict_missing_evidence",
             "retrieval_strategy", "k_per_doc", "total_limit", "max_per_doc_after_rerank",
             "default_output_mode", "table_schema",
+            "pinned_document_slugs",
             # Sprint 1 + 2
             "tools_enabled",
             "research_phase_enabled", "research_queries",

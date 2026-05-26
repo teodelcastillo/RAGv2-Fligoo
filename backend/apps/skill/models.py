@@ -137,6 +137,11 @@ class Skill(models.Model):
             '{"name": str, "description": str, "columns": [TableColumn]}.'
         ),
     )
+    pinned_document_slugs = models.JSONField(
+        default=list,
+        blank=True,
+        help_text="Default document filter. Empty = all context documents.",
+    )
 
     # ---------------------------------------------------------------------------
     # Agentic capabilities (Sprint 1 + 2)

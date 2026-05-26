@@ -49,6 +49,7 @@ class EvaluationMetricSerializer(serializers.ModelSerializer):
             "scale_label_min",
             "scale_label_max",
             "expected_units",
+            "linked_skill_slug",
             "position",
             "created_at",
             "updated_at",
@@ -145,6 +146,7 @@ class EvaluationMetricInputSerializer(serializers.Serializer):
     scale_label_min = serializers.CharField(required=False, allow_blank=True)
     scale_label_max = serializers.CharField(required=False, allow_blank=True)
     expected_units = serializers.CharField(required=False, allow_blank=True)
+    linked_skill_slug = serializers.SlugField(required=False, allow_null=True, allow_blank=True)
     position = serializers.IntegerField(required=False, min_value=1)
 
 
@@ -284,11 +286,16 @@ class EvaluationWriteSerializer(EvaluationSerializer):
                     "scale_label_min",
                     "scale_label_max",
                     "expected_units",
+                    "linked_skill_slug",
                 }
             }
+            linked_skill_slug = payload.pop("linked_skill_slug", None) or None
+            if linked_skill_slug == "":
+                linked_skill_slug = None
             EvaluationMetric.objects.create(
                 pillar=pillar,
                 position=position,
+                linked_skill_slug=linked_skill_slug,
                 **payload,
             )
 
@@ -481,3 +488,39 @@ class EvaluationRunCreateSerializer(serializers.Serializer):
             )
         return serialized
 
+
+class ApplySkillEvidenceSerializer(serializers.Serializer):
+    execution_id = serializers.IntegerField(min_value=1)
+    metric_id = serializers.IntegerField(min_value=1)
+
+    def validate(self, attrs):
+        from apps.skill.models import SkillExecution, ExecutionStatus
+
+        request = self.context["request"]
+        run: EvaluationRun = self.context["run"]
+        try:
+            execution = SkillExecution.objects.select_related("skill").get(
+                pk=attrs["execution_id"],
+                owner=request.user,
+            )
+        except SkillExecution.DoesNotExist as exc:
+            raise serializers.ValidationError(
+                {"execution_id": "Skill execution not found."}
+            ) from exc
+
+        if execution.status != ExecutionStatus.COMPLETED:
+            raise serializers.ValidationError(
+                {"execution_id": "Skill execution must be completed."}
+            )
+
+        metric_exists = MetricEvaluationResult.objects.filter(
+            pillar_result__run=run,
+            metric_id=attrs["metric_id"],
+        ).exists()
+        if not metric_exists:
+            raise serializers.ValidationError(
+                {"metric_id": "Metric not found in this evaluation run."}
+            )
+
+        attrs["execution"] = execution
+        return attrs

@@ -16,6 +16,8 @@ from apps.evaluation.models import (
     MetricResponseType,
     PillarEvaluationResult,
 )
+from apps.skill.models import Skill, SkillExecution, ExecutionStatus
+from apps.skill.services import execute_skill, execution_to_markdown
 
 logger = logging.getLogger(__name__)
 
@@ -102,6 +104,14 @@ class EvaluationRunner:
             pillar_result.save(update_fields=["summary", "chunk_ids", "sources"])
 
     def _evaluate_metric(self, *, run, pillar, metric, documents_qs):
+        skill_evidence = self._try_linked_skill_evidence(
+            run=run,
+            metric=metric,
+            documents_qs=documents_qs,
+        )
+        if skill_evidence is not None:
+            return skill_evidence
+
         query_text = self._build_query_text(pillar, metric, run)
         chunks = fetch_relevant_chunks(
             user=run.owner,
@@ -148,6 +158,77 @@ class EvaluationRunner:
             metadata={"usage": usage},
         )
         return metric_result
+
+    def _try_linked_skill_evidence(self, *, run, metric, documents_qs):
+        linked_slug = (metric.linked_skill_slug or "").strip()
+        if not linked_slug:
+            return None
+
+        try:
+            skill = Skill.objects.get(slug=linked_slug)
+        except Skill.DoesNotExist:
+            logger.warning(
+                "Metric %s references missing skill slug '%s'",
+                metric.id,
+                linked_slug,
+            )
+            return None
+
+        doc_slugs = list(documents_qs.values_list("slug", flat=True))
+        execution_kwargs = {
+            "skill": skill,
+            "owner": run.owner,
+            "metadata": {},
+        }
+        if run.project_id:
+            execution_kwargs["project_id"] = run.project_id
+        if doc_slugs:
+            execution_kwargs["metadata"]["document_slugs_filter"] = doc_slugs
+        elif skill.pinned_document_slugs:
+            execution_kwargs["metadata"]["document_slugs_filter"] = skill.pinned_document_slugs
+
+        execution = SkillExecution.objects.create(**execution_kwargs)
+        execution = execute_skill(execution)
+
+        if execution.status != ExecutionStatus.COMPLETED:
+            logger.warning(
+                "Linked skill '%s' for metric %s finished with status %s",
+                linked_slug,
+                metric.id,
+                execution.status,
+            )
+            return None
+
+        response_text = execution_to_markdown(execution)
+        response_value = None
+        if metric.response_type == MetricResponseType.QUANTITATIVE:
+            response_value = self._extract_numeric_value(
+                response_text, metric.scale_min, metric.scale_max
+            )
+
+        sources = [
+            {
+                "document_slug": entry.get("slug"),
+                "document_name": entry.get("name"),
+                "chunk_index": None,
+            }
+            for entry in (execution.document_snapshot or [])
+            if entry.get("slug")
+        ]
+
+        return MetricEvaluationResult(
+            metric=metric,
+            response_type=metric.response_type,
+            response_text=response_text,
+            response_value=response_value,
+            chunk_ids=[],
+            sources=sources,
+            metadata={
+                "linked_skill_execution_id": execution.id,
+                "linked_skill_slug": skill.slug,
+                "linked_skill_name": skill.name,
+            },
+        )
 
     def _documents_for_run(self, run: EvaluationRun):
         snapshot = run.document_snapshot or []
@@ -213,3 +294,60 @@ class EvaluationRunner:
 def execute_evaluation_run(run: EvaluationRun) -> EvaluationRun:
     runner = EvaluationRunner()
     return runner.run(run.id)
+
+
+def apply_skill_execution_to_metric(
+    *,
+    run: EvaluationRun,
+    metric_id: int,
+    execution: SkillExecution,
+) -> MetricEvaluationResult:
+    """
+    Insert a completed skill execution's output as evidence on an existing
+    metric result within an evaluation run.
+    """
+    if execution.status != ExecutionStatus.COMPLETED:
+        raise ValueError("Skill execution must be completed before applying as evidence.")
+
+    metric_result = (
+        MetricEvaluationResult.objects.select_related("metric")
+        .filter(
+            pillar_result__run=run,
+            metric_id=metric_id,
+        )
+        .first()
+    )
+    if metric_result is None:
+        raise ValueError("Metric result not found for this evaluation run.")
+
+    response_text = execution_to_markdown(execution)
+    metric_result.response_text = response_text
+    if metric_result.metric.response_type == MetricResponseType.QUANTITATIVE:
+        runner = EvaluationRunner()
+        metric_result.response_value = runner._extract_numeric_value(
+            response_text,
+            metric_result.metric.scale_min,
+            metric_result.metric.scale_max,
+        )
+
+    metadata = dict(metric_result.metadata or {})
+    metadata["linked_skill_execution_id"] = execution.id
+    metadata["linked_skill_slug"] = execution.skill.slug
+    metadata["linked_skill_name"] = execution.skill.name
+    metadata["applied_from_skill_execution"] = True
+    metric_result.metadata = metadata
+
+    skill_sources = [
+        {
+            "document_slug": entry.get("slug"),
+            "document_name": entry.get("name"),
+            "chunk_index": None,
+        }
+        for entry in (execution.document_snapshot or [])
+        if entry.get("slug")
+    ]
+    if skill_sources:
+        metric_result.sources = skill_sources
+
+    metric_result.save()
+    return metric_result

@@ -66,6 +66,15 @@ _NUMERIC_PATTERNS = (
 )
 
 
+CLASSIFIER_SOURCE_REGEX = "regex"
+CLASSIFIER_SOURCE_LLM = "llm_router"
+CLASSIFIER_SOURCE_OVERRIDE = "override"
+
+CLASSIFIER_CONFIDENCE_HIGH = "high"
+CLASSIFIER_CONFIDENCE_MEDIUM = "medium"
+CLASSIFIER_CONFIDENCE_LOW = "low"
+
+
 @dataclass
 class QueryAnalysis:
     """Structured representation of the user's question for retrieval."""
@@ -78,6 +87,11 @@ class QueryAnalysis:
     keywords: List[str] = field(default_factory=list)
     numeric_tokens: List[str] = field(default_factory=list)
     sub_queries: List[str] = field(default_factory=list)
+    # Telemetry: how the classification was reached. Not exposed in
+    # ``to_dict`` to avoid leaking implementation details to legacy clients;
+    # the chat views re-attach these to ``rag_diagnostics`` explicitly.
+    classifier_source: str = CLASSIFIER_SOURCE_REGEX
+    classifier_confidence: str = CLASSIFIER_CONFIDENCE_HIGH
 
     def to_dict(self) -> dict:
         return {
@@ -128,14 +142,64 @@ def _extract_numeric_tokens(text: str) -> List[str]:
     return re.findall(r"\d+(?:[\.,]\d+)?", text or "")
 
 
+def _classifier_confidence(
+    *,
+    is_panorama: bool,
+    all_coverage_hits: int,
+    is_comparative: bool,
+    is_numeric: bool,
+    long_question: bool,
+    word_count: int,
+) -> str:
+    """
+    Heuristic confidence in the regex classifier's decision.
+
+    "high":    one strong signal (clearly comparative, clearly panorama,
+               or clearly numeric without mixed cues).
+    "medium":  conflicting signals (e.g. comparative + numeric), or only a
+               weak fallback (default factual on a long question with no
+               other signals).
+    "low":     no clear classification signal and an ambiguous length.
+               These are the queries an LLM router should disambiguate.
+    """
+    flags = sum(1 for f in (is_panorama, is_comparative, is_numeric) if f)
+    # Two strong signals contradict each other -> the LLM is the tiebreaker.
+    if flags >= 2:
+        return CLASSIFIER_CONFIDENCE_MEDIUM
+    # Comparative is very unambiguous when it fires alone.
+    if is_comparative and flags == 1:
+        return CLASSIFIER_CONFIDENCE_HIGH
+    if is_panorama and flags == 1:
+        return CLASSIFIER_CONFIDENCE_HIGH
+    # Numeric on its own with explicit unit/keyword cues is usually right;
+    # mere presence of a digit in a longer prose question is weaker.
+    if is_numeric and flags == 1 and all_coverage_hits == 0:
+        return CLASSIFIER_CONFIDENCE_HIGH
+    # No signals at all: short factual lookups are confident; longer prose
+    # falls into the ambiguous "factual by default" bucket which is the
+    # main miss case the regex classifier has today.
+    if flags == 0:
+        if word_count <= 8:
+            return CLASSIFIER_CONFIDENCE_HIGH
+        if long_question:
+            # Long question with zero topical signals — LLM should look at it.
+            return CLASSIFIER_CONFIDENCE_LOW
+        return CLASSIFIER_CONFIDENCE_MEDIUM
+    return CLASSIFIER_CONFIDENCE_MEDIUM
+
+
 def classify_query(text: str) -> QueryAnalysis:
     """
-    Classify a user query into a coarse RAG-relevant type.
-    Always returns a QueryAnalysis; never raises on bad input.
+    Classify a user query into a coarse RAG-relevant type using regex
+    heuristics. Always returns a QueryAnalysis; never raises on bad input.
+
+    The result includes ``classifier_source`` and ``classifier_confidence``
+    so the hybrid router and downstream diagnostics can reason about it.
     """
     norm = _normalize(text)
     analysis = QueryAnalysis(raw_text=text or "", normalized=norm)
     if not norm:
+        analysis.classifier_confidence = CLASSIFIER_CONFIDENCE_HIGH
         return analysis
 
     analysis.keywords = _extract_keywords(norm)
@@ -148,7 +212,8 @@ def classify_query(text: str) -> QueryAnalysis:
         analysis.numeric_tokens
     )
 
-    long_question = len(norm.split()) >= 18
+    word_count = len(norm.split())
+    long_question = word_count >= 18
 
     if is_comparative:
         analysis.query_type = QUERY_TYPE_COMPARATIVE
@@ -172,7 +237,157 @@ def classify_query(text: str) -> QueryAnalysis:
         analysis.coverage_mode = COVERAGE_MODE_FOCUSED
 
     analysis.sub_queries = _heuristic_sub_queries(analysis)
+    analysis.classifier_source = CLASSIFIER_SOURCE_REGEX
+    analysis.classifier_confidence = _classifier_confidence(
+        is_panorama=is_panorama,
+        all_coverage_hits=all_coverage_hits,
+        is_comparative=is_comparative,
+        is_numeric=is_numeric,
+        long_question=long_question,
+        word_count=word_count,
+    )
     return analysis
+
+
+_LLM_ROUTER_SYSTEM_PROMPT = (
+    "Eres un router de un sistema RAG. Dada la pregunta del usuario, "
+    "decide cómo se debe orientar la recuperación. "
+    "Responde EXCLUSIVAMENTE con un JSON con la forma:\n"
+    "{\n"
+    '  "query_type": "factual" | "numeric" | "comparative" | "panorama",\n'
+    '  "coverage_mode": "focused" | "balanced" | "all",\n'
+    '  "is_general": true | false,\n'
+    '  "confidence": "high" | "medium" | "low"\n'
+    "}\n\n"
+    "Lineamientos:\n"
+    "- factual: pregunta específica con respuesta puntual.\n"
+    "- numeric: pide cifras, métricas, montos, porcentajes o cantidades.\n"
+    "- comparative: contrasta dos o más cosas, o pide ranking.\n"
+    "- panorama: pide visión general, síntesis o resumen amplio.\n"
+    "- coverage_mode all: cuando se necesita cubrir cada documento; "
+    "balanced para preguntas amplias; focused para preguntas puntuales.\n"
+    "- is_general: true para preguntas amplias que se beneficien de varias "
+    "sub-consultas; false si es específica.\n"
+    "No incluyas texto fuera del JSON."
+)
+
+
+def _llm_router_enabled() -> bool:
+    return os.environ.get("RAG_LLM_ROUTER_ENABLED", "1").lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
+def classify_query_llm(text: str) -> QueryAnalysis | None:
+    """
+    Classify the query with a lightweight LLM router. Returns ``None`` if
+    the LLM is disabled, unavailable, or the response cannot be parsed.
+
+    The returned ``QueryAnalysis`` preserves the regex-derived ``keywords``,
+    ``numeric_tokens`` and ``sub_queries`` (callers should pass through a
+    regex-classified ``QueryAnalysis`` via ``classify_query_hybrid``); when
+    invoked standalone it returns an analysis with empty keyword fields.
+    """
+    if not _llm_router_enabled():
+        return None
+    raw = (text or "").strip()
+    if not raw:
+        return None
+    try:
+        from apps.document.utils.client_openia import generate_chat_completion
+
+        messages = [
+            {"role": "system", "content": _LLM_ROUTER_SYSTEM_PROMPT},
+            {"role": "user", "content": raw[:1200]},
+        ]
+        body, _usage = generate_chat_completion(
+            messages,
+            model=os.environ.get("RAG_ROUTER_MODEL", "gpt-4o-mini"),
+            temperature=0.0,
+            max_tokens=80,
+            timeout=8,
+        )
+        body = (body or "").strip()
+        match = re.search(r"\{[\s\S]*\}", body)
+        if match:
+            body = match.group(0)
+        data = json.loads(body)
+    except Exception as exc:
+        logger.warning("LLM router failed, falling back to regex: %s", exc)
+        return None
+
+    query_type = str(data.get("query_type", "")).strip().lower()
+    coverage_mode = str(data.get("coverage_mode", "")).strip().lower()
+    is_general_raw = data.get("is_general")
+    confidence = str(data.get("confidence", "medium")).strip().lower()
+
+    valid_types = {QUERY_TYPE_FACTUAL, QUERY_TYPE_NUMERIC,
+                   QUERY_TYPE_COMPARATIVE, QUERY_TYPE_PANORAMA}
+    valid_coverage = {COVERAGE_MODE_FOCUSED, COVERAGE_MODE_BALANCED, COVERAGE_MODE_ALL}
+    valid_confidence = {CLASSIFIER_CONFIDENCE_HIGH, CLASSIFIER_CONFIDENCE_MEDIUM,
+                        CLASSIFIER_CONFIDENCE_LOW}
+
+    if query_type not in valid_types:
+        logger.warning("LLM router returned invalid query_type=%r", query_type)
+        return None
+    if coverage_mode not in valid_coverage:
+        # Backfill coverage from query_type if missing/invalid.
+        coverage_mode = (
+            COVERAGE_MODE_BALANCED
+            if query_type in {QUERY_TYPE_PANORAMA, QUERY_TYPE_COMPARATIVE}
+            else COVERAGE_MODE_FOCUSED
+        )
+
+    norm = _normalize(raw)
+    out = QueryAnalysis(raw_text=raw, normalized=norm)
+    out.keywords = _extract_keywords(norm)
+    out.numeric_tokens = _extract_numeric_tokens(norm)
+    out.query_type = query_type
+    out.coverage_mode = coverage_mode
+    if isinstance(is_general_raw, bool):
+        out.is_general = is_general_raw
+    else:
+        out.is_general = query_type in {
+            QUERY_TYPE_PANORAMA, QUERY_TYPE_COMPARATIVE,
+        }
+    out.sub_queries = _heuristic_sub_queries(out)
+    out.classifier_source = CLASSIFIER_SOURCE_LLM
+    out.classifier_confidence = (
+        confidence if confidence in valid_confidence else CLASSIFIER_CONFIDENCE_MEDIUM
+    )
+    return out
+
+
+def classify_query_hybrid(text: str) -> QueryAnalysis:
+    """
+    Hybrid classifier: regex first; if the regex is confident, return it.
+    Otherwise call the LLM router. On any LLM failure, fall back to regex.
+
+    This is the production-facing classifier — call this from the RAG
+    pipeline instead of ``classify_query`` directly so we get the
+    auto-routing behaviour and the per-decision telemetry.
+    """
+    regex_analysis = classify_query(text)
+    # Empty text or trivially short queries: trust the regex (no LLM call).
+    if not regex_analysis.normalized:
+        return regex_analysis
+    if regex_analysis.classifier_confidence == CLASSIFIER_CONFIDENCE_HIGH:
+        return regex_analysis
+    # Skip the LLM for very short queries (cheaper, regex tends to win).
+    if len(regex_analysis.normalized.split()) < 5:
+        return regex_analysis
+    if not _llm_router_enabled():
+        return regex_analysis
+
+    llm_analysis = classify_query_llm(text)
+    if llm_analysis is None:
+        return regex_analysis
+
+    # Preserve the regex keyword/numeric extraction (they are deterministic
+    # over the raw text and useful for downstream lexical retrieval).
+    llm_analysis.keywords = regex_analysis.keywords
+    llm_analysis.numeric_tokens = regex_analysis.numeric_tokens
+    return llm_analysis
 
 
 def apply_response_mode_override(
@@ -181,7 +396,8 @@ def apply_response_mode_override(
 ) -> QueryAnalysis:
     """
     Deterministic override from explicit frontend selector.
-    If provided, this mode takes precedence over heuristic classification.
+    If provided, this mode takes precedence over heuristic / LLM
+    classification.
     """
     mode = (response_mode or "").strip().lower()
     if not mode:
@@ -192,6 +408,8 @@ def apply_response_mode_override(
         analysis.coverage_mode = COVERAGE_MODE_FOCUSED
         analysis.is_general = False
         analysis.sub_queries = []
+        analysis.classifier_source = CLASSIFIER_SOURCE_OVERRIDE
+        analysis.classifier_confidence = CLASSIFIER_CONFIDENCE_HIGH
         return analysis
 
     if mode == RESPONSE_MODE_PANORAMA:
@@ -199,6 +417,8 @@ def apply_response_mode_override(
         analysis.coverage_mode = COVERAGE_MODE_ALL
         analysis.is_general = True
         analysis.sub_queries = _heuristic_sub_queries(analysis)
+        analysis.classifier_source = CLASSIFIER_SOURCE_OVERRIDE
+        analysis.classifier_confidence = CLASSIFIER_CONFIDENCE_HIGH
         return analysis
 
     if mode == RESPONSE_MODE_COMPARACION:
@@ -206,6 +426,8 @@ def apply_response_mode_override(
         analysis.coverage_mode = COVERAGE_MODE_BALANCED
         analysis.is_general = True
         analysis.sub_queries = _heuristic_sub_queries(analysis)
+        analysis.classifier_source = CLASSIFIER_SOURCE_OVERRIDE
+        analysis.classifier_confidence = CLASSIFIER_CONFIDENCE_HIGH
         return analysis
 
     if mode == RESPONSE_MODE_EXTRACCION:
@@ -213,6 +435,8 @@ def apply_response_mode_override(
         analysis.coverage_mode = COVERAGE_MODE_FOCUSED
         analysis.is_general = False
         analysis.sub_queries = []
+        analysis.classifier_source = CLASSIFIER_SOURCE_OVERRIDE
+        analysis.classifier_confidence = CLASSIFIER_CONFIDENCE_HIGH
         return analysis
 
     if mode == RESPONSE_MODE_TABLA:
@@ -220,6 +444,8 @@ def apply_response_mode_override(
         analysis.coverage_mode = COVERAGE_MODE_FOCUSED
         analysis.is_general = False
         analysis.sub_queries = []
+        analysis.classifier_source = CLASSIFIER_SOURCE_OVERRIDE
+        analysis.classifier_confidence = CLASSIFIER_CONFIDENCE_HIGH
         return analysis
 
     return analysis

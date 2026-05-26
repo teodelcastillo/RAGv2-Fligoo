@@ -46,6 +46,17 @@ class ChatSession(models.Model):
         blank=True,
         help_text="Proyecto al que pertenece esta sesión de chat (si aplica)",
     )
+    deliverable = models.ForeignKey(
+        "project.ProjectDeliverable",
+        related_name="chat_sessions",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        help_text=(
+            "Entregable activo al que pertenece esta sesión de copilot. "
+            "Solo aplica a sesiones de copilot dentro de un proyecto."
+        ),
+    )
     repository = models.ForeignKey(
         "repository.Repository",
         related_name="chat_sessions",

@@ -27,6 +27,9 @@ from apps.project.api.serializers import (
     CopilotAutocompleteSerializer,
     CopilotMessageCreateSerializer,
     InitializeStructureSerializer,
+    ProjectDeliverableCreateSerializer,
+    ProjectDeliverableSerializer,
+    ProjectDeliverableUpdateSerializer,
     ProjectDocumentAttachSerializer,
     ProjectSectionCreateSerializer,
     ProjectSectionSerializer,
@@ -37,7 +40,14 @@ from apps.project.api.serializers import (
     ProjectShareWriteSerializer,
     ProjectWriteSerializer,
 )
-from apps.project.models import Project, ProjectDocument, ProjectSection, ProjectShare
+from apps.project.models import (
+    Project,
+    ProjectDeliverable,
+    ProjectDocument,
+    ProjectSection,
+    ProjectShare,
+    ProjectStructureTemplate,
+)
 
 
 def _skill_execution_count_subquery():
@@ -296,36 +306,202 @@ class ProjectViewSet(viewsets.ModelViewSet):
         return Response(output.data, status=status.HTTP_201_CREATED)
 
     # ------------------------------------------------------------------
-    # Structure endpoints
+    # Deliverable endpoints — projects now hold N independent deliverables.
+    # The legacy ``/structure`` endpoint below redirects to the primary
+    # deliverable so older clients keep working during the transition.
     # ------------------------------------------------------------------
+
+    def _resolve_deliverable(self, project: Project, deliv_slug: str | None):
+        """Look up a deliverable by slug, or the project's primary one."""
+        qs = ProjectDeliverable.objects.filter(project=project)
+        if deliv_slug:
+            return get_object_or_404(qs, slug=deliv_slug)
+        primary = qs.filter(is_primary=True).first()
+        if primary is None:
+            # Defensive: any existing deliverable beats failing the request.
+            primary = qs.order_by("position", "created_at").first()
+        if primary is None:
+            primary = ProjectDeliverable.objects.create(
+                project=project,
+                name="Entregable principal",
+                template=project.structure_template,
+                is_primary=True,
+                position=1,
+            )
+        return primary
+
+    @action(
+        detail=True, methods=["get", "post"],
+        url_path="deliverables", url_name="deliverables",
+    )
+    def deliverables(self, request, slug=None):
+        project = self.get_object()
+        if request.method == "GET":
+            qs = ProjectDeliverable.objects.filter(project=project).select_related("template")
+            return Response(
+                ProjectDeliverableSerializer(qs, many=True).data,
+            )
+
+        self._ensure_editor(project)
+        serializer = ProjectDeliverableCreateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+
+        template = None
+        tpl_slug = data.get("template_slug") or None
+        if tpl_slug:
+            try:
+                template = ProjectStructureTemplate.objects.get(slug=tpl_slug)
+            except ProjectStructureTemplate.DoesNotExist:
+                return Response(
+                    {"detail": f"Template '{tpl_slug}' no encontrado."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+        next_pos = (
+            ProjectDeliverable.objects.filter(project=project)
+            .order_by("-position").values_list("position", flat=True).first()
+        )
+        deliverable = ProjectDeliverable.objects.create(
+            project=project,
+            name=data["name"],
+            template=template,
+            is_primary=False,
+            position=(next_pos or 0) + 1,
+            status=data.get("status") or "draft",
+        )
+        if template is not None:
+            try:
+                initialize_project_structure(
+                    project, template.slug, deliverable=deliverable,
+                )
+            except Exception as exc:  # pragma: no cover - defensive
+                deliverable.delete()
+                return Response(
+                    {"detail": f"No se pudo inicializar la estructura: {exc}"},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+        return Response(
+            ProjectDeliverableSerializer(deliverable).data,
+            status=status.HTTP_201_CREATED,
+        )
+
+    @action(
+        detail=True, methods=["patch", "delete"],
+        url_path=r"deliverables/(?P<deliv_slug>[^/]+)",
+        url_name="deliverable-detail",
+    )
+    def deliverable_detail(self, request, slug=None, deliv_slug=None):
+        project = self.get_object()
+        self._ensure_editor(project)
+        deliverable = self._resolve_deliverable(project, deliv_slug)
+
+        if request.method == "DELETE":
+            if deliverable.is_primary:
+                # Allow deleting the primary only when there are other deliverables;
+                # we promote one of them to primary.
+                next_primary = (
+                    ProjectDeliverable.objects.filter(project=project)
+                    .exclude(pk=deliverable.pk)
+                    .order_by("position", "created_at")
+                    .first()
+                )
+                if next_primary is None:
+                    return Response(
+                        {"detail": "No se puede eliminar el único entregable del proyecto."},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+                next_primary.is_primary = True
+                next_primary.save(update_fields=["is_primary", "updated_at"])
+            deliverable.delete()
+            return Response(status=status.HTTP_204_NO_CONTENT)
+
+        serializer = ProjectDeliverableUpdateSerializer(data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        update_fields = []
+        for field in ("name", "status", "position"):
+            if field in data:
+                setattr(deliverable, field, data[field])
+                update_fields.append(field)
+        if "is_primary" in data and data["is_primary"]:
+            # Promoting another to primary demotes the current primary.
+            ProjectDeliverable.objects.filter(
+                project=project, is_primary=True,
+            ).exclude(pk=deliverable.pk).update(is_primary=False)
+            deliverable.is_primary = True
+            update_fields.append("is_primary")
+        if update_fields:
+            update_fields.append("updated_at")
+            deliverable.save(update_fields=update_fields)
+        return Response(ProjectDeliverableSerializer(deliverable).data)
+
+    # ------------------------------------------------------------------
+    # Structure endpoints — scoped to a deliverable.
+    # ------------------------------------------------------------------
+
+    def _structure_payload(self, deliverable):
+        sections = ProjectSection.objects.filter(deliverable=deliverable).order_by("position")
+        return {
+            "deliverable_slug": deliverable.slug,
+            "deliverable_name": deliverable.name,
+            "template_slug": deliverable.template.slug if deliverable.template else None,
+            "template_name": deliverable.template.name if deliverable.template else None,
+            "sections": ProjectSectionSerializer(sections, many=True).data,
+        }
 
     @action(detail=True, methods=["get"], url_path="structure", url_name="structure")
     def structure(self, request, slug=None):
+        """Legacy structure endpoint — returns the primary deliverable."""
         project = self.get_object()
-        sections = ProjectSection.objects.filter(project=project).order_by("position")
-        serializer = ProjectSectionSerializer(sections, many=True)
-        return Response({
-            "template_slug": project.structure_template.slug if project.structure_template else None,
-            "template_name": project.structure_template.name if project.structure_template else None,
-            "sections": serializer.data,
-        })
+        deliverable = self._resolve_deliverable(project, None)
+        return Response(self._structure_payload(deliverable))
+
+    @action(
+        detail=True, methods=["get"],
+        url_path=r"deliverables/(?P<deliv_slug>[^/]+)/structure",
+        url_name="deliverable-structure",
+    )
+    def deliverable_structure(self, request, slug=None, deliv_slug=None):
+        project = self.get_object()
+        deliverable = self._resolve_deliverable(project, deliv_slug)
+        return Response(self._structure_payload(deliverable))
 
     @action(detail=True, methods=["put"], url_path="structure/initialize", url_name="structure-initialize")
     def structure_initialize(self, request, slug=None):
         project = self.get_object()
         self._ensure_editor(project)
+        deliverable = self._resolve_deliverable(project, None)
+        return self._initialize_structure_for_deliverable(project, deliverable, request)
+
+    @action(
+        detail=True, methods=["put"],
+        url_path=r"deliverables/(?P<deliv_slug>[^/]+)/structure/initialize",
+        url_name="deliverable-structure-initialize",
+    )
+    def deliverable_structure_initialize(self, request, slug=None, deliv_slug=None):
+        project = self.get_object()
+        self._ensure_editor(project)
+        deliverable = self._resolve_deliverable(project, deliv_slug)
+        return self._initialize_structure_for_deliverable(project, deliverable, request)
+
+    def _initialize_structure_for_deliverable(self, project, deliverable, request):
         serializer = InitializeStructureSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         try:
             sections = initialize_project_structure(
-                project, serializer.validated_data["template_slug"],
+                project,
+                serializer.validated_data["template_slug"],
+                deliverable=deliverable,
             )
         except Exception as exc:
             return Response(
                 {"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST,
             )
-        output = ProjectSectionSerializer(sections, many=True)
-        return Response(output.data, status=status.HTTP_200_OK)
+        return Response(
+            ProjectSectionSerializer(sections, many=True).data,
+            status=status.HTTP_200_OK,
+        )
 
     @action(
         detail=True, methods=["patch", "delete"],
@@ -335,16 +511,30 @@ class ProjectViewSet(viewsets.ModelViewSet):
     def update_section(self, request, slug=None, position=None):
         project = self.get_object()
         self._ensure_editor(project)
+        deliverable = self._resolve_deliverable(project, None)
+        return self._update_section_for_deliverable(deliverable, int(position), request)
+
+    @action(
+        detail=True, methods=["patch", "delete"],
+        url_path=r"deliverables/(?P<deliv_slug>[^/]+)/sections/(?P<position>\d+)",
+        url_name="deliverable-section-update",
+    )
+    def deliverable_update_section(self, request, slug=None, deliv_slug=None, position=None):
+        project = self.get_object()
+        self._ensure_editor(project)
+        deliverable = self._resolve_deliverable(project, deliv_slug)
+        return self._update_section_for_deliverable(deliverable, int(position), request)
+
+    def _update_section_for_deliverable(self, deliverable, position: int, request):
         section = get_object_or_404(
-            ProjectSection, project=project, position=int(position),
+            ProjectSection, deliverable=deliverable, position=position,
         )
 
         if request.method == "DELETE":
             removed_position = section.position
             section.delete()
-            # Compact remaining positions so the next section becomes N.
             following = ProjectSection.objects.filter(
-                project=project, position__gt=removed_position,
+                deliverable=deliverable, position__gt=removed_position,
             ).order_by("position")
             for sec in following:
                 sec.position -= 1
@@ -355,22 +545,18 @@ class ProjectViewSet(viewsets.ModelViewSet):
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
 
-        # Reorder, if requested. Done first because it changes the section's
-        # position and we want subsequent field updates to land on the moved row.
         new_position = data.get("position")
         if new_position is not None and new_position != section.position:
             current = section.position
-            # Park the moving section out of the way to free its slot.
             section.position = (
-                ProjectSection.objects.filter(project=project).count()
+                ProjectSection.objects.filter(deliverable=deliverable).count()
                 + max(current, new_position)
                 + 1
             )
             section.save(update_fields=["position"])
             if new_position < current:
-                # Shift sections in [new_position, current) down by one.
                 shifted = ProjectSection.objects.filter(
-                    project=project,
+                    deliverable=deliverable,
                     position__gte=new_position,
                     position__lt=current,
                 ).order_by("-position")
@@ -378,9 +564,8 @@ class ProjectViewSet(viewsets.ModelViewSet):
                     sec.position += 1
                     sec.save(update_fields=["position"])
             else:
-                # Shift sections in (current, new_position] up by one.
                 shifted = ProjectSection.objects.filter(
-                    project=project,
+                    deliverable=deliverable,
                     position__gt=current,
                     position__lte=new_position,
                 ).order_by("position")
@@ -406,19 +591,32 @@ class ProjectViewSet(viewsets.ModelViewSet):
     def create_section(self, request, slug=None):
         project = self.get_object()
         self._ensure_editor(project)
+        deliverable = self._resolve_deliverable(project, None)
+        return self._create_section_for_deliverable(project, deliverable, request)
+
+    @action(
+        detail=True, methods=["post"],
+        url_path=r"deliverables/(?P<deliv_slug>[^/]+)/sections",
+        url_name="deliverable-section-create",
+    )
+    def deliverable_create_section(self, request, slug=None, deliv_slug=None):
+        project = self.get_object()
+        self._ensure_editor(project)
+        deliverable = self._resolve_deliverable(project, deliv_slug)
+        return self._create_section_for_deliverable(project, deliverable, request)
+
+    def _create_section_for_deliverable(self, project, deliverable, request):
         serializer = ProjectSectionCreateSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
         last_position = (
-            ProjectSection.objects.filter(project=project)
+            ProjectSection.objects.filter(deliverable=deliverable)
             .order_by("-position").values_list("position", flat=True).first()
         )
         position = data.get("position") or ((last_position or 0) + 1)
-        # Shift conflicting positions one by one (highest first) to keep the
-        # (project, position) unique_together constraint satisfied at every step.
         conflicting = list(
             ProjectSection.objects.filter(
-                project=project, position__gte=position,
+                deliverable=deliverable, position__gte=position,
             ).order_by("-position")
         )
         for sec in conflicting:
@@ -426,6 +624,7 @@ class ProjectViewSet(viewsets.ModelViewSet):
             sec.save(update_fields=["position"])
         section = ProjectSection.objects.create(
             project=project,
+            deliverable=deliverable,
             title=data["title"],
             description=data.get("description", ""),
             position=position,
@@ -445,6 +644,14 @@ class ProjectViewSet(viewsets.ModelViewSet):
     )
     def copilot_sessions(self, request, slug=None):
         project = self.get_object()
+        # Copilot sessions live "inside" a deliverable: the redactor writes
+        # one document at a time. The frontend may filter by
+        # ``?deliverable=<slug>`` and pass ``deliverable_slug`` in the
+        # creation body. When omitted, we default to the primary deliverable
+        # so behaviour matches the single-deliverable era.
+        deliv_slug = request.query_params.get("deliverable") or request.data.get(
+            "deliverable_slug"
+        )
 
         if request.method == "GET":
             qs = (
@@ -456,11 +663,15 @@ class ProjectViewSet(viewsets.ModelViewSet):
                 .prefetch_related("allowed_documents")
                 .order_by("-updated_at")
             )
+            if deliv_slug:
+                deliverable = self._resolve_deliverable(project, deliv_slug)
+                qs = qs.filter(deliverable=deliverable)
             serializer = ChatSessionSerializer(
                 qs, many=True, context={"request": request},
             )
             return Response(serializer.data)
 
+        deliverable = self._resolve_deliverable(project, deliv_slug)
         doc_ids = (
             ProjectDocument.objects.filter(project=project)
             .values_list("document_id", flat=True)
@@ -470,8 +681,9 @@ class ProjectViewSet(viewsets.ModelViewSet):
         session = ChatSession.objects.create(
             owner=request.user,
             project=project,
+            deliverable=deliverable,
             session_type=ChatSessionType.COPILOT,
-            title=f"Copilot: {project.name}",
+            title=f"Copilot: {deliverable.name}",
             system_prompt="",
             model=ChatSession._meta.get_field("model").default,
             temperature=0.3,

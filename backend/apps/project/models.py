@@ -229,11 +229,96 @@ class ProjectStructureSection(models.Model):
         return f"{self.template.name} — {self.position}. {self.title}"
 
 
+class ProjectDeliverableStatus(models.TextChoices):
+    DRAFT = "draft", _("Draft")
+    FINAL = "final", _("Final")
+    ARCHIVED = "archived", _("Archived")
+
+
+class ProjectDeliverable(models.Model):
+    """
+    A single document/deliverable inside a project. Each project has at
+    least one (the "primary") deliverable, but consultants frequently work
+    on several documents per engagement (informe técnico, resumen
+    ejecutivo, TdR cliente, etc.), so deliverables are first-class
+    1:N children of ``Project``.
+
+    Each deliverable owns its own ``ProjectSection`` set, copilot session,
+    template and progress — they are independent of each other inside a
+    project.
+    """
+
+    project = models.ForeignKey(
+        Project,
+        related_name="deliverables",
+        on_delete=models.CASCADE,
+    )
+    name = models.CharField(max_length=255)
+    slug = models.SlugField(max_length=255, blank=True)
+    template = models.ForeignKey(
+        ProjectStructureTemplate,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="deliverables",
+    )
+    is_primary = models.BooleanField(
+        default=False,
+        help_text="Exactly one deliverable per project should be primary.",
+    )
+    position = models.PositiveIntegerField(default=1)
+    status = models.CharField(
+        max_length=20,
+        choices=ProjectDeliverableStatus.choices,
+        default=ProjectDeliverableStatus.DRAFT,
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ("position", "created_at")
+        unique_together = (("project", "slug"), ("project", "position"))
+
+    def __str__(self) -> str:
+        return f"{self.project.name} — {self.name}"
+
+    def save(self, *args, **kwargs):
+        if not self.slug:
+            self.slug = self._generate_unique_slug()
+        super().save(*args, **kwargs)
+
+    def _generate_unique_slug(self) -> str:
+        base = slugify(self.name) or "entregable"
+        base = base[:255]
+        slug = base
+        counter = 1
+        qs = ProjectDeliverable.objects.filter(project=self.project)
+        while qs.filter(slug=slug).exclude(pk=self.pk).exists():
+            suffix = f"-{counter}"
+            slug = f"{base[: 255 - len(suffix)]}{suffix}"
+            counter += 1
+        return slug
+
+
 class ProjectSection(models.Model):
+    # ``project`` is kept (denormalised) on the row for backward-compat
+    # with consumers that read ``section.project`` directly. The
+    # source-of-truth ownership chain is now Project -> Deliverable ->
+    # Section; ``project`` is automatically synced from ``deliverable``
+    # on save.
     project = models.ForeignKey(
         Project,
         related_name="sections",
         on_delete=models.CASCADE,
+    )
+    deliverable = models.ForeignKey(
+        ProjectDeliverable,
+        null=True,
+        blank=True,
+        related_name="sections",
+        on_delete=models.CASCADE,
+        help_text="Deliverable this section belongs to. Null only during "
+                  "the migration window before back-filling.",
     )
     template_section = models.ForeignKey(
         ProjectStructureSection,
@@ -256,8 +341,13 @@ class ProjectSection(models.Model):
 
     class Meta:
         ordering = ("position",)
-        unique_together = ("project", "position")
+        unique_together = ("deliverable", "position")
 
     def __str__(self) -> str:
         return f"{self.project.name} — {self.position}. {self.title} ({self.status})"
+
+    def save(self, *args, **kwargs):
+        if self.deliverable_id and not self.project_id:
+            self.project_id = self.deliverable.project_id
+        super().save(*args, **kwargs)
 

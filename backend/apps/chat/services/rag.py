@@ -42,6 +42,7 @@ from apps.chat.services.query_analysis import (
     apply_response_mode_override,
     build_query_set,
     classify_query,
+    classify_query_hybrid,
 )
 from apps.chat.services.reranker import is_reranker_enabled, llm_rerank
 from apps.chat.services.retrieval import cap_per_document, lexical_search, rrf_fuse
@@ -415,12 +416,14 @@ def retrieve_for_chat(
         diagnostics["elapsed_seconds"] = time.perf_counter() - started
         return RetrievalResult(diagnostics=diagnostics)
 
-    analysis = classify_query(query_text)
+    analysis = classify_query_hybrid(query_text)
     analysis = apply_response_mode_override(analysis, response_mode)
     queries = build_query_set(analysis)
     diagnostics["query_type"] = analysis.query_type
     diagnostics["coverage_mode"] = analysis.coverage_mode
     diagnostics["response_mode_override"] = response_mode or None
+    diagnostics["classifier_source"] = analysis.classifier_source
+    diagnostics["classifier_confidence"] = analysis.classifier_confidence
     diagnostics["sub_queries"] = max(0, len(queries) - 1)
 
     requires_all_docs = analysis.coverage_mode == COVERAGE_MODE_ALL

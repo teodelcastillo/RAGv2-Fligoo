@@ -8,6 +8,8 @@ from apps.document.models import Document
 from apps.document.services import accessible_documents_for
 from apps.project.models import (
     Project,
+    ProjectDeliverable,
+    ProjectDeliverableStatus,
     ProjectDocument,
     ProjectSection,
     ProjectSectionStatus,
@@ -471,16 +473,21 @@ class ProjectSectionSerializer(serializers.ModelSerializer):
     # Surfaces the curated skill shortcuts on the deliverable outline so the
     # consultant can act on a section without leaving it.
     suggested_skill_slugs = serializers.SerializerMethodField()
+    deliverable_slug = serializers.CharField(
+        source="deliverable.slug", read_only=True, default=None,
+    )
 
     class Meta:
         model = ProjectSection
         fields = (
             "id", "title", "description", "position", "status",
             "notes", "output_snapshot", "suggested_skill_slugs",
+            "deliverable_slug",
             "updated_at", "created_at",
         )
         read_only_fields = (
-            "id", "position", "suggested_skill_slugs", "updated_at", "created_at",
+            "id", "position", "suggested_skill_slugs", "deliverable_slug",
+            "updated_at", "created_at",
         )
 
     def get_suggested_skill_slugs(self, obj) -> list[str]:
@@ -537,4 +544,61 @@ class CopilotAutocompleteSerializer(serializers.Serializer):
 
 class InitializeStructureSerializer(serializers.Serializer):
     template_slug = serializers.SlugField()
+
+
+# ---------------------------------------------------------------------------
+# Deliverables (1:N within a project)
+# ---------------------------------------------------------------------------
+
+
+class ProjectDeliverableSerializer(serializers.ModelSerializer):
+    template_slug = serializers.CharField(
+        source="template.slug", read_only=True, default=None,
+    )
+    template_name = serializers.CharField(
+        source="template.name", read_only=True, default=None,
+    )
+    sections_count = serializers.SerializerMethodField()
+    completed_sections = serializers.SerializerMethodField()
+
+    class Meta:
+        model = ProjectDeliverable
+        fields = (
+            "id", "name", "slug",
+            "template_slug", "template_name",
+            "is_primary", "position", "status",
+            "sections_count", "completed_sections",
+            "created_at", "updated_at",
+        )
+        read_only_fields = (
+            "id", "slug",
+            "template_slug", "template_name",
+            "sections_count", "completed_sections",
+            "created_at", "updated_at",
+        )
+
+    def get_sections_count(self, obj) -> int:
+        return obj.sections.count()
+
+    def get_completed_sections(self, obj) -> int:
+        return obj.sections.filter(status=ProjectSectionStatus.COMPLETED).count()
+
+
+class ProjectDeliverableCreateSerializer(serializers.Serializer):
+    """Payload for creating a new deliverable inside a project."""
+
+    name = serializers.CharField(max_length=255)
+    template_slug = serializers.SlugField(required=False, allow_blank=True)
+    status = serializers.ChoiceField(
+        choices=ProjectDeliverableStatus.choices, required=False,
+    )
+
+
+class ProjectDeliverableUpdateSerializer(serializers.Serializer):
+    name = serializers.CharField(required=False, max_length=255)
+    status = serializers.ChoiceField(
+        choices=ProjectDeliverableStatus.choices, required=False,
+    )
+    is_primary = serializers.BooleanField(required=False)
+    position = serializers.IntegerField(required=False, min_value=1)
 

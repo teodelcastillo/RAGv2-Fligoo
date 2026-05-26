@@ -22,7 +22,12 @@ from apps.chat.api.serializers import (
 )
 from apps.chat.models import ChatMessage, ChatSession, MessageRole, touch_chat_session_activity
 from apps.chat.services.context_builder import build_citation_prompt
-from apps.chat.services.query_analysis import COVERAGE_MODE_ALL, classify_query, contextualize_query
+from apps.chat.services.query_analysis import (
+    COVERAGE_MODE_ALL,
+    apply_response_mode_override,
+    classify_query_hybrid,
+    contextualize_query,
+)
 from apps.chat.services.rag import RetrievalResult, retrieve_for_chat, suggest_related_library_documents
 from apps.document.models import Document
 from apps.document.utils import client_openia
@@ -42,9 +47,10 @@ def _chat_retrieval_params(
     the current message. Wider pools for broader questions and bigger libraries.
     """
     doc_count = session.allowed_documents.count()
-    analysis = classify_query(content)
-    if response_mode == "panorama":
-        analysis.coverage_mode = COVERAGE_MODE_ALL
+    analysis = classify_query_hybrid(content)
+    # Apply the same override the RAG pipeline uses so pool sizing
+    # matches the eventual retrieval decision.
+    analysis = apply_response_mode_override(analysis, response_mode)
     broad_question = len((content or "").split()) >= 18
     if analysis.coverage_mode == COVERAGE_MODE_ALL:
         total_limit = doc_count

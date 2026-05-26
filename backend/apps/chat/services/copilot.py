@@ -293,14 +293,16 @@ def process_copilot_message(
         metadata["draft_markdown"] = draft_markdown
         metadata["draft_section_position"] = draft_section_position
         # Persist a snapshot on the section so the structure tab can show progress.
+        # Scope the lookup to the deliverable the copilot session is tied
+        # to, so multi-deliverable projects don't collide on position.
         if draft_section_position is not None:
-            try:
-                section = ProjectSection.objects.get(
-                    project=project, position=draft_section_position,
-                )
-            except ProjectSection.DoesNotExist:
-                pass
-            else:
+            section_qs = ProjectSection.objects.filter(
+                project=project, position=draft_section_position,
+            )
+            if session.deliverable_id is not None:
+                section_qs = section_qs.filter(deliverable_id=session.deliverable_id)
+            section = section_qs.first()
+            if section is not None:
                 section.output_snapshot = draft_markdown
                 section.save(update_fields=["output_snapshot", "updated_at"])
 
@@ -311,20 +313,53 @@ def process_copilot_message(
 # Initialize project structure from template
 # ---------------------------------------------------------------------------
 
-def initialize_project_structure(project: Project, template_slug: str) -> list[ProjectSection]:
-    from apps.project.models import ProjectStructureTemplate
+def initialize_project_structure(
+    project: Project,
+    template_slug: str,
+    *,
+    deliverable=None,
+) -> list[ProjectSection]:
+    """
+    Wipe and re-create the sections of a deliverable from a template.
+
+    When ``deliverable`` is given (preferred path) the operation is scoped
+    to that deliverable. For backward-compat with the legacy ``/structure``
+    endpoint, ``deliverable=None`` resolves to the project's primary
+    deliverable (auto-created if missing) so existing callers keep working.
+    """
+    from apps.project.models import ProjectDeliverable, ProjectStructureTemplate
 
     template = ProjectStructureTemplate.objects.get(slug=template_slug)
 
-    ProjectSection.objects.filter(project=project).delete()
+    if deliverable is None:
+        deliverable = (
+            ProjectDeliverable.objects.filter(project=project, is_primary=True).first()
+            or ProjectDeliverable.objects.filter(project=project).first()
+        )
+        if deliverable is None:
+            deliverable = ProjectDeliverable.objects.create(
+                project=project,
+                name="Entregable principal",
+                template=template,
+                is_primary=True,
+                position=1,
+            )
 
-    project.structure_template = template
-    project.save(update_fields=["structure_template"])
+    ProjectSection.objects.filter(deliverable=deliverable).delete()
+
+    # Keep the project-level template pointer in sync only for the primary
+    # deliverable so the legacy field still represents "the" project template.
+    deliverable.template = template
+    deliverable.save(update_fields=["template", "updated_at"])
+    if deliverable.is_primary:
+        project.structure_template = template
+        project.save(update_fields=["structure_template"])
 
     sections = []
     for ts in template.sections.order_by("position"):
         section = ProjectSection.objects.create(
             project=project,
+            deliverable=deliverable,
             template_section=ts,
             title=ts.title,
             description=ts.description,

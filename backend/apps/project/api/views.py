@@ -14,12 +14,17 @@ from apps.chat.api.serializers import (
     ChatSessionSerializer,
     ChatSessionCreateSerializer,
 )
-from apps.chat.services.copilot import initialize_project_structure, process_copilot_message
+from apps.chat.services.copilot import (
+    generate_copilot_autocomplete,
+    initialize_project_structure,
+    process_copilot_message,
+)
 from apps.document.models import Document
 from apps.evaluation.api.serializers import EvaluationRunSerializer
 from apps.evaluation.models import EvaluationRun, PillarEvaluationResult
 from apps.project.api.permissions import ProjectAccessPermission
 from apps.project.api.serializers import (
+    CopilotAutocompleteSerializer,
     CopilotMessageCreateSerializer,
     InitializeStructureSerializer,
     ProjectDocumentAttachSerializer,
@@ -505,6 +510,52 @@ class ProjectViewSet(viewsets.ModelViewSet):
                 "assistant_message": ChatMessageSerializer(assistant_message).data,
             },
             status=status.HTTP_201_CREATED,
+        )
+
+    @action(
+        detail=True, methods=["post"],
+        url_path="copilot/autocomplete", url_name="copilot-autocomplete",
+    )
+    def copilot_autocomplete(self, request, slug=None):
+        """
+        Inline ghost-text suggestion for the project editor.
+
+        The editor calls this on caret pause or via keyboard shortcut. The
+        response is a short continuation text the frontend overlays as ghost
+        text — Tab to accept, Esc to dismiss.
+        """
+        project = self.get_object()
+        serializer = CopilotAutocompleteSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+
+        section = None
+        position = data.get("section_position")
+        if position:
+            section = ProjectSection.objects.filter(
+                project=project, position=position,
+            ).first()
+
+        try:
+            completion, usage = generate_copilot_autocomplete(
+                project,
+                before=data.get("before", ""),
+                after=data.get("after", ""),
+                section=section,
+                doc_title=data.get("doc_title") or None,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return Response(
+                {"detail": f"Autocomplete error: {exc}"},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+
+        return Response(
+            {
+                "completion": completion,
+                "usage": usage,
+            },
+            status=status.HTTP_200_OK,
         )
 
     def _ensure_editor(self, project: Project):

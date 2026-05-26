@@ -15,7 +15,7 @@ from apps.chat.services.copilot_tools import (
 )
 from apps.chat.services.rag import suggest_related_library_documents
 from apps.document.models import Document
-from apps.document.utils.client_openia import generate_with_tools
+from apps.document.utils.client_openia import generate_chat_completion, generate_with_tools
 from apps.project.models import Project, ProjectSection
 
 logger = logging.getLogger(__name__)
@@ -333,3 +333,165 @@ def initialize_project_structure(project: Project, template_slug: str) -> list[P
         sections.append(section)
 
     return sections
+
+
+# ---------------------------------------------------------------------------
+# Inline copilot autocomplete (editor ghost-text)
+# ---------------------------------------------------------------------------
+
+# Hard caps to keep autocomplete cheap and snappy. The editor sends short
+# windows around the caret so we don't blow up the prompt context per
+# keystroke / pause.
+AUTOCOMPLETE_BEFORE_CHARS = 2000
+AUTOCOMPLETE_AFTER_CHARS = 500
+AUTOCOMPLETE_DOC_SUMMARY_CHARS = 400
+AUTOCOMPLETE_MAX_DOCS = 6
+AUTOCOMPLETE_MAX_TOKENS = 120
+
+
+def _format_doc_briefs_for_autocomplete(documents: QuerySet[Document]) -> str:
+    docs = list(documents.only("name", "slug", "content_summary")[: AUTOCOMPLETE_MAX_DOCS])
+    if not docs:
+        return ""
+    lines = ["## Fuentes del proyecto"]
+    for doc in docs:
+        summary = (doc.content_summary or "").strip()
+        if len(summary) > AUTOCOMPLETE_DOC_SUMMARY_CHARS:
+            summary = summary[: AUTOCOMPLETE_DOC_SUMMARY_CHARS - 1].rstrip() + "…"
+        if summary:
+            lines.append(f"- {doc.name}: {summary}")
+        else:
+            lines.append(f"- {doc.name}")
+    return "\n".join(lines)
+
+
+def _build_autocomplete_system_prompt(
+    project: Project,
+    documents: QuerySet[Document],
+    section: ProjectSection | None,
+    doc_title: str | None,
+) -> str:
+    blueprint_slug = (
+        project.blueprint_document.slug if project.blueprint_document_id else None
+    )
+    parts: list[str] = [
+        (
+            "Eres un motor de autocompletado contextual para un consultor de "
+            "sostenibilidad y finanzas climaticas que esta redactando un documento. "
+            "Tu tarea: continuar el texto donde quedo el cursor con 1 a 3 oraciones "
+            "breves, coherentes con el tono y el idioma del autor, y consistentes con "
+            "las fuentes del proyecto. No introduzcas datos inventados; si no hay "
+            "evidencia clara, propone un puente o pregunta abierta."
+        ),
+        (
+            "Formato de salida estricto:\n"
+            "- Devuelve SOLO la continuacion directa del texto, sin comillas, sin "
+            "preambulo, sin 'Aqui tienes', sin explicaciones.\n"
+            "- No repitas la ultima frase del usuario; conectate suavemente con ella.\n"
+            "- Maximo ~3 oraciones (~60 palabras).\n"
+            "- Conserva el idioma exacto del texto de entrada.\n"
+            "- Si el contexto despues del cursor empieza con una frase coherente, "
+            "asegurate de que tu continuacion conecte gramaticalmente con ella."
+        ),
+        f'Proyecto: "{project.name}".',
+    ]
+    if project.description:
+        parts.append(f"Resumen del proyecto: {project.description}")
+
+    notes_block = _format_context_notes(project.context_notes or {})
+    if notes_block:
+        parts.append(notes_block)
+
+    docs_block = _format_doc_briefs_for_autocomplete(documents)
+    if docs_block:
+        parts.append(docs_block)
+
+    if blueprint_slug:
+        parts.append(
+            f"Documento principal (blueprint): '{blueprint_slug}'. Es el mandato del "
+            "encargo: alinea las afirmaciones con lo descrito ahi."
+        )
+
+    if section is not None:
+        section_block = [f"## Seccion en curso\n#{section.position}. {section.title}"]
+        if section.description:
+            section_block.append(f"Proposito: {section.description}")
+        if section.notes:
+            section_block.append(f"Notas internas: {section.notes}")
+        parts.append("\n".join(section_block))
+
+    if doc_title:
+        parts.append(f"Documento de trabajo: '{doc_title}'.")
+
+    return "\n\n".join(parts)
+
+
+def generate_copilot_autocomplete(
+    project: Project,
+    *,
+    before: str,
+    after: str = "",
+    section: ProjectSection | None = None,
+    doc_title: str | None = None,
+) -> tuple[str, dict]:
+    """
+    Generate an inline continuation for the editor caret position.
+
+    Returns (completion_text, usage_dict). The completion is a short
+    natural-language continuation of ``before``, optionally connecting into
+    ``after`` if provided. We use a plain chat completion (no tools, no RAG
+    streaming) to keep latency low — context comes from the project's stored
+    document summaries.
+    """
+    before_text = (before or "")[-AUTOCOMPLETE_BEFORE_CHARS:]
+    after_text = (after or "")[:AUTOCOMPLETE_AFTER_CHARS]
+
+    documents = _resolve_project_documents(project)
+    system_prompt = _build_autocomplete_system_prompt(
+        project, documents, section, doc_title,
+    )
+
+    user_parts = ["CONTEXTO ANTES DEL CURSOR:\n" + before_text]
+    if after_text.strip():
+        user_parts.append("CONTEXTO DESPUES DEL CURSOR:\n" + after_text)
+    user_parts.append("Continua el texto justo despues del cursor.")
+    user_content = "\n\n".join(user_parts)
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_content},
+    ]
+
+    completion_text, usage = generate_chat_completion(
+        messages,
+        temperature=0.3,
+        max_tokens=AUTOCOMPLETE_MAX_TOKENS,
+    )
+
+    cleaned = _clean_autocomplete_text(completion_text, before_text)
+    return cleaned, usage
+
+
+def _clean_autocomplete_text(text: str, before: str) -> str:
+    """Trim quotes/preamble and any duplication of the trailing user text."""
+    if not text:
+        return ""
+    out = text.strip()
+    # Strip wrapping quotes added by some models.
+    if (out.startswith('"') and out.endswith('"')) or (
+        out.startswith("'") and out.endswith("'")
+    ):
+        out = out[1:-1].strip()
+    if out.startswith("```"):
+        out = out.lstrip("`").strip()
+
+    # If the model echoed the end of `before`, drop the overlap so the inserted
+    # text reads naturally when appended at the caret.
+    tail = before[-200:].rstrip()
+    if tail:
+        for overlap_len in range(min(len(tail), len(out)), 10, -1):
+            if out.startswith(tail[-overlap_len:]):
+                out = out[overlap_len:].lstrip()
+                break
+
+    return out

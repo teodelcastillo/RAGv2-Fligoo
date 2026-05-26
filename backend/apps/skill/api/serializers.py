@@ -11,6 +11,7 @@ from apps.skill.models import (
     Skill,
     SkillContext,
     SkillExecution,
+    SkillExecutionVersion,
     SkillParameter,
     SkillParameterType,
     SkillStep,
@@ -380,6 +381,9 @@ class SkillExecutionSerializer(serializers.ModelSerializer):
     document_slug = serializers.SlugField(source="document.slug", read_only=True, allow_null=True)
     # Sprint 3 — incremental progress
     steps_total = serializers.IntegerField(read_only=True)
+    # Editable output state
+    edited_by_email = serializers.EmailField(source="edited_by.email", read_only=True, allow_null=True)
+    versions_count = serializers.SerializerMethodField()
 
     class Meta:
         model = SkillExecution
@@ -389,11 +393,40 @@ class SkillExecutionSerializer(serializers.ModelSerializer):
             "repository_slug", "project_slug", "document_slug",
             "extra_instructions", "input_values", "output_mode",
             "output", "output_structured",
+            "edited_output", "edited_at", "edited_by_email", "versions_count",
             "steps_completed", "steps_total", "current_step_position",
             "document_snapshot", "metadata", "error_message",
             "started_at", "finished_at", "created_at",
         )
         read_only_fields = fields
+
+    def get_versions_count(self, obj) -> int:
+        return obj.versions.count() if obj.pk else 0
+
+
+class SkillExecutionVersionSerializer(serializers.ModelSerializer):
+    created_by_email = serializers.EmailField(
+        source="created_by.email", read_only=True, allow_null=True,
+    )
+
+    class Meta:
+        model = SkillExecutionVersion
+        fields = (
+            "id",
+            "version_number",
+            "label",
+            "content",
+            "created_by_email",
+            "created_at",
+        )
+        read_only_fields = fields
+
+
+class SaveExecutionEditSerializer(serializers.Serializer):
+    """Payload for POST /skill-executions/{id}/edit/."""
+
+    content = serializers.CharField(allow_blank=False)
+    label = serializers.CharField(required=False, allow_blank=True, max_length=120, default="")
 
 
 class ApproveStepSerializer(serializers.Serializer):

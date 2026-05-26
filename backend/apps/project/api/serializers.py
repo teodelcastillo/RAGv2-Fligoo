@@ -264,6 +264,11 @@ class ProjectWriteSerializer(ProjectSerializer):
             return
         project.blueprint_document = doc
         project.save(update_fields=["blueprint_document"])
+        # Keep the per-link is_primary flag in sync so the frontend can rely
+        # on either field; otherwise stale is_primary rows would short-circuit
+        # the doc-finder and show the old primary until a full refresh.
+        project.project_documents.filter(is_primary=True).exclude(document=doc).update(is_primary=False)
+        project.project_documents.filter(document=doc).update(is_primary=True)
 
 
 class ProjectDocumentAttachSerializer(serializers.Serializer):
@@ -495,6 +500,22 @@ class ProjectSectionCreateSerializer(serializers.Serializer):
 
 class CopilotMessageCreateSerializer(serializers.Serializer):
     content = serializers.CharField(allow_blank=False, max_length=4000)
+
+
+class CopilotAutocompleteSerializer(serializers.Serializer):
+    """
+    Payload for inline ghost-text suggestions in the editor.
+
+    Both ``before`` and ``after`` are caret windows of the editor's plain text
+    representation. ``section_position`` and ``doc_title`` give the model an
+    extra hint about which deliverable section / scratch doc the consultant is
+    drafting.
+    """
+
+    before = serializers.CharField(allow_blank=True, max_length=8000)
+    after = serializers.CharField(allow_blank=True, required=False, default="", max_length=4000)
+    section_position = serializers.IntegerField(required=False, allow_null=True, min_value=1)
+    doc_title = serializers.CharField(required=False, allow_blank=True, max_length=255)
 
 
 class InitializeStructureSerializer(serializers.Serializer):

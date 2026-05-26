@@ -375,6 +375,26 @@ class SkillExecution(models.Model):
     # COPILOT output: {"steps": [{"step_id": 1, "title": "...", "content": "..."}]}
     output_structured = models.JSONField(default=dict, blank=True)
 
+    # User-curated edit of the execution output. When non-empty this becomes
+    # the "current" content shown in the result view; the raw AI output stays
+    # intact under `output` / `output_structured` so the user can always
+    # diff or revert to the original.
+    edited_output = models.TextField(
+        blank=True,
+        help_text=(
+            "Latest user-edited markdown of this execution's result. Empty means "
+            "the user has not modified the AI-generated output yet."
+        ),
+    )
+    edited_at = models.DateTimeField(null=True, blank=True)
+    edited_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        related_name="edited_skill_executions",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+    )
+
     # How many copilot steps have been written so far (updated incrementally during execution).
     steps_completed = models.PositiveSmallIntegerField(
         default=0,
@@ -426,3 +446,50 @@ class SkillExecution(models.Model):
         if self.document_id:
             return f"Document: {self.document.name}"
         return "No context"
+
+
+# ---------------------------------------------------------------------------
+# Execution version history
+# ---------------------------------------------------------------------------
+
+class SkillExecutionVersion(models.Model):
+    """
+    Immutable snapshot of a SkillExecution's edited output.
+
+    Each save of `edited_output` produces a new version row so the user can
+    review or restore previous iterations. The first version is created the
+    first time the user saves an edit; the raw AI output (pre-edit) is
+    intentionally NOT versioned here — it lives on the execution itself.
+    """
+    execution = models.ForeignKey(
+        SkillExecution,
+        related_name="versions",
+        on_delete=models.CASCADE,
+    )
+    version_number = models.PositiveIntegerField()
+    label = models.CharField(
+        max_length=120,
+        blank=True,
+        help_text="Optional short note the user attaches to this save point.",
+    )
+    content = models.TextField(
+        help_text="Markdown snapshot of edited_output at the time of save.",
+    )
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        related_name="skill_execution_versions",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ("-version_number",)
+        unique_together = ("execution", "version_number")
+        indexes = [
+            models.Index(fields=("execution", "version_number")),
+        ]
+
+    def __str__(self) -> str:
+        return f"Execution {self.execution_id} v{self.version_number}"

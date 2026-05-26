@@ -16,7 +16,9 @@ from apps.skill.access import (
 from apps.skill.api.serializers import (
     ApproveStepSerializer,
     RunSkillSerializer,
+    SaveExecutionEditSerializer,
     SkillExecutionSerializer,
+    SkillExecutionVersionSerializer,
     SkillSerializer,
     SkillWriteSerializer,
 )
@@ -25,6 +27,7 @@ from apps.skill.models import (
     ExecutionStatus,
     Skill,
     SkillExecution,
+    SkillExecutionVersion,
     SkillStep,
     SkillType,
 )
@@ -308,3 +311,131 @@ class SkillExecutionViewSet(
 
         run_skill_task.delay(execution.id)
         return Response(SkillExecutionSerializer(execution).data, status=status.HTTP_202_ACCEPTED)
+
+    # ------------------------------------------------------------------
+    # Editable output + version history
+    # ------------------------------------------------------------------
+
+    @action(detail=True, methods=["get", "post"], url_path="versions")
+    def versions(self, request, pk=None):
+        """
+        GET  /skill-executions/{id}/versions/  → list saved versions (newest first).
+        POST /skill-executions/{id}/versions/  → save the current edit as a new
+            version. Body: { "content": str, "label?": str }.
+        """
+        execution = self.get_object()
+
+        if request.method == "GET":
+            qs = execution.versions.select_related("created_by").order_by("-version_number")
+            data = SkillExecutionVersionSerializer(qs, many=True).data
+            return Response(data)
+
+        if not user_can_mutate_execution(request.user, execution):
+            raise PermissionDenied("No tienes permisos para editar esta ejecución.")
+
+        serializer = SaveExecutionEditSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        content = serializer.validated_data["content"]
+        label = serializer.validated_data.get("label", "")
+
+        from django.db import transaction
+        from django.utils import timezone
+
+        with transaction.atomic():
+            execution = (
+                SkillExecution.objects.select_for_update().get(pk=execution.pk)
+            )
+            last = (
+                execution.versions.order_by("-version_number").first()
+            )
+            next_number = (last.version_number + 1) if last else 1
+            version = SkillExecutionVersion.objects.create(
+                execution=execution,
+                version_number=next_number,
+                label=label,
+                content=content,
+                created_by=request.user,
+            )
+            execution.edited_output = content
+            execution.edited_at = timezone.now()
+            execution.edited_by = request.user
+            execution.save(update_fields=["edited_output", "edited_at", "edited_by"])
+
+        return Response(
+            {
+                "version": SkillExecutionVersionSerializer(version).data,
+                "execution": SkillExecutionSerializer(execution).data,
+            },
+            status=status.HTTP_201_CREATED,
+        )
+
+    @action(
+        detail=True,
+        methods=["post"],
+        url_path=r"versions/(?P<version_number>\d+)/restore",
+    )
+    def restore_version(self, request, pk=None, version_number=None):
+        """
+        Restore a previous version into the current edited_output.
+
+        Restoring also creates a new version on top so the history is
+        append-only — undoing a restore is just another restore.
+        """
+        execution = self.get_object()
+        if not user_can_mutate_execution(request.user, execution):
+            raise PermissionDenied("No tienes permisos para editar esta ejecución.")
+
+        try:
+            version = execution.versions.get(version_number=int(version_number))
+        except SkillExecutionVersion.DoesNotExist:
+            return Response(
+                {"detail": "Version not found."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        from django.db import transaction
+        from django.utils import timezone
+
+        with transaction.atomic():
+            execution = (
+                SkillExecution.objects.select_for_update().get(pk=execution.pk)
+            )
+            last = execution.versions.order_by("-version_number").first()
+            next_number = (last.version_number + 1) if last else 1
+            new_version = SkillExecutionVersion.objects.create(
+                execution=execution,
+                version_number=next_number,
+                label=f"Restaurada desde v{version.version_number}",
+                content=version.content,
+                created_by=request.user,
+            )
+            execution.edited_output = version.content
+            execution.edited_at = timezone.now()
+            execution.edited_by = request.user
+            execution.save(update_fields=["edited_output", "edited_at", "edited_by"])
+
+        return Response(
+            {
+                "version": SkillExecutionVersionSerializer(new_version).data,
+                "execution": SkillExecutionSerializer(execution).data,
+            },
+            status=status.HTTP_200_OK,
+        )
+
+    @action(detail=True, methods=["post"], url_path="reset-edit")
+    def reset_edit(self, request, pk=None):
+        """
+        Drop the current edited copy and fall back to the raw AI output.
+
+        Note: this does NOT delete the version history — only clears the
+        live edited_output. Saved versions remain available for restore.
+        """
+        execution = self.get_object()
+        if not user_can_mutate_execution(request.user, execution):
+            raise PermissionDenied("No tienes permisos para editar esta ejecución.")
+
+        execution.edited_output = ""
+        execution.edited_at = None
+        execution.edited_by = None
+        execution.save(update_fields=["edited_output", "edited_at", "edited_by"])
+        return Response(SkillExecutionSerializer(execution).data)

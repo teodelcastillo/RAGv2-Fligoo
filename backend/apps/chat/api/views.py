@@ -118,10 +118,30 @@ def _run_retrieval(
     Defensive wrapper around ``retrieve_for_chat``. Failures (embeddings,
     pgvector, OpenAI keys) must not bubble up as 500s — return an empty
     result so the chat still answers using base knowledge.
+
+    When the session has no explicitly attached documents (e.g. the global
+    chat), falls back to the user's personal document library so that
+    questions like "quién es Teodoro" can still be answered from the user's
+    own uploaded CVs/reports.
     """
     allowed_docs = session.allowed_documents.all()
     if not allowed_docs.exists():
-        return RetrievalResult()
+        # No documents pinned to this session → fall back to the user's
+        # personal library (owned documents that have been fully processed).
+        # We deliberately exclude public documents here to avoid polluting
+        # a personal query with unrelated library content.
+        from apps.document.models import ChunkingStatus
+        personal_docs = (
+            Document.objects.filter(
+                owner=user,
+                chunking_status=ChunkingStatus.DONE,
+            )
+            .filter(chunks__embedding__isnull=False)
+            .distinct()
+        )
+        if not personal_docs.exists():
+            return RetrievalResult()
+        allowed_docs = personal_docs
 
     retrieval_query = content
     history_qs = (

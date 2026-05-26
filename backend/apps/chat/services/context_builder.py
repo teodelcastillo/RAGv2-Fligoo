@@ -57,6 +57,9 @@ def build_context_block(
         )
         if doc_slug:
             header += f" (slug: {doc_slug}, chunk #{chunk.chunk_index})"
+        chunk_title = (getattr(chunk, "title", "") or "").strip()
+        if chunk_title:
+            header += f" | Sección: {chunk_title}"
         ctx = (getattr(chunk, "context_summary", "") or "").strip()
         body = f"Contexto: {ctx}\n{content}" if ctx else content
         sections.append(f"{header}\n{body}")

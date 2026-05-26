@@ -45,6 +45,10 @@ class DocumentChunkSerializer(serializers.ModelSerializer):
             'document_name',
             'document_file',
             'document_source',
+            'title',
+            'summary',
+            'keywords',
+            'context_summary',
             'token_count',
             'created_at',
         ]

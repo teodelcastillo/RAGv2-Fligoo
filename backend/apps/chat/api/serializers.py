@@ -7,6 +7,7 @@ from rest_framework import serializers
 
 from apps.chat.models import ChatSession, ChatMessage
 from apps.document.services import accessible_documents_for
+from apps.document.api.serializers import DocumentChunkSerializer
 from apps.document.models import Document, SmartChunk
 
 CHAT_MAX_DOCUMENTS_PER_SESSION = int(os.environ.get("CHAT_MAX_DOCUMENTS_PER_SESSION", "20"))
@@ -123,21 +124,26 @@ class ChatMessageSerializer(serializers.ModelSerializer):
             chunk.id: chunk
             for chunk in SmartChunk.objects.filter(id__in=obj.chunk_ids).select_related("document")
         }
-        serialized = []
-        for chunk_id in obj.chunk_ids:
-            chunk = chunks_by_id.get(chunk_id)
-            if chunk is None:
-                continue
-            serialized.append(
-                {
-                    "id": chunk.id,
-                    "document_slug": chunk.document.slug,
-                    "document_name": chunk.document.name,
-                    "chunk_index": chunk.chunk_index,
-                    "content": chunk.content,
-                }
-            )
-        return serialized
+        ordered_chunks = [
+            chunks_by_id[chunk_id]
+            for chunk_id in obj.chunk_ids
+            if chunk_id in chunks_by_id
+        ]
+        if not ordered_chunks:
+            return []
+        serialized_by_id = {
+            item["id"]: item
+            for item in DocumentChunkSerializer(
+                ordered_chunks,
+                many=True,
+                context=self.context,
+            ).data
+        }
+        return [
+            serialized_by_id[chunk_id]
+            for chunk_id in obj.chunk_ids
+            if chunk_id in serialized_by_id
+        ]
 
 
 class ChatMessageCreateSerializer(serializers.Serializer):

@@ -354,6 +354,42 @@ class ProjectViewSet(viewsets.ModelViewSet):
         serializer = ProjectSectionUpdateSerializer(data=request.data, partial=True)
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
+
+        # Reorder, if requested. Done first because it changes the section's
+        # position and we want subsequent field updates to land on the moved row.
+        new_position = data.get("position")
+        if new_position is not None and new_position != section.position:
+            current = section.position
+            # Park the moving section out of the way to free its slot.
+            section.position = (
+                ProjectSection.objects.filter(project=project).count()
+                + max(current, new_position)
+                + 1
+            )
+            section.save(update_fields=["position"])
+            if new_position < current:
+                # Shift sections in [new_position, current) down by one.
+                shifted = ProjectSection.objects.filter(
+                    project=project,
+                    position__gte=new_position,
+                    position__lt=current,
+                ).order_by("-position")
+                for sec in shifted:
+                    sec.position += 1
+                    sec.save(update_fields=["position"])
+            else:
+                # Shift sections in (current, new_position] up by one.
+                shifted = ProjectSection.objects.filter(
+                    project=project,
+                    position__gt=current,
+                    position__lte=new_position,
+                ).order_by("position")
+                for sec in shifted:
+                    sec.position -= 1
+                    sec.save(update_fields=["position"])
+            section.position = new_position
+            section.save(update_fields=["position"])
+
         update_fields = []
         for field in ("title", "description", "status", "notes", "output_snapshot"):
             if field in data:

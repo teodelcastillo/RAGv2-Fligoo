@@ -467,15 +467,28 @@ class ProjectStructureTemplateWriteSerializer(serializers.ModelSerializer):
 # ---------------------------------------------------------------------------
 
 class ProjectSectionSerializer(serializers.ModelSerializer):
+    # Inherited from the template (when the section was initialised from one).
+    # Surfaces the curated skill shortcuts on the deliverable outline so the
+    # consultant can act on a section without leaving it.
+    suggested_skill_slugs = serializers.SerializerMethodField()
+
     class Meta:
         model = ProjectSection
         fields = (
             "id", "title", "description", "position", "status",
-            "notes", "output_snapshot", "updated_at", "created_at",
+            "notes", "output_snapshot", "suggested_skill_slugs",
+            "updated_at", "created_at",
         )
         read_only_fields = (
-            "id", "position", "updated_at", "created_at",
+            "id", "position", "suggested_skill_slugs", "updated_at", "created_at",
         )
+
+    def get_suggested_skill_slugs(self, obj) -> list[str]:
+        template = obj.template_section
+        if template is None:
+            return []
+        value = template.suggested_skill_slugs or []
+        return [s for s in value if isinstance(s, str)]
 
 
 class ProjectSectionUpdateSerializer(serializers.Serializer):
@@ -486,6 +499,10 @@ class ProjectSectionUpdateSerializer(serializers.Serializer):
     )
     notes = serializers.CharField(required=False, allow_blank=True)
     output_snapshot = serializers.CharField(required=False, allow_blank=True)
+    # Optional target position. The viewset re-orders sections in a safe
+    # two-step swap to keep the (project, position) unique constraint
+    # satisfied at every intermediate save.
+    position = serializers.IntegerField(required=False, min_value=1)
 
 
 class ProjectSectionCreateSerializer(serializers.Serializer):

@@ -37,7 +37,7 @@ class EvaluationViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         user = self.request.user
-        return (
+        qs = (
             Evaluation.objects.for_user(user)
             .select_related("owner", "project")
             .prefetch_related(
@@ -56,6 +56,12 @@ class EvaluationViewSet(viewsets.ModelViewSet):
             )
             .distinct()
         )
+        # `?project=<slug>` lets project detail pages cheaply scope evaluations
+        # to the current project without hand-rolling a per-project endpoint.
+        project_slug = self.request.query_params.get("project")
+        if project_slug:
+            qs = qs.filter(project__slug=project_slug)
+        return qs
 
     def get_serializer_class(self):
         if self.action in {"create", "update", "partial_update"}:

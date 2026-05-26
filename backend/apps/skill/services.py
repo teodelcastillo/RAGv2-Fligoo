@@ -49,7 +49,16 @@ def resolve_documents(execution: SkillExecution) -> QuerySet[Document]:
     - Repository: only is_active=True documents
     - Project: all linked documents
     - Document: the single document
+
+    When ``execution.metadata["document_slugs_filter"]`` contains slugs, the
+    base context queryset is intersected with that selection so the run only
+    sees the documents the user explicitly chose. An empty/absent filter
+    preserves the legacy behaviour of using the full context.
     """
+    metadata = execution.metadata or {}
+    slug_filter = metadata.get("document_slugs_filter") or []
+    slug_filter = [s for s in slug_filter if isinstance(s, str) and s.strip()]
+
     if execution.repository_id:
         from apps.repository.models import RepositoryDocument
         doc_ids = (
@@ -57,7 +66,10 @@ def resolve_documents(execution: SkillExecution) -> QuerySet[Document]:
             .filter(repository_id=execution.repository_id, is_active=True)
             .values_list("document_id", flat=True)
         )
-        return Document.objects.filter(id__in=doc_ids)
+        qs = Document.objects.filter(id__in=doc_ids)
+        if slug_filter:
+            qs = qs.filter(slug__in=slug_filter)
+        return qs
 
     if execution.project_id:
         from apps.project.models import ProjectDocument
@@ -66,7 +78,10 @@ def resolve_documents(execution: SkillExecution) -> QuerySet[Document]:
             .filter(project_id=execution.project_id)
             .values_list("document_id", flat=True)
         )
-        return Document.objects.filter(id__in=doc_ids)
+        qs = Document.objects.filter(id__in=doc_ids)
+        if slug_filter:
+            qs = qs.filter(slug__in=slug_filter)
+        return qs
 
     if execution.document_id:
         return Document.objects.filter(id=execution.document_id)

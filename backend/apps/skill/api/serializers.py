@@ -459,6 +459,16 @@ class RunSkillSerializer(serializers.Serializer):
             "Example: {\"framework\": \"GRI\", \"target_year\": \"2024\"}."
         ),
     )
+    # Optional subset of documents to consider for this run. When provided, the
+    # runner intersects this list with the context's accessible documents
+    # (project linked docs / repository active docs). Omit to use the full
+    # context — preserves existing behaviour.
+    document_slugs = serializers.ListField(
+        child=serializers.SlugField(),
+        required=False,
+        allow_empty=True,
+        default=list,
+    )
     output_mode = serializers.ChoiceField(
         choices=ExecutionOutputMode.choices,
         required=False,

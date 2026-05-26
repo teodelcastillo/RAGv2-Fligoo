@@ -138,6 +138,11 @@ class SkillViewSet(viewsets.ModelViewSet):
         except ValueError as exc:
             return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
 
+        # Per-run document filter — narrows the context's documents to the
+        # explicit selection the user is acting on. Stored in metadata so
+        # resolve_documents() can pick it up at execution time.
+        requested_doc_slugs = [s for s in (data.get("document_slugs") or []) if s]
+
         execution = SkillExecution.objects.create(
             skill=skill,
             owner=request.user,
@@ -154,6 +159,7 @@ class SkillViewSet(viewsets.ModelViewSet):
                     if isinstance(col, dict) and col.get("key")
                 ],
                 "table_schema": effective_table_schema,
+                "document_slugs_filter": requested_doc_slugs,
             },
             status=ExecutionStatus.PENDING,
         )

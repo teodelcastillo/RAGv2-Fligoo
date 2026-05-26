@@ -185,6 +185,7 @@ def generate_chat_completion(
     temperature: float = 0.1,
     max_tokens: int | None = None,
     timeout: float | None = None,
+    response_format: dict | None = None,
 ) -> Tuple[str, dict]:
     """
     Generate chat completion using OpenAI's chat models.
@@ -233,6 +234,8 @@ def generate_chat_completion(
     # Add optional parameters if provided
     if max_tokens is not None:
         request_params["max_tokens"] = max_tokens
+    if response_format is not None:
+        request_params["response_format"] = response_format
     
     # Make API call with optional timeout
     if timeout is not None:

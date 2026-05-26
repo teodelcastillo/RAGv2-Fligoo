@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List
 from django.utils import timezone
 
@@ -22,8 +24,9 @@ from apps.skill.services import execute_skill, execution_to_markdown
 logger = logging.getLogger(__name__)
 
 DEFAULT_CONTEXT_CHUNKS = int(
-    os.environ.get("EVALUATION_CONTEXT_CHUNKS", os.environ.get("CHAT_CONTEXT_CHUNKS", "4"))
+    os.environ.get("EVALUATION_CONTEXT_CHUNKS", os.environ.get("CHAT_CONTEXT_CHUNKS", "8"))
 )
+EVALUATION_MAX_WORKERS = int(os.environ.get("EVALUATION_MAX_WORKERS", "6"))
 
 
 class EvaluationRunner:
@@ -76,22 +79,78 @@ class EvaluationRunner:
 
     def _process_pillars(self, run: EvaluationRun, documents_qs):
         evaluation = run.evaluation
+
+        # Pre-load all pillars and their metrics before parallelizing to avoid
+        # queryset lazy-evaluation inside threads (which can race on the prefetch cache).
+        pillar_data: list[tuple] = []
         for pillar in evaluation.pillars.all():
-            pillar_result = PillarEvaluationResult.objects.create(
+            metrics = list(pillar.metrics.all())
+            pillar_data.append((pillar, metrics))
+
+        # Pre-create all PillarEvaluationResult rows (fast, sequential).
+        pillar_result_map: dict[int, PillarEvaluationResult] = {}
+        for pillar, _ in pillar_data:
+            pr = PillarEvaluationResult.objects.create(
                 run=run,
                 pillar=pillar,
                 position=pillar.position,
                 summary="",
             )
-            pillar_chunk_ids: List[int] = []
-            pillar_sources: List[dict] = []
-            for metric in pillar.metrics.all():
-                metric_result = self._evaluate_metric(
+            pillar_result_map[pillar.id] = pr
+
+        # Flatten all (pillar, metric) pairs into a single task list.
+        tasks = [
+            (pillar, metric)
+            for pillar, metrics in pillar_data
+            for metric in metrics
+        ]
+
+        if not tasks:
+            return
+
+        # Run all metric evaluations in parallel — the expensive part is the
+        # RAG retrieval + LLM call inside _evaluate_metric, which is pure I/O.
+        # DB writes happen after this block so there are no write-concurrency issues.
+        max_workers = min(len(tasks), EVALUATION_MAX_WORKERS)
+        metric_results: dict[tuple[int, int], MetricEvaluationResult] = {}
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_map = {
+                executor.submit(
+                    self._evaluate_metric,
                     run=run,
                     pillar=pillar,
                     metric=metric,
                     documents_qs=documents_qs,
-                )
+                ): (pillar.id, metric.id)
+                for pillar, metric in tasks
+            }
+            for future in as_completed(future_map):
+                key = future_map[future]
+                try:
+                    metric_results[key] = future.result()
+                except Exception:
+                    pillar_id, metric_id = key
+                    logger.exception(
+                        "Metric %s in pillar %s failed during parallel evaluation",
+                        metric_id, pillar_id,
+                    )
+
+        # Collect results and persist per pillar (sequential, fast).
+        for pillar, metrics in pillar_data:
+            pillar_result = pillar_result_map[pillar.id]
+            pillar_chunk_ids: List[int] = []
+            pillar_sources: List[dict] = []
+
+            for metric in metrics:
+                key = (pillar.id, metric.id)
+                metric_result = metric_results.get(key)
+                if metric_result is None:
+                    logger.warning(
+                        "No result recorded for metric %s in pillar %s — skipping.",
+                        metric.id, pillar.id,
+                    )
+                    continue
                 metric_result.pillar_result = pillar_result
                 metric_result.position = metric.position
                 metric_result.save()
@@ -113,28 +172,59 @@ class EvaluationRunner:
             return skill_evidence
 
         query_text = self._build_query_text(pillar, metric, run)
+        # Use hybrid_per_document when multiple documents are present so every
+        # source gets coverage; fall back to global for single-document runs.
+        doc_count = documents_qs.count()
+        retrieval_strategy = "hybrid_per_document" if doc_count > 1 else "global"
         chunks = fetch_relevant_chunks(
             user=run.owner,
             query_text=query_text,
             allowed_documents=documents_qs,
             top_n=self.chunks_per_metric,
+            retrieval_strategy=retrieval_strategy,
+            k_per_doc=3,
+            total_limit=self.chunks_per_metric,
         )
         context_block = build_context_block(chunks)
+        is_quantitative = metric.response_type == MetricResponseType.QUANTITATIVE
         prompt = self._build_prompt(run, pillar, metric, context_block)
         messages = [
             {"role": "system", "content": run.evaluation.system_prompt},
             {"role": "user", "content": prompt},
         ]
-        response_text, usage = generate_chat_completion(
-            messages,
-            model=run.model,
-            temperature=run.temperature,
-        )
+        completion_kwargs: dict = {
+            "model": run.model,
+            "temperature": run.temperature,
+        }
+        if is_quantitative:
+            # Force JSON output for numeric metrics so we never lose the score
+            # to regex parsing failures on prose like "entre 3 y 4 puntos".
+            completion_kwargs["response_format"] = {"type": "json_object"}
+
+        response_text, usage = generate_chat_completion(messages, **completion_kwargs)
+
         response_value = None
-        if metric.response_type == MetricResponseType.QUANTITATIVE:
-            response_value = self._extract_numeric_value(
-                response_text, metric.scale_min, metric.scale_max
-            )
+        if is_quantitative:
+            try:
+                parsed = json.loads(response_text)
+                raw_score = parsed.get("score")
+                if raw_score is not None:
+                    response_value = float(raw_score)
+                    if metric.scale_min is not None and response_value < metric.scale_min:
+                        response_value = None
+                    elif metric.scale_max is not None and response_value > metric.scale_max:
+                        response_value = None
+                # Replace response_text with the qualitative justification so the
+                # UI shows readable analysis rather than raw JSON.
+                response_text = parsed.get("justification") or parsed.get("analysis") or response_text
+            except (json.JSONDecodeError, ValueError, TypeError):
+                logger.warning(
+                    "Metric %s: JSON parse failed on quantitative response — falling back to regex.",
+                    metric.id,
+                )
+                response_value = self._extract_numeric_value(
+                    response_text, metric.scale_min, metric.scale_max
+                )
 
         chunk_ids = [chunk.id for chunk in chunks]
         sources = [
@@ -256,13 +346,17 @@ class EvaluationRunner:
         if metric.criteria:
             lines.append(f"Criterios adicionales:\n{metric.criteria}")
         if metric.response_type == MetricResponseType.QUANTITATIVE:
-            scale = f"El resultado debe ser numérico"
+            scale = "El resultado debe ser numérico"
             if metric.scale_min is not None and metric.scale_max is not None:
                 scale += f" entre {metric.scale_min} y {metric.scale_max}"
             scale += "."
             if metric.expected_units:
                 scale += f" Unidades esperadas: {metric.expected_units}."
             lines.append(scale)
+            lines.append(
+                'Responde ÚNICAMENTE con JSON válido en la forma: '
+                '{"score": <número>, "justification": "<análisis cualitativo que respalda el score>"}'
+            )
         else:
             lines.append("Entrega un análisis cualitativo/descriptivo.")
 

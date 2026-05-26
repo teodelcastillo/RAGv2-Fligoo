@@ -21,6 +21,10 @@ from apps.project.models import Project, ProjectSection
 logger = logging.getLogger(__name__)
 
 MAX_HISTORY_MESSAGES = int(os.environ.get("COPILOT_HISTORY_MESSAGES", "20"))
+# When total history exceeds this threshold, older messages are compressed into
+# a summary block injected as system context. Keeps the window coherent without
+# losing context from the start of long sessions.
+HISTORY_SUMMARY_THRESHOLD = int(os.environ.get("COPILOT_HISTORY_SUMMARY_THRESHOLD", "25"))
 
 # Delimiters used to wrap draft content the consultant can insert into the
 # editor as a clean section body. The optional `section=N` attribute lets the
@@ -163,6 +167,58 @@ def build_copilot_system_prompt(
 
 
 # ---------------------------------------------------------------------------
+# History summarization
+# ---------------------------------------------------------------------------
+
+def _summarize_history(messages: list[dict], project_name: str) -> str:
+    """
+    Compress a list of older conversation messages into a compact summary.
+
+    Called only when the total session history exceeds HISTORY_SUMMARY_THRESHOLD
+    so that the copilot retains context about decisions made early in a long
+    session without blowing up the context window.
+    """
+    if not messages:
+        return ""
+
+    conversation_text = "\n".join(
+        f"{m['role'].upper()}: {(m['content'] or '')[:600]}"
+        for m in messages
+    )
+
+    summary_messages = [
+        {
+            "role": "system",
+            "content": (
+                "Eres un asistente que resume conversaciones de trabajo. "
+                "Produce un resumen compacto (máximo 250 palabras) de los puntos clave, "
+                "decisiones tomadas, y contexto relevante de esta conversación. "
+                "Omite saludos, afirmaciones triviales, y conversación genérica. "
+                "Responde solo con el resumen, sin preámbulo."
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"Proyecto: {project_name}\n\n"
+                f"Conversación a resumir:\n{conversation_text}"
+            ),
+        },
+    ]
+
+    try:
+        summary, _ = generate_chat_completion(
+            summary_messages,
+            temperature=0.1,
+            max_tokens=350,
+        )
+        return summary
+    except Exception as exc:
+        logger.warning("History summarization failed, proceeding without summary: %s", exc)
+        return ""
+
+
+# ---------------------------------------------------------------------------
 # Message composition
 # ---------------------------------------------------------------------------
 
@@ -180,16 +236,42 @@ def build_copilot_messages(
         {"role": "system", "content": system_prompt},
     ]
 
-    history_qs = (
-        session.messages.order_by("-created_at")
-        .exclude(role=MessageRole.SYSTEM)[:max_history]
+    # Fetch the full session history (oldest first) excluding system messages.
+    all_history = list(
+        session.messages.order_by("created_at")
+        .exclude(role=MessageRole.SYSTEM)
+        .values("role", "content")
     )
-    history_messages = [
-        {"role": str(msg.role), "content": msg.content or ""}
-        for msg in reversed(list(history_qs))
-    ]
-    messages.extend(history_messages)
 
+    total = len(all_history)
+    if total > HISTORY_SUMMARY_THRESHOLD:
+        # Split: older messages get summarized, recent ones are kept verbatim.
+        # We keep max_history recent messages so the immediate context is intact.
+        keep_count = min(max_history, total)
+        older = all_history[: total - keep_count]
+        recent = all_history[total - keep_count :]
+
+        summary = _summarize_history(older, project.name)
+        if summary:
+            messages.append({
+                "role": "system",
+                "content": (
+                    "## Resumen de conversación anterior\n"
+                    f"{summary}"
+                ),
+            })
+        history_messages = [
+            {"role": str(m["role"]), "content": m["content"] or ""}
+            for m in recent
+        ]
+    else:
+        # Session is within the normal window — include everything.
+        history_messages = [
+            {"role": str(m["role"]), "content": m["content"] or ""}
+            for m in all_history[-max_history:]
+        ]
+
+    messages.extend(history_messages)
     messages.append({"role": "user", "content": user_content})
     return messages
 

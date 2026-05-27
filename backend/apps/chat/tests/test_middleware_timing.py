@@ -71,8 +71,8 @@ class RetrievalModeRoutingTests(TestCase):
         self.assertEqual(result.diagnostics["retrieval_mode"], "none")
 
     def test_short_domain_query_does_not_use_none_mode(self):
-        # "acuerdo de paris" has a domain hint → should retrieve
-        result = self._retrieve("acuerdo de paris")
+        # "emisiones" is in _RETRIEVAL_DOMAIN_HINTS → short query but has domain hint → retrieve
+        result = self._retrieve("emisiones carbono")
         self.assertNotEqual(result.diagnostics["retrieval_mode"], "none")
 
     # --- Mode: light (factual / numeric / focused) ---
@@ -226,7 +226,11 @@ class ContextualizeQueryGuardTests(TestCase):
 
         mock_contextualize.return_value = "rewritten query"
 
+        doc = Document.objects.create(
+            owner=self.user, name="Doc ctx", slug="doc-ctx-long"
+        )
         session = ChatSession.objects.create(owner=self.user, title="Long")
+        session.allowed_documents.add(doc)
         ChatMessage.objects.create(session=session, role=MessageRole.USER, content="Hola")
         ChatMessage.objects.create(
             session=session, role=MessageRole.ASSISTANT, content="Hola!"

@@ -1,5 +1,6 @@
 from unittest.mock import patch
 import os
+import uuid
 
 from django.contrib.auth import get_user_model
 from django.urls import reverse
@@ -56,11 +57,12 @@ class ChatAPITestCase(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
     def test_create_session_rejects_too_many_documents(self):
+        run_id = uuid.uuid4().hex[:8]
         docs = [
             Document.objects.create(
                 owner=self.user,
                 name=f"TooMany Doc {i}",
-                slug=f"too-many-doc-{i}",
+                slug=f"too-{run_id}-{i}",
             )
             for i in range(25)
         ]
@@ -222,12 +224,26 @@ class ChatAPITestCase(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
         self.assertEqual(response.data["assistant_message"]["chunk_ids"], [])
 
+    @patch("apps.chat.services.rag.classify_query_hybrid")
     @patch("apps.chat.services.rag.lexical_search")
     @patch("apps.chat.services.rag.fetch_relevant_chunks")
     @patch("apps.document.utils.client_openia.generate_chat_completion")
     def test_create_message_persists_citation_metadata(
-        self, mock_completion, mock_fetch_chunks, mock_lexical
+        self, mock_completion, mock_fetch_chunks, mock_lexical, mock_classify
     ):
+        from apps.chat.services.query_analysis import (
+            QueryAnalysis, QUERY_TYPE_FACTUAL, COVERAGE_MODE_FOCUSED,
+            CLASSIFIER_CONFIDENCE_HIGH,
+        )
+        controlled_analysis = QueryAnalysis(
+            raw_text="¿Qué dice el documento sobre emisiones de carbono?",
+            normalized="que dice el documento sobre emisiones de carbono",
+        )
+        controlled_analysis.query_type = QUERY_TYPE_FACTUAL
+        controlled_analysis.coverage_mode = COVERAGE_MODE_FOCUSED
+        controlled_analysis.classifier_confidence = CLASSIFIER_CONFIDENCE_HIGH
+        mock_classify.return_value = controlled_analysis
+
         mock_completion.return_value = ("Respuesta citada [#1].", {"total_tokens": 12})
         chunk = SmartChunk.objects.create(
             document=self.document,
@@ -242,12 +258,13 @@ class ChatAPITestCase(APITestCase):
         session.allowed_documents.add(self.document)
 
         url = reverse("chat-message-list")
-        # Use a domain query long enough to bypass the "none" retrieval gate
-        response = self.client.post(
-            url,
-            {"session": session.id, "content": "¿Qué dice el documento sobre emisiones de carbono?"},
-            format="json",
-        )
+        env = {"RAG_RETRIEVAL_GATE_ENABLED": "1", "RAG_LIGHT_MODE_ENABLED": "1"}
+        with patch.dict(os.environ, env, clear=False):
+            response = self.client.post(
+                url,
+                {"session": session.id, "content": "¿Qué dice el documento sobre emisiones de carbono?"},
+                format="json",
+            )
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
 
         metadata = response.data["assistant_message"]["metadata"]

@@ -20,6 +20,7 @@ Usage by App:
 import os
 from typing import Generator, List, Tuple, Optional
 
+import httpx
 from openai import OpenAI
 
 
@@ -54,7 +55,11 @@ def get_openai_client() -> OpenAI:
                 "OPENAI_API_KEY environment variable is not set. "
                 "Please ensure it's configured in your .env file or environment."
             )
-        _client = OpenAI(api_key=api_key)
+        _client = OpenAI(
+            api_key=api_key,
+            max_retries=0,
+            timeout=httpx.Timeout(connect=5.0, read=90.0, write=90.0, pool=10.0),
+        )
     return _client
 
 

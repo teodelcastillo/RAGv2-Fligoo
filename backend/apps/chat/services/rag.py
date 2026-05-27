@@ -37,6 +37,8 @@ from apps.chat.services.context_builder import (
 )
 from apps.chat.services.query_analysis import (
     COVERAGE_MODE_ALL,
+    QUERY_TYPE_COMPARATIVE,
+    QUERY_TYPE_NUMERIC,
     QUERY_TYPE_PANORAMA,
     QueryAnalysis,
     apply_response_mode_override,
@@ -56,6 +58,7 @@ MAX_CONTEXT_CHUNKS = int(os.environ.get("CHAT_CONTEXT_CHUNKS", "8"))
 RAG_RERANK_POOL = int(os.environ.get("RAG_RERANK_POOL", "20"))
 RAG_VECTOR_POOL_MULTIPLIER = float(os.environ.get("RAG_VECTOR_POOL_MULTIPLIER", "2.5"))
 RAG_LEXICAL_POOL_MULTIPLIER = float(os.environ.get("RAG_LEXICAL_POOL_MULTIPLIER", "2.0"))
+RAG_MIN_SIMILARITY = float(os.environ.get("RAG_MIN_SIMILARITY", "0.3"))
 RAG_ALL_DOCS_MIN_COVERAGE_RATIO = float(
     os.environ.get("RAG_ALL_DOCS_MIN_COVERAGE_RATIO", "1.0")
 )
@@ -257,7 +260,7 @@ def fetch_relevant_chunks(
 
     resolved_strategy = retrieval_strategy
     if retrieval_strategy == "auto":
-        if len(doc_ids) > 3 or is_general_query(query_text):
+        if is_general_query(query_text):
             resolved_strategy = "hybrid_per_document"
         else:
             resolved_strategy = "global"
@@ -364,6 +367,23 @@ def _fill_missing_documents(
     return filled
 
 
+def _chunk_similarity(chunk: SmartChunk) -> float | None:
+    """Best-effort normalized similarity in [0, 1] for relevance filtering."""
+    distance = getattr(chunk, "distance", None)
+    if distance is not None:
+        try:
+            return max(0.0, min(1.0, 1.0 - float(distance)))
+        except (TypeError, ValueError):
+            return None
+    lex_sim = getattr(chunk, "lex_sim", None)
+    if lex_sim is not None:
+        try:
+            return max(0.0, min(1.0, float(lex_sim)))
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
 def retrieve_for_chat(
     *,
     user,
@@ -405,6 +425,9 @@ def retrieve_for_chat(
         "coverage_missing_documents": [],
         "coverage_met": True,
         "elapsed_seconds": 0.0,
+        "max_similarity": None,
+        "avg_similarity": None,
+        "retrieval_confidence": "none",
     }
 
     if not query_text:
@@ -446,17 +469,24 @@ def retrieve_for_chat(
         base_top_n,
         int(round(base_top_n * RAG_VECTOR_POOL_MULTIPLIER)),
     )
+    lexical_multiplier = RAG_LEXICAL_POOL_MULTIPLIER
+    if analysis.query_type == QUERY_TYPE_NUMERIC:
+        # Numeric queries tend to benefit from stronger lexical recall.
+        lexical_multiplier = max(lexical_multiplier, 2.8)
     lexical_per_query = max(
         base_top_n,
-        int(round(base_top_n * RAG_LEXICAL_POOL_MULTIPLIER)),
+        int(round(base_top_n * lexical_multiplier)),
     )
 
-    # Strategy: panorama/comparative -> hybrid_per_document; else auto.
-    vector_strategy = (
-        "hybrid_per_document"
-        if (requires_all_docs and multi_doc) or analysis.query_type == QUERY_TYPE_PANORAMA or len(doc_ids) > 3
-        else "auto"
-    )
+    # Strategy matrix based on query analysis (never on corpus size alone).
+    if requires_all_docs:
+        vector_strategy = "hybrid_per_document"
+    elif analysis.query_type == QUERY_TYPE_PANORAMA:
+        vector_strategy = "hybrid_per_document"
+    elif analysis.query_type in {QUERY_TYPE_COMPARATIVE, QUERY_TYPE_NUMERIC}:
+        vector_strategy = "global"
+    else:
+        vector_strategy = "global"
 
     # --- Vector retrieval (per sub-query) ---
     vector_lists: list[list[SmartChunk]] = []
@@ -547,6 +577,35 @@ def retrieve_for_chat(
         except Exception as exc:  # pragma: no cover - defensive
             logger.warning("MMR selection failed, falling back to capped: %s", exc)
             final_chunks = capped
+
+    # --- Relevance threshold filtering ---
+    if final_chunks:
+        filtered_chunks: list[SmartChunk] = []
+        scored_similarities: list[float] = []
+        for chunk in final_chunks:
+            sim = _chunk_similarity(chunk)
+            if sim is not None:
+                scored_similarities.append(sim)
+            if sim is None or sim >= RAG_MIN_SIMILARITY:
+                filtered_chunks.append(chunk)
+
+        final_chunks = filtered_chunks
+
+        if scored_similarities:
+            max_similarity = max(scored_similarities)
+            avg_similarity = sum(scored_similarities) / len(scored_similarities)
+            diagnostics["max_similarity"] = round(max_similarity, 4)
+            diagnostics["avg_similarity"] = round(avg_similarity, 4)
+            if max_similarity >= 0.78:
+                diagnostics["retrieval_confidence"] = "high"
+            elif max_similarity >= 0.55:
+                diagnostics["retrieval_confidence"] = "medium"
+            elif max_similarity >= RAG_MIN_SIMILARITY:
+                diagnostics["retrieval_confidence"] = "low"
+            else:
+                diagnostics["retrieval_confidence"] = "none"
+        elif final_chunks:
+            diagnostics["retrieval_confidence"] = "low"
 
     context_block = _build_context_block(final_chunks, with_citations=True)
 

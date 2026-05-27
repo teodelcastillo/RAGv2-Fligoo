@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 
 from django.db import transaction
 from django.db.models import Exists, OuterRef
@@ -30,24 +31,30 @@ from apps.chat.services.query_analysis import (
     contextualize_query,
 )
 from apps.chat.services.rag import RetrievalResult, retrieve_for_chat, suggest_related_library_documents
-from apps.document.models import Document
+from apps.document.models import Document, ChunkingStatus
+from apps.document.services import accessible_library_documents
 from apps.document.utils import client_openia
 
 logger = logging.getLogger(__name__)
 
 MAX_HISTORY_MESSAGES = int(os.environ.get("CHAT_HISTORY_MESSAGES", "10"))
+CITATION_PATTERN = re.compile(r"\[#(\d+)\]")
 
 
 def _chat_retrieval_params(
     session: ChatSession,
     content: str,
     response_mode: str | None = None,
+    *,
+    doc_count_override: int | None = None,
 ) -> dict:
     """
     Heuristic sizing for the RAG retrieval pool given the session scope and
     the current message. Wider pools for broader questions and bigger libraries.
     """
-    doc_count = session.allowed_documents.count()
+    doc_count = (
+        doc_count_override if doc_count_override is not None else session.allowed_documents.count()
+    )
     analysis = classify_query_hybrid(content)
     # Apply the same override the RAG pipeline uses so pool sizing
     # matches the eventual retrieval decision.
@@ -109,6 +116,38 @@ def _workspace_session(session: ChatSession) -> bool:
     return session.project_id is not None or session.repository_id is not None
 
 
+def _chunk_ids_from_citations(answer_text: str, retrieval: RetrievalResult) -> list[int]:
+    """
+    Keep only chunks explicitly cited as [#N] when citations exist.
+    Falls back to all retrieval chunks if there are no valid citations.
+    """
+    chunk_ids = retrieval.chunk_ids
+    if not chunk_ids:
+        return []
+
+    cited_positions = []
+    for match in CITATION_PATTERN.findall(answer_text or ""):
+        try:
+            idx = int(match) - 1
+        except ValueError:
+            continue
+        if 0 <= idx < len(chunk_ids):
+            cited_positions.append(idx)
+
+    if not cited_positions:
+        return chunk_ids
+
+    seen: set[int] = set()
+    filtered: list[int] = []
+    for pos in cited_positions:
+        cid = chunk_ids[pos]
+        if cid in seen:
+            continue
+        seen.add(cid)
+        filtered.append(cid)
+    return filtered
+
+
 def _run_retrieval(
     session: ChatSession,
     content: str,
@@ -127,22 +166,16 @@ def _run_retrieval(
     """
     allowed_docs = session.allowed_documents.all()
     if not allowed_docs.exists():
-        # No documents pinned to this session → fall back to the user's
-        # personal library (owned documents that have been fully processed).
-        # We deliberately exclude public documents here to avoid polluting
-        # a personal query with unrelated library content.
-        from apps.document.models import ChunkingStatus
-        personal_docs = (
-            Document.objects.filter(
-                owner=user,
-                chunking_status=ChunkingStatus.DONE,
-            )
+        # Global chat: use the full accessible library scope (public curated
+        # docs + user's own/shared docs) while preserving permission filters.
+        allowed_docs = (
+            accessible_library_documents(user)
+            .filter(chunking_status=ChunkingStatus.DONE)
             .filter(chunks__embedding__isnull=False)
             .distinct()
         )
-        if not personal_docs.exists():
+        if not allowed_docs.exists():
             return RetrievalResult()
-        allowed_docs = personal_docs
 
     retrieval_query = content
     history_qs = (
@@ -163,7 +196,12 @@ def _run_retrieval(
             query_text=retrieval_query,
             allowed_documents=allowed_docs,
             response_mode=response_mode,
-            **_chat_retrieval_params(session, retrieval_query, response_mode=response_mode),
+            **_chat_retrieval_params(
+                session,
+                retrieval_query,
+                response_mode=response_mode,
+                doc_count_override=allowed_docs.count(),
+            ),
         )
         if _workspace_session(session):
             try:
@@ -202,7 +240,7 @@ def _compose_messages(
     ]
 
     if retrieval.context_block:
-        doc_count = session.allowed_documents.count()
+        doc_count = retrieval.diagnostics.get("documents_in_scope") or session.allowed_documents.count()
         if doc_count == 1:
             single_doc = session.allowed_documents.first()
             doc_label = f'del documento "{single_doc.name}"' if single_doc else "del documento"
@@ -215,7 +253,8 @@ def _compose_messages(
             )
         else:
             context_preamble = (
-                "El siguiente contexto proviene de los documentos del usuario. "
+                "El siguiente contexto proviene de documentos accesibles en la biblioteca de Ecofilia "
+                "(incluyendo documentos públicos curados y, cuando corresponda, documentos con acceso del usuario). "
                 "Prioriza este contexto para responder. "
                 "Si la información del contexto es suficiente, basate principalmente en ella. "
                 "Si el contexto no contiene información relevante o es insuficiente, "
@@ -439,7 +478,7 @@ class ChatMessageViewSet(
                 session=session,
                 role=MessageRole.ASSISTANT,
                 content=answer_text,
-                chunk_ids=retrieval.chunk_ids,
+                chunk_ids=_chunk_ids_from_citations(answer_text, retrieval),
                 metadata=metadata,
             )
             touch_chat_session_activity(session.pk)
@@ -561,7 +600,7 @@ class ChatMessageStreamView(APIView):
                     session=session,
                     role=MessageRole.ASSISTANT,
                     content=answer_text,
-                    chunk_ids=retrieval.chunk_ids,
+                    chunk_ids=_chunk_ids_from_citations(answer_text, retrieval),
                     metadata=metadata,
                 )
                 touch_chat_session_activity(session.pk)

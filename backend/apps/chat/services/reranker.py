@@ -64,7 +64,7 @@ def llm_rerank(
             "un JSON array con los índices (1-based) de los fragmentos más "
             "relevantes, en orden decreciente de relevancia, con un máximo de "
             f"{top_k}. No incluyas explicación. Si ningún fragmento es relevante, "
-            "devuelve un subconjunto pequeño y razonable, no un array vacío."
+            "devuelve [] (array vacío)."
         )
         user = (
             f"Pregunta: {query}\n\n"
@@ -101,7 +101,7 @@ def llm_rerank(
                 break
 
         if not order:
-            return list(candidates[:top_k])
+            return []
 
         ordered = [candidates[i - 1] for i in order]
         # Fill remaining slots with leftover candidates preserving their order.

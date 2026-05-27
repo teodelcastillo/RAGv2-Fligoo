@@ -5,8 +5,9 @@ from django.urls import reverse
 from rest_framework import status
 from rest_framework.test import APITestCase
 
-from apps.chat.api.views import _chat_retrieval_params
+from apps.chat.api.views import _chat_retrieval_params, _chunk_ids_from_citations
 from apps.chat.models import ChatSession
+from apps.chat.services.rag import RetrievalResult
 from apps.chat.services.query_analysis import COVERAGE_MODE_ALL, classify_query
 from apps.document.models import Document, SmartChunk
 
@@ -155,6 +156,36 @@ class ChatAPITestCase(APITestCase):
         self.assertEqual(len(response.data), 1)
         self.assertEqual(response.data[0]["content"], "Hola A")
         self.assertEqual(response.data[0]["session"], session_a.id)
+
+    def test_chunk_ids_from_citations_keeps_only_cited_chunks(self):
+        retrieval = RetrievalResult()
+        retrieval.chunks = [type("Chunk", (), {"id": 11})(), type("Chunk", (), {"id": 22})()]
+        ids = _chunk_ids_from_citations("Respuesta [#2] con cita puntual.", retrieval)
+        self.assertEqual(ids, [22])
+
+    def test_chunk_ids_from_citations_falls_back_when_no_citations(self):
+        retrieval = RetrievalResult()
+        retrieval.chunks = [type("Chunk", (), {"id": 11})(), type("Chunk", (), {"id": 22})()]
+        ids = _chunk_ids_from_citations("Respuesta sin marcadores de cita.", retrieval)
+        self.assertEqual(ids, [11, 22])
+
+    @patch("apps.chat.services.rag.lexical_search")
+    @patch("apps.chat.services.rag.fetch_relevant_chunks")
+    @patch("apps.document.utils.client_openia.generate_chat_completion")
+    def test_create_message_without_evidence_returns_empty_chunk_ids(
+        self, mock_completion, mock_fetch_chunks, mock_lexical
+    ):
+        mock_completion.return_value = ("Respuesta general sin evidencia documental.", {"total_tokens": 10})
+        mock_fetch_chunks.return_value = []
+        mock_lexical.return_value = []
+
+        session = ChatSession.objects.create(owner=self.user, title="Global")
+        url = reverse("chat-message-list")
+        payload = {"session": session.id, "content": "¿Qué dice el Acuerdo de París?"}
+
+        response = self.client.post(url, payload, format="json")
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(response.data["assistant_message"]["chunk_ids"], [])
 
 
 

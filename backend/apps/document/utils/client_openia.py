@@ -370,6 +370,7 @@ def generate_chat_completion_stream(
     *,
     model: str | None = None,
     temperature: float = 0.1,
+    timeout: float | None = None,
 ) -> Generator[str, None, None]:
     """
     Stream chat completion tokens from OpenAI.
@@ -382,12 +383,15 @@ def generate_chat_completion_stream(
         {"role": m["role"], "content": m["content"]}
         for m in messages
     ]
-    stream = client.chat.completions.create(
-        model=model or MODEL_COMPLETION,
-        temperature=temperature,
-        messages=formatted_messages,
-        stream=True,
-    )
+    create_kwargs: dict = {
+        "model": model or MODEL_COMPLETION,
+        "temperature": temperature,
+        "messages": formatted_messages,
+        "stream": True,
+    }
+    if timeout is not None:
+        create_kwargs["timeout"] = timeout
+    stream = client.chat.completions.create(**create_kwargs)
     for chunk in stream:
         if not chunk.choices:
             continue

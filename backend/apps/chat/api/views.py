@@ -640,6 +640,7 @@ class ChatMessageStreamView(APIView):
                     messages,
                     model=session.model,
                     temperature=session.temperature,
+                    timeout=90,
                 ):
                     collected.append(text_chunk)
                     yield _event({"type": "chunk", "content": text_chunk})

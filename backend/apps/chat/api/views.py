@@ -40,6 +40,19 @@ logger = logging.getLogger(__name__)
 MAX_HISTORY_MESSAGES = int(os.environ.get("CHAT_HISTORY_MESSAGES", "10"))
 CITATION_PATTERN = re.compile(r"\[#(\d+)\]")
 
+# Marker used to detect sessions whose stored system_prompt was created with
+# the old RAG-only default.  When no context is retrieved (greetings, trivial
+# queries, library gap) that prompt causes the LLM to reply
+# "No tengo información disponible."  We swap it for a conversational fallback.
+_RAG_CONTEXT_REQUIRED_MARKER = "Responde únicamente con la información disponible"
+_CONVERSATIONAL_FALLBACK_PROMPT = (
+    "Eres Ecofilia, un asistente experto en ESG y sostenibilidad. "
+    "Responde de forma clara, amable y concisa. "
+    "Si el usuario saluda o hace una consulta general, responde cordialmente. "
+    "Si necesita información específica de documentos, sugiérele que seleccione "
+    "documentos de la biblioteca o formule una pregunta más concreta."
+)
+
 
 def _chat_retrieval_params(
     session: ChatSession,
@@ -190,27 +203,18 @@ def _run_retrieval(
     response_mode: str | None = None,
 ) -> RetrievalResult:
     """
-    Defensive wrapper around ``retrieve_for_chat``. Failures (embeddings,
-    pgvector, OpenAI keys) must not bubble up as 500s — return an empty
-    result so the chat still answers using base knowledge.
+    Defensive wrapper around the RAG pipeline. Failures (embeddings, pgvector,
+    OpenAI keys) must not bubble up as 500s — return an empty result so the
+    chat still answers using base knowledge.
 
-    When the session has no explicitly attached documents (general chat mode),
-    returns an empty retrieval so the LLM answers from its own knowledge.
-    Loading the full library was causing OOM kills on the 1 GB ECS container:
-    each embedded chunk is ~6 KB and loading hundreds of them exhausts RAM.
-    Document-scoped RAG requires the user to explicitly select documents.
+    History-aware query rewrite is applied BEFORE the path split so that
+    follow-up questions carry conversational context into the vector search
+    regardless of whether the session is in library or document-scoped mode.
+
+    Skip rewrite for short standalone queries (< 5 words) — they are typically
+    self-contained and the LLM call (10s timeout) would be wasteful.
     """
-    allowed_docs = session.allowed_documents.all()
-    if not allowed_docs.exists():
-        # General chat: no explicit document scope.
-        # Use a single global pgvector query across the accessible library
-        # (bounded to top_n chunks — O(1) RAM regardless of library size).
-        try:
-            return retrieve_from_library(user=user, query_text=content)
-        except Exception as exc:
-            logger.exception("Library retrieval failed (session=%s): %s", session.id, exc)
-            return RetrievalResult()
-
+    # ── 1. Shared: history-aware query rewrite ────────────────────────────────
     retrieval_query = content
     history_qs = (
         session.messages
@@ -221,12 +225,27 @@ def _run_retrieval(
         {"role": str(m.role), "content": m.content or ""}
         for m in reversed(list(history_qs))
     ]
-    # Skip rewrite for short standalone queries — they are self-contained
-    # and the LLM call (10s timeout) is wasteful for simple follow-ups.
     content_words = len((content or "").split())
     if history and content_words >= 5:
-        retrieval_query = contextualize_query(content, history)
+        try:
+            retrieval_query = contextualize_query(content, history)
+        except Exception as exc:
+            logger.warning(
+                "Query contextualization failed, using original (session=%s): %s",
+                session.id, exc,
+            )
 
+    # ── 2. Path: general chat — library-wide pgvector search ─────────────────
+    # Bounded to top_n chunks → O(1) RAM regardless of library size.
+    allowed_docs = session.allowed_documents.all()
+    if not allowed_docs.exists():
+        try:
+            return retrieve_from_library(user=user, query_text=retrieval_query)
+        except Exception as exc:
+            logger.exception("Library retrieval failed (session=%s): %s", session.id, exc)
+            return RetrievalResult()
+
+    # ── 3. Path: document-scoped chat ─────────────────────────────────────────
     try:
         result = retrieve_for_chat(
             user=user,
@@ -271,6 +290,13 @@ def _compose_messages(
     system_text = (session.system_prompt or "").strip() or (
         "Eres Ecofilia, un asistente útil. Responde de forma clara y concisa."
     )
+
+    # Adaptive system prompt: when no RAG context is available (greeting,
+    # off-topic query, or library gap) and the stored prompt is the
+    # context-dependent default, substitute a conversational fallback so the
+    # LLM doesn't respond with "No tengo información disponible."
+    if not retrieval.context_block and _RAG_CONTEXT_REQUIRED_MARKER in system_text:
+        system_text = _CONVERSATIONAL_FALLBACK_PROMPT
 
     base_messages: list[dict] = [
         {"role": str(MessageRole.SYSTEM), "content": system_text},

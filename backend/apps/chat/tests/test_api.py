@@ -127,6 +127,35 @@ class ChatAPITestCase(APITestCase):
             response.data["assistant_message"]["content"], "Respuesta generada"
         )
 
+    def test_list_messages_requires_session_param(self):
+        session = ChatSession.objects.create(owner=self.user, title="Sesión")
+        url = reverse("chat-message-list")
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_list_messages_filters_by_session(self):
+        session_a = ChatSession.objects.create(owner=self.user, title="A")
+        session_b = ChatSession.objects.create(owner=self.user, title="B")
+        from apps.chat.models import ChatMessage, MessageRole
+
+        ChatMessage.objects.create(
+            session=session_a,
+            role=MessageRole.USER,
+            content="Hola A",
+        )
+        ChatMessage.objects.create(
+            session=session_b,
+            role=MessageRole.USER,
+            content="Hola B",
+        )
+
+        url = reverse("chat-message-list")
+        response = self.client.get(url, {"session": session_a.id})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0]["content"], "Hola A")
+        self.assertEqual(response.data[0]["session"], session_a.id)
+
 
 
 

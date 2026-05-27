@@ -100,6 +100,73 @@ class ChatSessionCreateSerializer(serializers.ModelSerializer):
         return session
 
 
+def prefetch_chunks_by_id(chunk_ids: list[int], *, include_content: bool = True) -> dict[int, SmartChunk]:
+    """Load SmartChunk rows once for many messages (avoids N+1 on list)."""
+    unique_ids = list(dict.fromkeys(chunk_ids))
+    if not unique_ids:
+        return {}
+
+    qs = SmartChunk.objects.filter(id__in=unique_ids).select_related("document")
+    if not include_content:
+        qs = qs.only(
+            "id",
+            "chunk_index",
+            "document_id",
+            "document__slug",
+            "document__name",
+        )
+    return {chunk.id: chunk for chunk in qs}
+
+
+def serialize_message_chunks(
+    obj: ChatMessage,
+    *,
+    context: dict,
+    include_content: bool = True,
+    chunks_by_id: dict[int, SmartChunk] | None = None,
+) -> list[dict]:
+    if not obj.chunk_ids:
+        return []
+
+    resolved = chunks_by_id if chunks_by_id is not None else context.get("chunks_by_id")
+    if resolved is None:
+        resolved = prefetch_chunks_by_id(obj.chunk_ids, include_content=include_content)
+
+    ordered_chunks = [
+        resolved[chunk_id]
+        for chunk_id in obj.chunk_ids
+        if chunk_id in resolved
+    ]
+    if not ordered_chunks:
+        return []
+
+    if not include_content:
+        return [
+            {
+                "id": chunk.id,
+                "chunk_index": chunk.chunk_index,
+                "document_slug": chunk.document.slug,
+                "document_name": chunk.document.name,
+                "content": "",
+            }
+            for chunk in ordered_chunks
+        ]
+
+    serialized_by_id = {
+        item["id"]: item
+        for item in DocumentChunkSerializer(
+            ordered_chunks,
+            many=True,
+            context=context,
+        ).data
+    }
+    return [
+        serialized_by_id[chunk_id]
+        for chunk_id in obj.chunk_ids
+        if chunk_id in serialized_by_id
+    ]
+
+
 class ChatMessageSerializer(serializers.ModelSerializer):
     chunks = serializers.SerializerMethodField()
 
@@ -118,32 +185,12 @@ class ChatMessageSerializer(serializers.ModelSerializer):
         read_only_fields = fields
 
     def get_chunks(self, obj: ChatMessage):
-        if not obj.chunk_ids:
-            return []
-        chunks_by_id = {
-            chunk.id: chunk
-            for chunk in SmartChunk.objects.filter(id__in=obj.chunk_ids).select_related("document")
-        }
-        ordered_chunks = [
-            chunks_by_id[chunk_id]
-            for chunk_id in obj.chunk_ids
-            if chunk_id in chunks_by_id
-        ]
-        if not ordered_chunks:
-            return []
-        serialized_by_id = {
-            item["id"]: item
-            for item in DocumentChunkSerializer(
-                ordered_chunks,
-                many=True,
-                context=self.context,
-            ).data
-        }
-        return [
-            serialized_by_id[chunk_id]
-            for chunk_id in obj.chunk_ids
-            if chunk_id in serialized_by_id
-        ]
+        include_content = self.context.get("include_chunk_content", True)
+        return serialize_message_chunks(
+            obj,
+            context=self.context,
+            include_content=include_content,
+        )
 
 
 class ChatMessageCreateSerializer(serializers.Serializer):

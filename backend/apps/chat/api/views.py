@@ -5,7 +5,7 @@ import logging
 import os
 
 from django.db import transaction
-from django.db.models import Count
+from django.db.models import Exists, OuterRef
 from django.http import StreamingHttpResponse
 from rest_framework import mixins, status, viewsets
 from rest_framework.pagination import PageNumberPagination
@@ -19,6 +19,7 @@ from apps.chat.api.serializers import (
     ChatMessageSerializer,
     ChatSessionCreateSerializer,
     ChatSessionSerializer,
+    prefetch_chunks_by_id,
 )
 from apps.chat.models import ChatMessage, ChatSession, MessageRole, touch_chat_session_activity
 from apps.chat.services.context_builder import build_citation_prompt
@@ -302,8 +303,10 @@ class ChatSessionViewSet(
         if getattr(self, "action", None) == "list":
             raw = (self.request.query_params.get("include_empty") or "").lower()
             if raw not in ("1", "true", "yes"):
-                base = base.annotate(_ecofilia_msg_count=Count("messages")).filter(
-                    _ecofilia_msg_count__gt=0
+                base = base.filter(
+                    Exists(
+                        ChatMessage.objects.filter(session_id=OuterRef("pk"))
+                    )
                 )
         return base.order_by("-updated_at", "-created_at", "-id")
 
@@ -332,14 +335,44 @@ class ChatMessageViewSet(
     serializer_class = ChatMessageSerializer
 
     def get_queryset(self):
-        qs = (
-            ChatMessage.objects.select_related("session", "session__owner")
-            .prefetch_related("session__allowed_documents")
-            .order_by("created_at")
+        qs = ChatMessage.objects.select_related("session", "session__owner").order_by(
+            "created_at"
         )
-        if self.request.user.is_staff:
-            return qs
-        return qs.filter(session__owner=self.request.user)
+        if not self.request.user.is_staff:
+            qs = qs.filter(session__owner=self.request.user)
+
+        session_id = self.request.query_params.get("session")
+        if session_id:
+            qs = qs.filter(session_id=session_id)
+        return qs
+
+    def list(self, request, *args, **kwargs):
+        session_id = request.query_params.get("session")
+        if not session_id:
+            return Response(
+                {"detail": "El parámetro 'session' es obligatorio."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        queryset = self.filter_queryset(self.get_queryset())
+        messages = list(queryset)
+
+        all_chunk_ids: list[int] = []
+        for message in messages:
+            all_chunk_ids.extend(message.chunk_ids or [])
+
+        serializer_context = self.get_serializer_context()
+        serializer_context["include_chunk_content"] = False
+        serializer_context["chunks_by_id"] = prefetch_chunks_by_id(
+            all_chunk_ids,
+            include_content=False,
+        )
+        serializer = self.get_serializer(
+            messages,
+            many=True,
+            context=serializer_context,
+        )
+        return Response(serializer.data)
 
     def create(self, request, *args, **kwargs):
         serializer = ChatMessageCreateSerializer(

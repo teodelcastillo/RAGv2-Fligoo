@@ -94,6 +94,7 @@ class ChatSession(models.Model):
         ordering = ("-created_at",)
         indexes = [
             models.Index(fields=("owner", "created_at")),
+            models.Index(fields=("owner", "-updated_at"), name="chat_session_owner_upd_idx"),
             models.Index(fields=("primary_document",)),
             models.Index(fields=("project", "owner", "created_at")),
             models.Index(fields=("repository", "owner", "created_at")),

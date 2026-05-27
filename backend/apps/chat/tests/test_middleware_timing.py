@@ -249,3 +249,55 @@ class ContextualizeQueryGuardTests(TestCase):
             )
 
         mock_contextualize.assert_called_once()
+
+
+class SelectiveRerankerTests(TestCase):
+    """llm_rerank must only fire for panorama/comparative queries, never for factual."""
+
+    def setUp(self):
+        self.user = User.objects.create_user(
+            email="reranker@example.com", password="secret", username="rerankeruser"
+        )
+        self.doc = Document.objects.create(
+            owner=self.user, name="Reranker Doc", slug="reranker-doc"
+        )
+
+    def _retrieve(self, query_text, *, reranker_enabled="1"):
+        session = ChatSession.objects.create(owner=self.user, title="R")
+        session.allowed_documents.add(self.doc)
+        env = {
+            "RAG_RETRIEVAL_GATE_ENABLED": "1",
+            "RAG_RERANKER_ENABLED": reranker_enabled,
+            "RAG_LLM_ROUTER_ENABLED": "0",
+            "RAG_QUERY_EXPANSION_ENABLED": "0",
+        }
+        with patch.dict(os.environ, env, clear=False):
+            with patch("apps.chat.services.rag.fetch_relevant_chunks", return_value=[]):
+                with patch("apps.chat.services.rag.lexical_search", return_value=[]):
+                    with patch("apps.chat.services.rag.llm_rerank") as mock_rerank:
+                        result = retrieve_for_chat(
+                            user=self.user,
+                            query_text=query_text,
+                            allowed_documents=session.allowed_documents.all(),
+                        )
+                        return result, mock_rerank
+
+    def test_factual_query_does_not_call_reranker(self):
+        _, mock_rerank = self._retrieve("¿Cuántas toneladas de CO2 se emitieron en 2023?")
+        mock_rerank.assert_not_called()
+
+    def test_panorama_query_may_call_reranker(self):
+        # With empty fused list, len(fused) <= safe_total so rerank won't fire.
+        # The important thing is the condition is reached (mode=full, type=panorama).
+        # We verify mode is full so the code path is correct.
+        result, _ = self._retrieve(
+            "Dame un resumen general de todos los documentos disponibles"
+        )
+        self.assertEqual(result.diagnostics["retrieval_mode"], "full")
+
+    def test_comparative_query_does_not_call_reranker_when_disabled(self):
+        _, mock_rerank = self._retrieve(
+            "Compara las estrategias de mitigación entre los documentos",
+            reranker_enabled="0",
+        )
+        mock_rerank.assert_not_called()

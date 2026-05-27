@@ -626,7 +626,12 @@ def retrieve_for_chat(
     if budget_exceeded():
         diagnostics["retrieval_timed_out"] = True
         diagnostics["retrieval_skipped_reason"] = "budget_exceeded"
-    elif retrieval_mode != "light" and is_reranker_enabled() and len(fused) > safe_total:
+    elif (
+        retrieval_mode != "light"
+        and is_reranker_enabled()
+        and len(fused) > safe_total
+        and analysis.query_type in {QUERY_TYPE_PANORAMA, QUERY_TYPE_COMPARATIVE}
+    ):
         fused = llm_rerank(query_text, fused, top_k=min(len(fused), pool_top_n))
         diagnostics["reranked"] = True
 

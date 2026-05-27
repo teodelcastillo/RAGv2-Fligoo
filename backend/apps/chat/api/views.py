@@ -32,8 +32,7 @@ from apps.chat.services.query_analysis import (
     contextualize_query,
 )
 from apps.chat.services.rag import RetrievalResult, retrieve_for_chat, suggest_related_library_documents
-from apps.document.models import Document, ChunkingStatus
-from apps.document.services import accessible_library_documents
+from apps.document.models import Document
 from apps.document.utils import client_openia
 
 logger = logging.getLogger(__name__)
@@ -195,23 +194,16 @@ def _run_retrieval(
     pgvector, OpenAI keys) must not bubble up as 500s — return an empty
     result so the chat still answers using base knowledge.
 
-    When the session has no explicitly attached documents (e.g. the global
-    chat), falls back to the user's personal document library so that
-    questions like "quién es Teodoro" can still be answered from the user's
-    own uploaded CVs/reports.
+    When the session has no explicitly attached documents (general chat mode),
+    returns an empty retrieval so the LLM answers from its own knowledge.
+    Loading the full library was causing OOM kills on the 1 GB ECS container:
+    each embedded chunk is ~6 KB and loading hundreds of them exhausts RAM.
+    Document-scoped RAG requires the user to explicitly select documents.
     """
     allowed_docs = session.allowed_documents.all()
     if not allowed_docs.exists():
-        # Global chat: use the full accessible library scope (public curated
-        # docs + user's own/shared docs) while preserving permission filters.
-        allowed_docs = (
-            accessible_library_documents(user)
-            .filter(chunking_status=ChunkingStatus.DONE)
-            .filter(chunks__embedding__isnull=False)
-            .distinct()
-        )
-        if not allowed_docs.exists():
-            return RetrievalResult()
+        # No documents selected → pure LLM mode, no retrieval.
+        return RetrievalResult()
 
     retrieval_query = content
     history_qs = (

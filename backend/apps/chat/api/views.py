@@ -27,6 +27,7 @@ from apps.chat.services.context_builder import build_citation_prompt
 from apps.chat.services.query_analysis import (
     COVERAGE_MODE_ALL,
     apply_response_mode_override,
+    classify_query,
     classify_query_hybrid,
     contextualize_query,
 )
@@ -55,9 +56,9 @@ def _chat_retrieval_params(
     doc_count = (
         doc_count_override if doc_count_override is not None else session.allowed_documents.count()
     )
-    analysis = classify_query_hybrid(content)
-    # Apply the same override the RAG pipeline uses so pool sizing
-    # matches the eventual retrieval decision.
+    # Use fast regex classifier for pool sizing — the full LLM-quality
+    # classification runs once inside retrieve_for_chat.
+    analysis = classify_query(content)
     analysis = apply_response_mode_override(analysis, response_mode)
     broad_question = len((content or "").split()) >= 18
     if analysis.coverage_mode == COVERAGE_MODE_ALL:
@@ -222,7 +223,10 @@ def _run_retrieval(
         {"role": str(m.role), "content": m.content or ""}
         for m in reversed(list(history_qs))
     ]
-    if history:
+    # Skip rewrite for short standalone queries — they are self-contained
+    # and the LLM call (10s timeout) is wasteful for simple follow-ups.
+    content_words = len((content or "").split())
+    if history and content_words >= 5:
         retrieval_query = contextualize_query(content, history)
 
     try:
@@ -479,6 +483,7 @@ class ChatMessageViewSet(
                     messages,
                     model=session.model,
                     temperature=session.temperature,
+                    timeout=90,
                 )
             except Exception as exc:  # pragma: no cover - network failure
                 error_msg = str(exc)

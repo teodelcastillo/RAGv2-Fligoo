@@ -59,8 +59,8 @@ class ChatAPITestCase(APITestCase):
         docs = [
             Document.objects.create(
                 owner=self.user,
-                name=f"Doc {i}",
-                slug=f"doc-{i}",
+                name=f"TooMany Doc {i}",
+                slug=f"too-many-doc-{i}",
             )
             for i in range(25)
         ]
@@ -102,20 +102,22 @@ class ChatAPITestCase(APITestCase):
         self.assertEqual(params["top_n"], 17)
         self.assertEqual(params["max_chunks_per_doc"], 1)
 
+    @patch("apps.chat.services.rag.lexical_search")
     @patch("apps.chat.services.rag.fetch_relevant_chunks")
     @patch("apps.document.utils.client_openia.generate_chat_completion")
     def test_create_message_returns_assistant_response(
-        self, mock_completion, mock_fetch_chunks
+        self, mock_completion, mock_fetch_chunks, mock_lexical
     ):
         mock_completion.return_value = ("Respuesta generada", {"total_tokens": 10})
 
         chunk = SmartChunk.objects.create(
             document=self.document,
             chunk_index=0,
-            content="Información relevante",
+            content="Información relevante sobre emisiones",
             token_count=5,
         )
         mock_fetch_chunks.return_value = [chunk]
+        mock_lexical.return_value = []
 
         session = ChatSession.objects.create(
             owner=self.user,
@@ -124,7 +126,7 @@ class ChatAPITestCase(APITestCase):
         session.allowed_documents.add(self.document)
 
         url = reverse("chat-message-list")
-        payload = {"session": session.id, "content": "¿Qué dice el documento?"}
+        payload = {"session": session.id, "content": "¿Qué dice el documento sobre emisiones?"}
 
         response = self.client.post(url, payload, format="json")
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
@@ -220,25 +222,32 @@ class ChatAPITestCase(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
         self.assertEqual(response.data["assistant_message"]["chunk_ids"], [])
 
+    @patch("apps.chat.services.rag.lexical_search")
     @patch("apps.chat.services.rag.fetch_relevant_chunks")
     @patch("apps.document.utils.client_openia.generate_chat_completion")
     def test_create_message_persists_citation_metadata(
-        self, mock_completion, mock_fetch_chunks
+        self, mock_completion, mock_fetch_chunks, mock_lexical
     ):
         mock_completion.return_value = ("Respuesta citada [#1].", {"total_tokens": 12})
         chunk = SmartChunk.objects.create(
             document=self.document,
             chunk_index=0,
-            content="Evidencia importante",
+            content="Evidencia importante sobre emisiones de carbono",
             token_count=6,
         )
         mock_fetch_chunks.return_value = [chunk]
+        mock_lexical.return_value = []
 
         session = ChatSession.objects.create(owner=self.user, title="Sesión citada")
         session.allowed_documents.add(self.document)
 
         url = reverse("chat-message-list")
-        response = self.client.post(url, {"session": session.id, "content": "Pregunta"}, format="json")
+        # Use a domain query long enough to bypass the "none" retrieval gate
+        response = self.client.post(
+            url,
+            {"session": session.id, "content": "¿Qué dice el documento sobre emisiones de carbono?"},
+            format="json",
+        )
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
 
         metadata = response.data["assistant_message"]["metadata"]

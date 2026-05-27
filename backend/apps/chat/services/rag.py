@@ -54,6 +54,10 @@ from apps.document.utils.client_openia import embed_text
 logger = logging.getLogger(__name__)
 
 
+def _env_bool(name: str, default: str = "False") -> bool:
+    return os.environ.get(name, default).strip().lower() in ("1", "true", "yes", "on")
+
+
 MAX_CONTEXT_CHUNKS = int(os.environ.get("CHAT_CONTEXT_CHUNKS", "8"))
 RAG_RERANK_POOL = int(os.environ.get("RAG_RERANK_POOL", "20"))
 RAG_VECTOR_POOL_MULTIPLIER = float(os.environ.get("RAG_VECTOR_POOL_MULTIPLIER", "2.5"))
@@ -384,6 +388,52 @@ def _chunk_similarity(chunk: SmartChunk) -> float | None:
     return None
 
 
+_RETRIEVAL_DOMAIN_HINTS = (
+    "ndc",
+    "nap",
+    "acuerdo de parís",
+    "paris agreement",
+    "mitigación",
+    "mitigacion",
+    "adaptación",
+    "adaptacion",
+    "emisiones",
+    "clima",
+    "climático",
+    "climatico",
+)
+
+
+def _decide_retrieval_mode(query_text: str, analysis: QueryAnalysis) -> tuple[str, str | None]:
+    """
+    Decide retrieval mode before expensive chunk search.
+    Returns (mode, skip_reason) where mode is none|light|full.
+    """
+    if not _env_bool("RAG_RETRIEVAL_GATE_ENABLED", "True"):
+        return "full", None
+
+    norm = (query_text or "").strip().lower()
+    words = norm.split()
+    if not norm:
+        return "none", "empty_query"
+
+    trivial = len(words) <= 3
+    greeting_like = norm in {"hola", "hello", "hi", "buenas", "q mas hay", "qué más hay", "que mas hay"}
+    has_domain_hint = any(h in norm for h in _RETRIEVAL_DOMAIN_HINTS)
+
+    if greeting_like or (trivial and not has_domain_hint):
+        return "none", "simple_query"
+
+    if analysis.coverage_mode == COVERAGE_MODE_ALL:
+        return "full", None
+    if analysis.query_type in {QUERY_TYPE_PANORAMA, QUERY_TYPE_COMPARATIVE}:
+        return "full", None
+
+    if _env_bool("RAG_LIGHT_MODE_ENABLED", "True"):
+        return "light", None
+    return "full", None
+
+
 def retrieve_for_chat(
     *,
     user,
@@ -428,6 +478,9 @@ def retrieve_for_chat(
         "max_similarity": None,
         "avg_similarity": None,
         "retrieval_confidence": "none",
+        "retrieval_mode": "full",
+        "retrieval_timed_out": False,
+        "retrieval_skipped_reason": None,
     }
 
     if not query_text:
@@ -441,6 +494,14 @@ def retrieve_for_chat(
 
     analysis = classify_query_hybrid(query_text)
     analysis = apply_response_mode_override(analysis, response_mode)
+    retrieval_mode, skip_reason = _decide_retrieval_mode(query_text, analysis)
+    diagnostics["retrieval_mode"] = retrieval_mode
+    diagnostics["retrieval_skipped_reason"] = skip_reason
+
+    if retrieval_mode == "none":
+        diagnostics["elapsed_seconds"] = round(time.perf_counter() - started, 4)
+        return RetrievalResult(analysis=analysis, diagnostics=diagnostics)
+
     queries = build_query_set(analysis)
     diagnostics["query_type"] = analysis.query_type
     diagnostics["coverage_mode"] = analysis.coverage_mode
@@ -453,6 +514,12 @@ def retrieve_for_chat(
     coverage_target_ratio = RAG_ALL_DOCS_MIN_COVERAGE_RATIO if requires_all_docs else None
     diagnostics["coverage_target_ratio"] = coverage_target_ratio
 
+    retrieval_budget_ms = int(os.environ.get("RAG_RETRIEVAL_BUDGET_MS", "2500"))
+    retrieval_budget_s = max(0.0, retrieval_budget_ms / 1000.0)
+
+    def budget_exceeded() -> bool:
+        return retrieval_budget_s > 0 and (time.perf_counter() - started) >= retrieval_budget_s
+
     # Sizing the candidate pools.
     base_top_n = top_n or MAX_CONTEXT_CHUNKS
     multi_doc = len(doc_ids) > 1
@@ -464,10 +531,18 @@ def retrieve_for_chat(
         base_top_n = max(base_top_n, len(doc_ids))
         total_limit = max(total_limit or base_top_n, len(doc_ids))
         max_chunks_per_doc = 1
-    pool_top_n = max(base_top_n, RAG_RERANK_POOL)
+    if retrieval_mode == "light":
+        base_top_n = max(2, min(base_top_n, 4))
+        vector_multiplier = min(RAG_VECTOR_POOL_MULTIPLIER, 1.25)
+        rerank_pool = min(RAG_RERANK_POOL, 10)
+    else:
+        vector_multiplier = RAG_VECTOR_POOL_MULTIPLIER
+        rerank_pool = RAG_RERANK_POOL
+
+    pool_top_n = max(base_top_n, rerank_pool)
     vector_per_query = max(
         base_top_n,
-        int(round(base_top_n * RAG_VECTOR_POOL_MULTIPLIER)),
+        int(round(base_top_n * vector_multiplier)),
     )
     lexical_multiplier = RAG_LEXICAL_POOL_MULTIPLIER
     if analysis.query_type == QUERY_TYPE_NUMERIC:
@@ -477,6 +552,8 @@ def retrieve_for_chat(
         base_top_n,
         int(round(base_top_n * lexical_multiplier)),
     )
+    if retrieval_mode == "light":
+        lexical_per_query = min(lexical_per_query, max(4, base_top_n + 2))
 
     # Strategy matrix based on query analysis (never on corpus size alone).
     if requires_all_docs:
@@ -491,6 +568,10 @@ def retrieve_for_chat(
     # --- Vector retrieval (per sub-query) ---
     vector_lists: list[list[SmartChunk]] = []
     for q in queries:
+        if budget_exceeded():
+            diagnostics["retrieval_timed_out"] = True
+            diagnostics["retrieval_skipped_reason"] = "budget_exceeded"
+            break
         try:
             vector_total_limit = len(doc_ids) if (requires_all_docs and multi_doc) else vector_per_query
             vector_k_per_doc = 1 if (requires_all_docs and multi_doc) else k_per_doc
@@ -515,11 +596,16 @@ def retrieve_for_chat(
 
     # --- Lexical retrieval (single pass on original query) ---
     base_qs = _scope_qs_for_user(user, doc_ids)
-    try:
-        lex_chunks = lexical_search(base_qs, query_text, top_n=lexical_per_query)
-    except Exception as exc:  # pragma: no cover - defensive
-        logger.warning("Lexical retrieval failed: %s", exc)
+    if budget_exceeded():
+        diagnostics["retrieval_timed_out"] = True
+        diagnostics["retrieval_skipped_reason"] = "budget_exceeded"
         lex_chunks = []
+    else:
+        try:
+            lex_chunks = lexical_search(base_qs, query_text, top_n=lexical_per_query)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("Lexical retrieval failed: %s", exc)
+            lex_chunks = []
     diagnostics["lexical_candidates"] = len(lex_chunks)
 
     # --- Fusion ---
@@ -537,7 +623,10 @@ def retrieve_for_chat(
 
     # --- Optional LLM rerank ---
     safe_total = total_limit or base_top_n
-    if is_reranker_enabled() and len(fused) > safe_total:
+    if budget_exceeded():
+        diagnostics["retrieval_timed_out"] = True
+        diagnostics["retrieval_skipped_reason"] = "budget_exceeded"
+    elif retrieval_mode != "light" and is_reranker_enabled() and len(fused) > safe_total:
         fused = llm_rerank(query_text, fused, top_k=min(len(fused), pool_top_n))
         diagnostics["reranked"] = True
 
@@ -569,7 +658,10 @@ def retrieve_for_chat(
 
     # --- Optional MMR (off by default) ---
     final_chunks: list[SmartChunk] = capped
-    if is_mmr_enabled() and capped:
+    if budget_exceeded():
+        diagnostics["retrieval_timed_out"] = True
+        diagnostics["retrieval_skipped_reason"] = "budget_exceeded"
+    elif retrieval_mode != "light" and is_mmr_enabled() and capped:
         try:
             q_emb = embed_text(query_text)
             final_chunks = mmr_select(capped, q_emb, top_k=safe_total)

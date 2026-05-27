@@ -592,12 +592,6 @@ class ChatMessageStreamView(APIView):
         response_mode = serializer.validated_data.get("response_mode")
 
         _sync_session_documents_for_request(session, document_slugs)
-        messages, retrieval = _build_chat_messages(
-            session,
-            content,
-            request.user,
-            response_mode=response_mode,
-        )
 
         user_message = ChatMessage.objects.create(
             session=session,
@@ -615,9 +609,28 @@ class ChatMessageStreamView(APIView):
                     "message": ChatMessageSerializer(user_message).data,
                 }
             )
+            if os.environ.get("RAG_STREAM_EARLY_EVENT_ENABLED", "1").lower() in (
+                "1",
+                "true",
+                "yes",
+                "on",
+            ):
+                yield _event(
+                    {
+                        "type": "status",
+                        "phase": "retrieval",
+                        "detail": "Preparando contexto documental",
+                    }
+                )
 
             collected: list[str] = []
             try:
+                messages, retrieval = _build_chat_messages(
+                    session,
+                    content,
+                    request.user,
+                    response_mode=response_mode,
+                )
                 for text_chunk in client_openia.generate_chat_completion_stream(
                     messages,
                     model=session.model,

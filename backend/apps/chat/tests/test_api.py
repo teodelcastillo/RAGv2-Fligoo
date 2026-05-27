@@ -1,4 +1,5 @@
 from unittest.mock import patch
+import os
 
 from django.contrib.auth import get_user_model
 from django.urls import reverse
@@ -11,7 +12,7 @@ from apps.chat.api.views import (
     _extract_citation_payload,
 )
 from apps.chat.models import ChatSession
-from apps.chat.services.rag import RetrievalResult
+from apps.chat.services.rag import RetrievalResult, retrieve_for_chat
 from apps.chat.services.query_analysis import COVERAGE_MODE_ALL, classify_query
 from apps.document.models import Document, SmartChunk
 
@@ -245,6 +246,60 @@ class ChatAPITestCase(APITestCase):
         self.assertIn("retrieval_chunk_ids", metadata)
         self.assertIn("citation_integrity", metadata)
         self.assertEqual(metadata["citation_integrity"], "complete")
+
+    def test_retrieve_for_chat_uses_none_mode_for_simple_query(self):
+        session = ChatSession.objects.create(owner=self.user, title="Simple")
+        session.allowed_documents.add(self.document)
+        with patch.dict(os.environ, {"RAG_RETRIEVAL_GATE_ENABLED": "1"}, clear=False):
+            result = retrieve_for_chat(
+                user=self.user,
+                query_text="hola",
+                allowed_documents=session.allowed_documents.all(),
+            )
+        self.assertEqual(result.diagnostics.get("retrieval_mode"), "none")
+        self.assertEqual(result.diagnostics.get("retrieval_skipped_reason"), "simple_query")
+        self.assertEqual(result.chunk_ids, [])
+
+    def test_retrieve_for_chat_marks_timeout_when_budget_exceeded(self):
+        session = ChatSession.objects.create(owner=self.user, title="Budget")
+        session.allowed_documents.add(self.document)
+        with patch.dict(
+            os.environ,
+            {
+                "RAG_RETRIEVAL_GATE_ENABLED": "1",
+                "RAG_LIGHT_MODE_ENABLED": "1",
+                "RAG_RETRIEVAL_BUDGET_MS": "1",
+            },
+            clear=False,
+        ):
+            with patch("apps.chat.services.rag.fetch_relevant_chunks", side_effect=lambda **kwargs: []):
+                result = retrieve_for_chat(
+                    user=self.user,
+                    query_text="Qué dice el acuerdo de paris sobre mitigación",
+                    allowed_documents=session.allowed_documents.all(),
+                )
+        self.assertIn(result.diagnostics.get("retrieval_mode"), {"light", "full"})
+        self.assertIn(result.diagnostics.get("retrieval_skipped_reason"), {"budget_exceeded", None})
+
+    @patch("apps.chat.api.views._build_chat_messages")
+    @patch("apps.document.utils.client_openia.generate_chat_completion_stream")
+    def test_stream_emits_early_status_event(self, mock_stream_completion, mock_build_chat):
+        session = ChatSession.objects.create(owner=self.user, title="Stream")
+        mock_build_chat.return_value = ([{"role": "user", "content": "hola"}], RetrievalResult())
+        mock_stream_completion.return_value = iter(["ok"])
+
+        url = reverse("chat-message-stream")
+        with patch.dict(os.environ, {"RAG_STREAM_EARLY_EVENT_ENABLED": "1"}, clear=False):
+            response = self.client.post(
+                url,
+                {"session": session.id, "content": "hola"},
+                format="json",
+            )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        body = b"".join(response.streaming_content).decode("utf-8")
+        self.assertIn('"type": "status"', body)
+        self.assertIn('"phase": "retrieval"', body)
 
 
 

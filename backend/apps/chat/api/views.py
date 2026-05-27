@@ -31,7 +31,7 @@ from apps.chat.services.query_analysis import (
     classify_query_hybrid,
     contextualize_query,
 )
-from apps.chat.services.rag import RetrievalResult, retrieve_for_chat, suggest_related_library_documents
+from apps.chat.services.rag import RetrievalResult, retrieve_for_chat, retrieve_from_library, suggest_related_library_documents
 from apps.document.models import Document
 from apps.document.utils import client_openia
 
@@ -202,8 +202,14 @@ def _run_retrieval(
     """
     allowed_docs = session.allowed_documents.all()
     if not allowed_docs.exists():
-        # No documents selected → pure LLM mode, no retrieval.
-        return RetrievalResult()
+        # General chat: no explicit document scope.
+        # Use a single global pgvector query across the accessible library
+        # (bounded to top_n chunks — O(1) RAM regardless of library size).
+        try:
+            return retrieve_from_library(user=user, query_text=content)
+        except Exception as exc:
+            logger.exception("Library retrieval failed (session=%s): %s", session.id, exc)
+            return RetrievalResult()
 
     retrieval_query = content
     history_qs = (

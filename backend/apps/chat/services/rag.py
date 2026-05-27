@@ -109,6 +109,132 @@ class RetrievalResult:
         return {c.document_id for c in self.chunks}
 
 
+def retrieve_from_library(
+    *,
+    user,
+    query_text: str,
+    top_n: int | None = None,
+) -> "RetrievalResult":
+    """
+    Library-wide hybrid retrieval for general chat (no explicit document scope).
+
+    Design principle: constant memory cost, scales to millions of chunks.
+
+    Pipeline:
+    1. Fast retrieval gate — skip for greetings/trivial queries (no DB hit).
+    2. Pre-compute accessible document IDs in one SQL query on the documents
+       table (cheap: just IDs, no chunk data loaded).
+    3. Single pgvector vector search: WHERE document_id IN (...) ORDER BY
+       embedding <=> $vec LIMIT top_n — pgvector returns only top_n rows;
+       Python never loads the embeddings of chunks that didn't rank.
+    4. Single trigram lexical search with the same scope.
+    5. RRF fusion of vector + lexical lists.
+    6. Relevance threshold filter.
+    7. Citation-ready context block.
+
+    Memory usage: O(top_n) regardless of library size.
+    With an HNSW index the vector step is O(log N) in the DB.
+    """
+    from apps.document.models import ChunkingStatus
+    from apps.document.services import accessible_library_documents
+
+    top_n = top_n or int(os.environ.get("LIBRARY_RETRIEVAL_TOP_N", "15"))
+    started = time.perf_counter()
+
+    diagnostics: dict = {
+        "retrieval_mode": "library_global",
+        "retrieval_skipped_reason": None,
+        "documents_in_scope": 0,
+        "final_chunks": 0,
+        "elapsed_seconds": 0.0,
+    }
+
+    if not query_text:
+        return RetrievalResult(diagnostics=diagnostics)
+
+    # ── 1. Retrieval gate: skip expensive DB work for trivial queries ──────
+    analysis = classify_query(query_text)  # pure-regex, no LLM call
+    retrieval_mode, skip_reason = _decide_retrieval_mode(query_text, analysis)
+    diagnostics["retrieval_skipped_reason"] = skip_reason
+    if retrieval_mode == "none":
+        diagnostics["elapsed_seconds"] = round(time.perf_counter() - started, 4)
+        return RetrievalResult(analysis=analysis, diagnostics=diagnostics)
+
+    # ── 2. Accessible document IDs — query on documents table only ─────────
+    # .values_list().distinct() on Document (small table) is fast.
+    # Hard cap at 2000 docs to keep the IN clause sane; real libraries will
+    # be much smaller for a long time.
+    accessible_doc_ids: list[int] = list(
+        accessible_library_documents(user)
+        .filter(chunking_status=ChunkingStatus.DONE)
+        .values_list("id", flat=True)
+        .distinct()[:2000]
+    )
+    diagnostics["documents_in_scope"] = len(accessible_doc_ids)
+    if not accessible_doc_ids:
+        diagnostics["elapsed_seconds"] = round(time.perf_counter() - started, 4)
+        return RetrievalResult(analysis=analysis, diagnostics=diagnostics)
+
+    # ── 3. Vector search: ONE query, pgvector does the heavy lifting ───────
+    # No JOINs, no DISTINCT on the chunks table (incompatible with ORDER BY
+    # embedding), no Python-side embedding comparisons.
+    query_embedding = embed_text(query_text)
+    vector_chunks: list[SmartChunk] = []
+    if query_embedding:
+        vector_chunks = list(
+            SmartChunk.objects.filter(
+                document_id__in=accessible_doc_ids,
+                embedding__isnull=False,
+            )
+            .annotate(distance=CosineDistance("embedding", query_embedding))
+            .order_by("distance")[:top_n]
+        )
+
+    # ── 4. Lexical search: trigram similarity, same scope ──────────────────
+    base_qs = SmartChunk.objects.filter(
+        document_id__in=accessible_doc_ids,
+        embedding__isnull=False,
+    )
+    lex_chunks: list[SmartChunk] = []
+    try:
+        lex_chunks = lexical_search(base_qs, query_text, top_n=top_n)
+    except Exception as exc:
+        logger.warning("Library lexical search failed: %s", exc)
+
+    # ── 5. RRF fusion ──────────────────────────────────────────────────────
+    ranked_lists: list[list[SmartChunk]] = []
+    if vector_chunks:
+        ranked_lists.append(vector_chunks)
+    if lex_chunks:
+        ranked_lists.append(lex_chunks)
+
+    if not ranked_lists:
+        diagnostics["elapsed_seconds"] = round(time.perf_counter() - started, 4)
+        return RetrievalResult(analysis=analysis, diagnostics=diagnostics)
+
+    fused = rrf_fuse(ranked_lists, top_n=top_n)
+
+    # ── 6. Relevance threshold ─────────────────────────────────────────────
+    final_chunks: list[SmartChunk] = [
+        c for c in fused
+        if _chunk_similarity(c) is None or _chunk_similarity(c) >= RAG_MIN_SIMILARITY
+    ]
+
+    # ── 7. Context block ───────────────────────────────────────────────────
+    context_block = _build_context_block(final_chunks, with_citations=True)
+
+    diagnostics["final_chunks"] = len(final_chunks)
+    diagnostics["unique_documents"] = len({c.document_id for c in final_chunks})
+    diagnostics["elapsed_seconds"] = round(time.perf_counter() - started, 4)
+
+    return RetrievalResult(
+        chunks=final_chunks,
+        context_block=context_block,
+        analysis=analysis,
+        diagnostics=diagnostics,
+    )
+
+
 def suggest_related_library_documents(
     *,
     user,
@@ -742,5 +868,6 @@ __all__ = [
     "fetch_relevant_chunks",
     "is_general_query",
     "retrieve_for_chat",
+    "retrieve_from_library",
     "suggest_related_library_documents",
 ]

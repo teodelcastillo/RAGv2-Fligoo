@@ -27,6 +27,15 @@ from openai import OpenAI
 # Model defaults from environment
 MODEL_EMBEDDING = os.environ.get("MODEL_EMBEDDING", "text-embedding-3-small")
 MODEL_COMPLETION = os.environ.get("MODEL_COMPLETION", "gpt-4o-mini")
+# Optional dimension override (Matryoshka truncation — only supported by text-embedding-3-*)
+# Leave unset to use the model's native output dimension.
+# text-embedding-3-small native: 1536 | text-embedding-3-large native: 3072
+# Set to 1536 when using large to keep the DB schema unchanged while getting better recall.
+EMBEDDING_DIMENSIONS: int | None = (
+    int(os.environ["EMBEDDING_DIMENSIONS"])
+    if os.environ.get("EMBEDDING_DIMENSIONS")
+    else None
+)
 
 # Lazy initialization of OpenAI client to avoid issues with env vars not being loaded
 _client: Optional[OpenAI] = None
@@ -166,20 +175,27 @@ def generate_chunk_context(
 def embed_text(text: str, model: str | None = None) -> List[float]:
     """
     Generate embeddings for text using OpenAI's embedding model.
-    
-    Primarily used by the Documents app for creating vector embeddings
-    of document chunks for RAG (Retrieval Augmented Generation).
-    
+
+    Supports Matryoshka dimension truncation via the EMBEDDING_DIMENSIONS env var.
+    This lets you run text-embedding-3-large at 1536 dims (same as small) for
+    better recall quality without changing the DB schema.
+
+    IMPORTANT: all chunks in the DB must use the SAME model + dimensions.
+    Mixing embeddings from different models makes cosine similarity meaningless.
+
     Args:
-        text: Text to generate embedding for
-        model: Embedding model to use (defaults to MODEL_EMBEDDING)
-        
+        text: Text to embed.
+        model: Override the embedding model (defaults to MODEL_EMBEDDING env var).
+
     Returns:
-        List[float]: Embedding vector (1536 dimensions for text-embedding-3-small)
+        List[float]: Embedding vector. Dimension depends on model + EMBEDDING_DIMENSIONS.
     """
     client = get_openai_client()
     embedding_model = model or MODEL_EMBEDDING
-    response = client.embeddings.create(input=text, model=embedding_model)
+    kwargs: dict = {"input": text, "model": embedding_model}
+    if EMBEDDING_DIMENSIONS is not None:
+        kwargs["dimensions"] = EMBEDDING_DIMENSIONS
+    response = client.embeddings.create(**kwargs)
     return response.data[0].embedding
 
 

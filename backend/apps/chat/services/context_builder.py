@@ -26,7 +26,9 @@ CITATION_INSTRUCTIONS = (
     "Cuando uses información del contexto, cita la fuente al final de la "
     "afirmación con marcadores tipo [#1], [#2], etc. (donde el número "
     "corresponde al fragmento listado abajo). Si combinas varias fuentes, "
-    "cítalas todas. Si la información necesaria no está en el contexto, "
+    "cítalas todas. Para respuestas con varias afirmaciones, cita inline cada "
+    "afirmación factual relevante (no solo al final del párrafo). "
+    "Si la información necesaria no está en el contexto, "
     "indícalo de forma explícita en lugar de inventar."
 )
 

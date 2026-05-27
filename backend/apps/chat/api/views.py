@@ -116,36 +116,71 @@ def _workspace_session(session: ChatSession) -> bool:
     return session.project_id is not None or session.repository_id is not None
 
 
-def _chunk_ids_from_citations(answer_text: str, retrieval: RetrievalResult) -> list[int]:
+def _extract_citation_payload(answer_text: str, retrieval: RetrievalResult) -> dict:
     """
-    Keep only chunks explicitly cited as [#N] when citations exist.
-    Falls back to all retrieval chunks if there are no valid citations.
+    Build citation metadata from inline markers [#N].
+    Returns stable mapping data for UI traceability.
     """
-    chunk_ids = retrieval.chunk_ids
-    if not chunk_ids:
-        return []
+    chunks = list(retrieval.chunks or [])
+    retrieval_chunk_ids = [chunk.id for chunk in chunks]
+    if not retrieval_chunk_ids:
+        return {
+            "chunk_ids": [],
+            "citations": [],
+            "retrieval_chunk_ids": [],
+            "citation_integrity": "missing",
+        }
 
-    cited_positions = []
+    cited_positions: list[int] = []
     for match in CITATION_PATTERN.findall(answer_text or ""):
         try:
             idx = int(match) - 1
         except ValueError:
             continue
-        if 0 <= idx < len(chunk_ids):
+        if 0 <= idx < len(retrieval_chunk_ids):
             cited_positions.append(idx)
 
     if not cited_positions:
-        return chunk_ids
+        return {
+            "chunk_ids": retrieval_chunk_ids,
+            "citations": [],
+            "retrieval_chunk_ids": retrieval_chunk_ids,
+            "citation_integrity": "missing",
+        }
 
-    seen: set[int] = set()
-    filtered: list[int] = []
+    seen_ids: set[int] = set()
+    chunk_ids: list[int] = []
+    citations: list[dict] = []
     for pos in cited_positions:
-        cid = chunk_ids[pos]
-        if cid in seen:
+        chunk = chunks[pos]
+        chunk_id = chunk.id
+        if chunk_id in seen_ids:
             continue
-        seen.add(cid)
-        filtered.append(cid)
-    return filtered
+        seen_ids.add(chunk_id)
+        chunk_ids.append(chunk_id)
+        document = getattr(chunk, "document", None)
+        citations.append(
+            {
+                "citation_index": pos + 1,
+                "chunk_id": chunk_id,
+                "document_slug": getattr(document, "slug", None),
+                "document_name": getattr(document, "name", None),
+                "chunk_index": getattr(chunk, "chunk_index", None),
+            }
+        )
+
+    integrity = "complete" if len(chunk_ids) == len(retrieval_chunk_ids) else "partial"
+    return {
+        "chunk_ids": chunk_ids,
+        "citations": citations,
+        "retrieval_chunk_ids": retrieval_chunk_ids,
+        "citation_integrity": integrity,
+    }
+
+
+def _chunk_ids_from_citations(answer_text: str, retrieval: RetrievalResult) -> list[int]:
+    """Backward-compatible helper retained for tests/callers."""
+    return _extract_citation_payload(answer_text, retrieval)["chunk_ids"]
 
 
 def _run_retrieval(
@@ -474,11 +509,16 @@ class ChatMessageViewSet(
             if retrieval.recommended_documents:
                 metadata["recommended_documents"] = retrieval.recommended_documents
 
+            citation_payload = _extract_citation_payload(answer_text, retrieval)
+            metadata["citations"] = citation_payload["citations"]
+            metadata["retrieval_chunk_ids"] = citation_payload["retrieval_chunk_ids"]
+            metadata["citation_integrity"] = citation_payload["citation_integrity"]
+
             assistant_message = ChatMessage.objects.create(
                 session=session,
                 role=MessageRole.ASSISTANT,
                 content=answer_text,
-                chunk_ids=_chunk_ids_from_citations(answer_text, retrieval),
+                chunk_ids=citation_payload["chunk_ids"],
                 metadata=metadata,
             )
             touch_chat_session_activity(session.pk)
@@ -596,11 +636,16 @@ class ChatMessageStreamView(APIView):
                     metadata["response_mode"] = response_mode
                 if retrieval.recommended_documents:
                     metadata["recommended_documents"] = retrieval.recommended_documents
+                citation_payload = _extract_citation_payload(answer_text, retrieval)
+                metadata["citations"] = citation_payload["citations"]
+                metadata["retrieval_chunk_ids"] = citation_payload["retrieval_chunk_ids"]
+                metadata["citation_integrity"] = citation_payload["citation_integrity"]
+
                 assistant_message = ChatMessage.objects.create(
                     session=session,
                     role=MessageRole.ASSISTANT,
                     content=answer_text,
-                    chunk_ids=_chunk_ids_from_citations(answer_text, retrieval),
+                    chunk_ids=citation_payload["chunk_ids"],
                     metadata=metadata,
                 )
                 touch_chat_session_activity(session.pk)

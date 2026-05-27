@@ -5,7 +5,11 @@ from django.urls import reverse
 from rest_framework import status
 from rest_framework.test import APITestCase
 
-from apps.chat.api.views import _chat_retrieval_params, _chunk_ids_from_citations
+from apps.chat.api.views import (
+    _chat_retrieval_params,
+    _chunk_ids_from_citations,
+    _extract_citation_payload,
+)
 from apps.chat.models import ChatSession
 from apps.chat.services.rag import RetrievalResult
 from apps.chat.services.query_analysis import COVERAGE_MODE_ALL, classify_query
@@ -169,6 +173,34 @@ class ChatAPITestCase(APITestCase):
         ids = _chunk_ids_from_citations("Respuesta sin marcadores de cita.", retrieval)
         self.assertEqual(ids, [11, 22])
 
+    def test_extract_citation_payload_contains_mapping_metadata(self):
+        chunk_a = type(
+            "Chunk",
+            (),
+            {
+                "id": 11,
+                "chunk_index": 2,
+                "document": type("Doc", (), {"slug": "doc-a", "name": "Doc A"})(),
+            },
+        )()
+        chunk_b = type(
+            "Chunk",
+            (),
+            {
+                "id": 22,
+                "chunk_index": 4,
+                "document": type("Doc", (), {"slug": "doc-b", "name": "Doc B"})(),
+            },
+        )()
+        retrieval = RetrievalResult(chunks=[chunk_a, chunk_b])
+        payload = _extract_citation_payload("Texto con cita [#2].", retrieval)
+
+        self.assertEqual(payload["chunk_ids"], [22])
+        self.assertEqual(payload["retrieval_chunk_ids"], [11, 22])
+        self.assertEqual(payload["citation_integrity"], "partial")
+        self.assertEqual(payload["citations"][0]["citation_index"], 2)
+        self.assertEqual(payload["citations"][0]["chunk_id"], 22)
+
     @patch("apps.chat.services.rag.lexical_search")
     @patch("apps.chat.services.rag.fetch_relevant_chunks")
     @patch("apps.document.utils.client_openia.generate_chat_completion")
@@ -186,6 +218,33 @@ class ChatAPITestCase(APITestCase):
         response = self.client.post(url, payload, format="json")
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
         self.assertEqual(response.data["assistant_message"]["chunk_ids"], [])
+
+    @patch("apps.chat.services.rag.fetch_relevant_chunks")
+    @patch("apps.document.utils.client_openia.generate_chat_completion")
+    def test_create_message_persists_citation_metadata(
+        self, mock_completion, mock_fetch_chunks
+    ):
+        mock_completion.return_value = ("Respuesta citada [#1].", {"total_tokens": 12})
+        chunk = SmartChunk.objects.create(
+            document=self.document,
+            chunk_index=0,
+            content="Evidencia importante",
+            token_count=6,
+        )
+        mock_fetch_chunks.return_value = [chunk]
+
+        session = ChatSession.objects.create(owner=self.user, title="Sesión citada")
+        session.allowed_documents.add(self.document)
+
+        url = reverse("chat-message-list")
+        response = self.client.post(url, {"session": session.id, "content": "Pregunta"}, format="json")
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+
+        metadata = response.data["assistant_message"]["metadata"]
+        self.assertIn("citations", metadata)
+        self.assertIn("retrieval_chunk_ids", metadata)
+        self.assertIn("citation_integrity", metadata)
+        self.assertEqual(metadata["citation_integrity"], "complete")
 
 
 

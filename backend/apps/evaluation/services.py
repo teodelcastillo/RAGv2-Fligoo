@@ -8,8 +8,14 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List
 from django.utils import timezone
 
-from apps.chat.services.rag import build_context_block, fetch_relevant_chunks
-from apps.document.models import Document
+from apps.chat.services.rag import (
+    RAG_MIN_SIMILARITY,
+    _chunk_similarity,
+    build_context_block,
+    fetch_relevant_chunks,
+)
+from apps.chat.services.retrieval import lexical_search, rrf_fuse
+from apps.document.models import Document, SmartChunk
 from apps.document.utils.client_openia import generate_chat_completion
 from apps.evaluation.models import (
     EvaluationRun,
@@ -171,23 +177,81 @@ class EvaluationRunner:
         if skill_evidence is not None:
             return skill_evidence
 
-        query_text = self._build_query_text(pillar, metric, run)
-        # Use hybrid_per_document when multiple documents are present so every
-        # source gets coverage; fall back to global for single-document runs.
-        doc_count = documents_qs.count()
+        # ── Phase 1: decompose the metric into focused retrieval queries ──────
+        retrieval_queries = self._build_retrieval_queries(pillar, metric, run)
+
+        # ── Phase 2: hybrid retrieval + RRF cross-query ───────────────────────
+        doc_ids = list(documents_qs.values_list("id", flat=True))
+        doc_count = len(doc_ids)
         retrieval_strategy = "hybrid_per_document" if doc_count > 1 else "global"
-        chunks = fetch_relevant_chunks(
-            user=run.owner,
-            query_text=query_text,
-            allowed_documents=documents_qs,
-            top_n=self.chunks_per_metric,
-            retrieval_strategy=retrieval_strategy,
-            k_per_doc=3,
-            total_limit=self.chunks_per_metric,
-        )
-        context_block = build_context_block(chunks)
+        base_qs = SmartChunk.objects.filter(
+            document_id__in=doc_ids
+        ).exclude(embedding__isnull=True)
+
+        all_ranked_lists: list[list] = []
+        for query in retrieval_queries:
+            try:
+                v_chunks = fetch_relevant_chunks(
+                    user=run.owner,
+                    query_text=query,
+                    allowed_documents=documents_qs,
+                    top_n=self.chunks_per_metric,
+                    retrieval_strategy=retrieval_strategy,
+                    k_per_doc=3,
+                    total_limit=self.chunks_per_metric,
+                )
+            except Exception as exc:
+                logger.warning("Metric %s vector retrieval failed for query %r: %s", metric.id, query, exc)
+                v_chunks = []
+            try:
+                lex_chunks = lexical_search(base_qs, query, top_n=self.chunks_per_metric)
+            except Exception as exc:
+                logger.warning("Metric %s lexical retrieval failed for query %r: %s", metric.id, query, exc)
+                lex_chunks = []
+            for lst in [v_chunks, lex_chunks]:
+                if lst:
+                    all_ranked_lists.append(lst)
+
+        fused = rrf_fuse(all_ranked_lists, top_n=self.chunks_per_metric) if all_ranked_lists else []
+
+        # Threshold filter + evidence quality score
+        chunks_with_score = [(c, _chunk_similarity(c)) for c in fused]
+        final_chunks = [
+            c for c, sim in chunks_with_score
+            if sim is None or sim >= RAG_MIN_SIMILARITY
+        ]
+        sims = [sim for _, sim in chunks_with_score if sim is not None]
+        max_sim = max(sims) if sims else None
+        evidence_quality: dict = {
+            "chunks_retrieved": len(final_chunks),
+            "chunks_above_threshold": len(final_chunks),
+            "avg_similarity": round(sum(sims) / len(sims), 4) if sims else None,
+            "max_similarity": round(max_sim, 4) if max_sim is not None else None,
+            "evidence_level": (
+                "high" if (max_sim is not None and max_sim >= 0.7)
+                else "medium" if (max_sim is not None and max_sim >= 0.4)
+                else "low"
+            ),
+            "docs_covered": len({c.document_id for c in final_chunks}),
+            "docs_in_scope": doc_count,
+        }
+
+        # ── Phase 3: optional LLM reranker ───────────────────────────────────
+        if (
+            os.environ.get("EVALUATION_RERANKER_ENABLED", "0").strip().lower()
+            in ("1", "true", "yes")
+            and final_chunks
+        ):
+            from apps.chat.services.reranker import llm_rerank
+            final_chunks = llm_rerank(
+                retrieval_queries[0], final_chunks, top_k=self.chunks_per_metric
+            )
+
+        context_block = build_context_block(final_chunks)
         is_quantitative = metric.response_type == MetricResponseType.QUANTITATIVE
-        prompt = self._build_prompt(run, pillar, metric, context_block)
+        prompt = self._build_prompt(
+            run, pillar, metric, context_block, evidence_quality=evidence_quality
+        )
         messages = [
             {"role": "system", "content": run.evaluation.system_prompt},
             {"role": "user", "content": prompt},
@@ -226,7 +290,7 @@ class EvaluationRunner:
                     response_text, metric.scale_min, metric.scale_max
                 )
 
-        chunk_ids = [chunk.id for chunk in chunks]
+        chunk_ids = [chunk.id for chunk in final_chunks]
         sources = [
             {
                 "chunk_id": chunk.id,
@@ -235,7 +299,7 @@ class EvaluationRunner:
                 "chunk_index": chunk.chunk_index,
                 "distance": getattr(chunk, "distance", None),
             }
-            for chunk in chunks
+            for chunk in final_chunks
         ]
 
         metric_result = MetricEvaluationResult(
@@ -245,7 +309,7 @@ class EvaluationRunner:
             response_value=response_value,
             chunk_ids=chunk_ids,
             sources=sources,
-            metadata={"usage": usage},
+            metadata={"usage": usage, "evidence_quality": evidence_quality},
         )
         return metric_result
 
@@ -334,7 +398,18 @@ class EvaluationRunner:
         ]
         return "\n".join(part for part in parts if part).strip()
 
-    def _build_prompt(self, run, pillar, metric, context_block: str) -> str:
+    def _build_retrieval_queries(self, pillar, metric, run) -> list[str]:
+        primary = f"{metric.instructions or ''} {metric.criteria or ''}".strip()[:400]
+        secondary = (pillar.context_instructions or "")[:200].strip()
+        queries = [q for q in [primary, secondary] if q]
+        if len(primary.split()) > 15:
+            from apps.chat.services.query_analysis import _extract_keywords
+            kws = _extract_keywords(primary, max_terms=8)
+            if kws:
+                queries.append(" ".join(kws))
+        return queries[:3]
+
+    def _build_prompt(self, run, pillar, metric, context_block: str, *, evidence_quality: dict | None = None) -> str:
         language = run.language or "es"
         lines = [
             f"Evaluación: {run.evaluation.title}",
@@ -363,8 +438,17 @@ class EvaluationRunner:
         if run.instructions_override:
             lines.append(f"Instrucciones adicionales del usuario:\n{run.instructions_override}")
 
+        if evidence_quality and evidence_quality.get("evidence_level") == "low":
+            lines.append(
+                "ADVERTENCIA: La evidencia documental recuperada es escasa o de baja similitud. "
+                "Indica explícitamente en tu respuesta qué información falta para una evaluación completa."
+            )
+
         if context_block:
-            lines.append("Contexto documental:\n" + context_block)
+            lines.append(
+                "Al citar evidencia usa la notación [#N] referenciando el número del fragmento. "
+                "Contexto documental:\n" + context_block
+            )
         else:
             lines.append("No se encontraron fragmentos relevantes; indica claramente si falta contexto.")
 

@@ -11,6 +11,7 @@ from apps.chat.models import ChatMessage, ChatSession, MessageRole
 from apps.chat.services.copilot_tools import (
     COPILOT_TOOLS,
     CopilotToolContext,
+    build_project_brief,
     execute_copilot_tool,
 )
 from apps.chat.services.rag import suggest_related_library_documents
@@ -229,12 +230,25 @@ def build_copilot_messages(
     documents: QuerySet[Document],
     *,
     max_history: int = MAX_HISTORY_MESSAGES,
+    project_brief: str = "",
 ) -> list[dict]:
     system_prompt = build_copilot_system_prompt(project, documents)
 
     messages: list[dict] = [
         {"role": "system", "content": system_prompt},
     ]
+
+    if project_brief:
+        messages.append({
+            "role": "system",
+            "content": (
+                "## Resumen inicial del corpus del proyecto\n"
+                "Contexto pre-recuperado al inicio de la sesión. "
+                "Úsalo para responder preguntas generales y para saber qué buscar "
+                "con search_documents cuando necesites más detalle.\n\n"
+                f"{project_brief}"
+            ),
+        })
 
     # Fetch the full session history (oldest first) excluding system messages.
     all_history = list(
@@ -327,8 +341,22 @@ def process_copilot_message(
 
     documents = _resolve_project_documents(project)
 
+    # Phase 3: project brief — compute once and persist in session metadata so
+    # subsequent messages don't pay the retrieval cost again.
+    session_metadata = session.metadata or {}
+    project_brief = session_metadata.get("project_brief", "")
+    if not project_brief:
+        try:
+            project_brief = build_project_brief(user, project, documents)
+            if project_brief:
+                session.metadata = {**session_metadata, "project_brief": project_brief}
+                session.save(update_fields=["metadata"])
+        except Exception as exc:
+            logger.warning("Copilot project brief failed, proceeding without it: %s", exc)
+            project_brief = ""
+
     messages = build_copilot_messages(
-        session, user_content, project, documents,
+        session, user_content, project, documents, project_brief=project_brief,
     )
 
     tool_ctx = CopilotToolContext(

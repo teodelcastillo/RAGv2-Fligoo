@@ -101,6 +101,13 @@ class Skill(models.Model):
             "statements for missing document/criterion pairs."
         ),
     )
+    retrieval_query_template = models.TextField(
+        blank=True,
+        help_text=(
+            "Optional explicit retrieval query. When set, used instead of the "
+            "auto-built query from name+description. Supports {{extra_instructions}} placeholder."
+        ),
+    )
     retrieval_strategy = models.CharField(
         max_length=40,
         choices=RetrievalStrategy.choices,

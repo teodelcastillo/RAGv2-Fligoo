@@ -98,11 +98,19 @@ def lexical_search(
         or_filter |= Q(content_norm__icontains=t)
     candidates = list(base_qs.filter(or_filter).only("id", "content_norm", "document_id")[:200])
 
-    def score(chunk: SmartChunk) -> int:
-        text = (chunk.content_norm or "").lower()
-        return sum(1 for t in tokens if t in text)
+    n_tokens = len(tokens)
 
-    candidates.sort(key=score, reverse=True)
+    def _lex_score(chunk: SmartChunk) -> float:
+        text = (chunk.content_norm or "").lower()
+        hits = sum(1 for t in tokens if t in text)
+        return hits / n_tokens
+
+    # Annotate lex_sim so _chunk_similarity() in the pipeline can evaluate these
+    # chunks against RAG_MIN_SIMILARITY, matching the behaviour of the trigram path.
+    for c in candidates:
+        c.lex_sim = _lex_score(c)  # type: ignore[attr-defined]
+    candidates = [c for c in candidates if c.lex_sim >= LEXICAL_MIN_SIMILARITY]
+    candidates.sort(key=lambda c: c.lex_sim, reverse=True)  # type: ignore[attr-defined]
     return candidates[:top_n]
 
 

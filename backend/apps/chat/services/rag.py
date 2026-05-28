@@ -282,7 +282,7 @@ def suggest_related_library_documents(
             | Q(document__projects__id__in=shared_project_ids)
         ).distinct()
 
-    chunks = list(chunk_qs.top_similar(text, top_n=chunk_pool))
+    chunks = list(chunk_qs.top_similar2(text, top_n=chunk_pool))
     if not chunks:
         return []
 
@@ -396,11 +396,11 @@ def fetch_relevant_chunks(
             resolved_strategy = "global"
 
     if resolved_strategy != "hybrid_per_document":
-        return list(qs.top_similar(query_text, top_n=top_n))
+        return list(qs.top_similar2(query_text, top_n=top_n))
 
     query_embedding = embed_text(query_text)
     if not query_embedding:
-        return list(qs.top_similar(query_text, top_n=top_n))
+        return list(qs.top_similar2(query_text, top_n=top_n))
 
     ranked_qs = qs.annotate(
         distance=CosineDistance("embedding", query_embedding)

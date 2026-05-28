@@ -7,7 +7,15 @@ from typing import Any, Callable
 
 from django.db.models import QuerySet
 
-from apps.chat.services.rag import build_context_block, fetch_relevant_chunks
+from apps.chat.services.context_builder import build_context_block as _build_context_block
+from apps.chat.services.rag import (
+    RAG_MIN_SIMILARITY,
+    _chunk_similarity,
+    build_context_block,
+    fetch_relevant_chunks,
+)
+from apps.chat.services.retrieval import lexical_search, rrf_fuse
+from apps.document.models import SmartChunk
 
 logger = logging.getLogger(__name__)
 
@@ -215,23 +223,157 @@ class CopilotToolContext:
 
 
 # ---------------------------------------------------------------------------
+# Copilot retrieval helpers
+# ---------------------------------------------------------------------------
+
+def retrieve_for_copilot(
+    *,
+    user,
+    project,
+    allowed_documents: QuerySet,
+    query_text: str,
+    top_n: int = 12,
+) -> list:
+    """
+    Hybrid retrieval for the Copilot search_documents tool.
+
+    Blueprint chunks are retrieved first (up to 3) with a guaranteed slot so
+    the project mandate is always visible to the LLM. The remaining budget is
+    filled via RRF fusion of vector + lexical over the rest of the corpus.
+    """
+    blueprint_slug = (
+        project.blueprint_document.slug if project.blueprint_document_id else None
+    )
+
+    blueprint_chunks: list = []
+    if blueprint_slug:
+        blueprint_doc_qs = allowed_documents.filter(slug=blueprint_slug)
+        if blueprint_doc_qs.exists():
+            try:
+                blueprint_chunks = list(
+                    fetch_relevant_chunks(
+                        user=user,
+                        query_text=query_text,
+                        allowed_documents=blueprint_doc_qs,
+                        top_n=3,
+                        retrieval_strategy="global",
+                        total_limit=3,
+                    )
+                )
+            except Exception as exc:
+                logger.warning("Copilot blueprint retrieval failed: %s", exc)
+
+    other_docs = (
+        allowed_documents.exclude(slug=blueprint_slug)
+        if blueprint_slug
+        else allowed_documents
+    )
+    remaining_budget = max(1, top_n - len(blueprint_chunks))
+
+    other_doc_ids = list(other_docs.values_list("id", flat=True))
+    if not other_doc_ids:
+        return blueprint_chunks
+
+    try:
+        v_chunks = fetch_relevant_chunks(
+            user=user,
+            query_text=query_text,
+            allowed_documents=other_docs,
+            top_n=remaining_budget,
+            retrieval_strategy="auto",
+            total_limit=remaining_budget,
+        )
+    except Exception as exc:
+        logger.warning("Copilot vector retrieval failed: %s", exc)
+        v_chunks = []
+
+    base_qs = SmartChunk.objects.filter(
+        document_id__in=other_doc_ids
+    ).exclude(embedding__isnull=True)
+    try:
+        lex_chunks = lexical_search(base_qs, query_text, top_n=remaining_budget)
+    except Exception as exc:
+        logger.warning("Copilot lexical retrieval failed: %s", exc)
+        lex_chunks = []
+
+    ranked_lists = [lst for lst in [v_chunks, lex_chunks] if lst]
+    if ranked_lists:
+        fused = rrf_fuse(ranked_lists, top_n=remaining_budget)
+        fused = [
+            c for c in fused
+            if _chunk_similarity(c) is None or _chunk_similarity(c) >= RAG_MIN_SIMILARITY
+        ]
+    else:
+        fused = []
+
+    return blueprint_chunks + fused
+
+
+def build_project_brief(user, project, documents: QuerySet) -> str:
+    """
+    High-level corpus overview generated once per Copilot session.
+
+    Injected as ambient system context so the LLM has a baseline understanding
+    of the project's documents from the very first message, before any tool
+    calls. Uses ``with_citations=False`` so [#N] markers don't leak into
+    system-level context that has no corresponding user message.
+    """
+    if not documents.exists():
+        return ""
+
+    broad_query = " ".join(filter(None, [
+        project.name,
+        project.description or "",
+        "objetivos compromisos metodología emisiones",
+    ])).strip()
+
+    chunks = retrieve_for_copilot(
+        user=user,
+        project=project,
+        allowed_documents=documents,
+        query_text=broad_query,
+        top_n=8,
+    )
+    if not chunks:
+        return ""
+
+    return _build_context_block(chunks, with_citations=False)
+
+
+# ---------------------------------------------------------------------------
 # Individual tool executors
 # ---------------------------------------------------------------------------
 
 def _execute_search_documents(args: dict, ctx: CopilotToolContext) -> str:
+    from apps.project.models import ProjectSection
+
     query = (args.get("query") or "").strip()
     if not query:
         return "Error: 'query' parameter is required."
 
     top_n = min(max(int(args.get("top_n", 4)), 1), 8)
 
+    # Phase 2: enrich query with the active section's context so retrieval
+    # pulls toward the part of the corpus most relevant to current work.
+    active_section = (
+        ProjectSection.objects.filter(project=ctx.project, status="in_progress")
+        .order_by("position")
+        .first()
+    )
+    enriched_query = query
+    if active_section and active_section.description:
+        enriched_query = (
+            f"{query}. Contexto: {active_section.title}. "
+            f"{active_section.description[:200]}"
+        ).strip()
+
     try:
-        chunks = fetch_relevant_chunks(
+        chunks = retrieve_for_copilot(
             user=ctx.user,
-            query_text=query,
+            project=ctx.project,
             allowed_documents=ctx.allowed_documents,
+            query_text=enriched_query,
             top_n=top_n,
-            retrieval_strategy="auto",
         )
     except Exception as exc:
         logger.warning("search_documents tool failed: %s", exc)

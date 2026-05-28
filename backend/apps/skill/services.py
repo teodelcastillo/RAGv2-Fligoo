@@ -8,8 +8,14 @@ from typing import List
 from django.db.models import QuerySet
 from django.utils import timezone
 
-from apps.chat.services.rag import build_context_block, fetch_relevant_chunks
-from apps.document.models import Document
+from apps.chat.services.rag import (
+    RAG_MIN_SIMILARITY,
+    _chunk_similarity,
+    build_context_block,
+    fetch_relevant_chunks,
+)
+from apps.chat.services.retrieval import lexical_search, rrf_fuse
+from apps.document.models import Document, SmartChunk
 from apps.document.utils.client_openia import generate_chat_completion, generate_with_tools
 from apps.skill.models import (
     ExecutionOutputMode,
@@ -341,17 +347,17 @@ def _run_research_phase(
     steps: List[SkillStep],
 ) -> tuple[str, list]:
     """
-    Execute a broad retrieval pass before the authoring steps.
+    Broad retrieval pass before the authoring steps.
 
-    Returns:
-        (scratchpad_block, chunks_used)
-        - scratchpad_block: formatted context string injected into each step.
-        - chunks_used: list of SmartChunk objects for source tracking.
+    One global pgvector query + one lexical query per research query,
+    then a single RRF pass cross all queries so chunks that appear in
+    multiple searches float up and duplicates are naturally eliminated.
+
+    Returns (scratchpad_block, chunks_used).
     """
     research_queries: list[str] = list(skill.research_queries or [])
 
     if not research_queries:
-        # Auto-derive from step instructions, deduplicating by truncated content.
         seen: set[str] = set()
         for step in steps:
             q = f"{step.title}. {step.instructions}"[:200].strip()
@@ -361,34 +367,88 @@ def _run_research_phase(
             if len(research_queries) >= RESEARCH_AUTO_QUERIES_MAX:
                 break
 
-    all_chunks: list = []
-    seen_ids: set[int] = set()
+    if not research_queries:
+        return "", []
 
+    doc_ids = list(documents.values_list("id", flat=True))
+    base_qs = SmartChunk.objects.filter(
+        document_id__in=doc_ids
+    ).exclude(embedding__isnull=True)
+
+    all_ranked_lists: list[list] = []
     for query in research_queries[:RESEARCH_AUTO_QUERIES_MAX]:
         try:
-            chunks = fetch_relevant_chunks(
+            v_chunks = fetch_relevant_chunks(
                 user=execution.owner,
                 query_text=query,
                 allowed_documents=documents,
-                top_n=4,
-                retrieval_strategy="hybrid_per_document",
-                k_per_doc=2,
-                total_limit=8,
+                top_n=6,
+                retrieval_strategy="global",
+                total_limit=6,
             )
         except Exception as exc:
-            logger.warning("Research phase query %r failed: %s", query, exc)
-            continue
+            logger.warning("Research phase vector query %r failed: %s", query, exc)
+            v_chunks = []
 
-        for c in chunks:
-            if c.id not in seen_ids:
-                seen_ids.add(c.id)
-                all_chunks.append(c)
+        try:
+            lex_chunks = lexical_search(base_qs, query, top_n=6)
+        except Exception as exc:
+            logger.warning("Research phase lexical query %r failed: %s", query, exc)
+            lex_chunks = []
 
-    capped = all_chunks[:RESEARCH_SCRATCHPAD_MAX_CHUNKS]
-    if not capped:
+        for lst in [v_chunks, lex_chunks]:
+            if lst:
+                all_ranked_lists.append(lst)
+
+    if not all_ranked_lists:
         return "", []
 
-    return build_context_block(capped), capped
+    fused = rrf_fuse(all_ranked_lists, top_n=RESEARCH_SCRATCHPAD_MAX_CHUNKS)
+    final = [
+        c for c in fused
+        if _chunk_similarity(c) is None or _chunk_similarity(c) >= RAG_MIN_SIMILARITY
+    ]
+
+    if not final:
+        return "", []
+
+    return build_context_block(final), final
+
+
+# ---------------------------------------------------------------------------
+# Quick skill runner helpers
+# ---------------------------------------------------------------------------
+
+def _build_skill_coverage_instruction(
+    documents: "QuerySet[Document]", chunks: list
+) -> str:
+    """
+    Coverage policy block for comparative-mode quick skills.
+    Only meaningful with 2+ documents — returns empty string otherwise.
+    """
+    doc_list = list(documents.values("id", "name", "slug").order_by("name"))
+    total = len(doc_list)
+    if total <= 1:
+        return ""
+    covered_ids = {c.document_id for c in chunks}
+    missing = [d for d in doc_list if d["id"] not in covered_ids]
+    covered_count = total - len(missing)
+    missing_text = (
+        " Documentos sin evidencia recuperada: "
+        + ", ".join(f"{d['name']} ({d['slug']})" for d in missing)
+        + "."
+        if missing
+        else ""
+    )
+    return (
+        "\n\nPOLÍTICA DE COBERTURA OBLIGATORIA:\n"
+        f"- Esta skill tiene {total} documentos en scope.\n"
+        f"- El contexto recuperado cubre {covered_count}/{total} documentos.\n"
+        "- Debes incluir una entrada por cada documento cubierto.\n"
+        "- Si un documento no tiene evidencia para un criterio, indícalo explícitamente "
+        "como 'Sin evidencia en fuentes provistas'."
+        f"{missing_text}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -399,16 +459,27 @@ def _run_quick(execution: SkillExecution, documents: QuerySet[Document]) -> None
     from apps.skill.tools import SkillToolContext
 
     skill = execution.skill
-    query_text = f"{skill.name}. {skill.description}. {execution.extra_instructions}".strip()
+
+    # 1. Build the retrieval query — use explicit template when configured,
+    #    otherwise fall back to the old metadata-based construction.
+    auto_query = f"{skill.name}. {skill.description}. {execution.extra_instructions}".strip()
+    if skill.retrieval_query_template:
+        retrieval_query = skill.retrieval_query_template.replace(
+            "{{extra_instructions}}", execution.extra_instructions or ""
+        ).strip() or auto_query
+    else:
+        retrieval_query = auto_query
+
     effective_retrieval_strategy = (
         RetrievalStrategy.HYBRID_PER_DOCUMENT
         if skill.comparative_mode_enabled
         else skill.retrieval_strategy
     )
 
-    chunks = fetch_relevant_chunks(
+    # 2. Vector retrieval (unchanged call site, new query variable)
+    vector_chunks = fetch_relevant_chunks(
         user=execution.owner,
-        query_text=query_text,
+        query_text=retrieval_query,
         allowed_documents=documents,
         top_n=DEFAULT_CHUNKS,
         retrieval_strategy=effective_retrieval_strategy,
@@ -416,7 +487,30 @@ def _run_quick(execution: SkillExecution, documents: QuerySet[Document]) -> None
         total_limit=skill.total_limit,
         max_chunks_per_doc=skill.max_per_doc_after_rerank,
     )
-    context_block = build_context_block(chunks)
+
+    # 3. Lexical retrieval over the same document scope
+    doc_ids = list(documents.values_list("id", flat=True))
+    base_qs = SmartChunk.objects.filter(
+        document_id__in=doc_ids
+    ).exclude(embedding__isnull=True)
+    try:
+        lex_chunks = lexical_search(base_qs, retrieval_query, top_n=skill.total_limit)
+    except Exception as exc:
+        logger.warning("Skill lexical search failed for execution %s: %s", execution.id, exc)
+        lex_chunks = []
+
+    # 4. RRF fusion
+    ranked_lists = [lst for lst in [vector_chunks, lex_chunks] if lst]
+    fused = rrf_fuse(ranked_lists, top_n=skill.total_limit) if ranked_lists else vector_chunks
+
+    # 5. Relevance threshold — drop chunks that have a score but fall below the bar
+    final_chunks = [
+        c for c in fused
+        if _chunk_similarity(c) is None or _chunk_similarity(c) >= RAG_MIN_SIMILARITY
+    ]
+
+    # 6. Context block with structured citations [#N]
+    context_block = build_context_block(final_chunks)
 
     prompt = _render_prompt_variables(
         skill.prompt_template,
@@ -428,6 +522,9 @@ def _run_quick(execution: SkillExecution, documents: QuerySet[Document]) -> None
         prompt = (
             f"{prompt}\n\n{_comparative_instruction_block(skill.strict_missing_evidence)}"
         ).strip()
+        coverage = _build_skill_coverage_instruction(documents, final_chunks)
+        if coverage:
+            prompt = f"{prompt}\n{coverage}".strip()
 
     is_table = execution.output_mode == ExecutionOutputMode.TABLE
     table_schema = execution.metadata.get("table_schema") or {}
@@ -444,7 +541,7 @@ def _run_quick(execution: SkillExecution, documents: QuerySet[Document]) -> None
 
     tool_ctx = SkillToolContext(user=execution.owner, allowed_documents=documents)
     output_text, usage = _call_model(messages, skill=skill, tool_ctx=tool_ctx)
-    all_chunks = chunks + tool_ctx.additional_chunks
+    all_chunks = final_chunks + tool_ctx.additional_chunks
 
     if is_table:
         parsed = coerce_table_output(output_text=output_text, table_schema=table_schema)
@@ -458,6 +555,9 @@ def _run_quick(execution: SkillExecution, documents: QuerySet[Document]) -> None
     execution.metadata = {
         "usage": usage,
         "chunks_used": len(all_chunks),
+        "vector_chunks": len(vector_chunks),
+        "lexical_chunks": len(lex_chunks),
+        "retrieval_query": retrieval_query,
         "tool_calls_made": len(tool_ctx.additional_chunks) > 0,
         "comparative_mode_enabled": skill.comparative_mode_enabled,
         "strict_missing_evidence": skill.strict_missing_evidence,
@@ -536,6 +636,15 @@ def _run_copilot(execution: SkillExecution, documents: QuerySet[Document]) -> No
         else skill.retrieval_strategy
     )
 
+    # Shared lexical scope for all steps (computed once, not per step).
+    step_doc_ids = list(documents.values_list("id", flat=True))
+    step_base_qs = SmartChunk.objects.filter(
+        document_id__in=step_doc_ids
+    ).exclude(embedding__isnull=True)
+
+    # Track chunk IDs already seen so each step can prioritise fresh coverage.
+    seen_chunk_ids: set[int] = set()
+
     # ------------------------------------------------------------------ #
     # Research phase (Sprint 2A)                                          #
     # ------------------------------------------------------------------ #
@@ -548,6 +657,7 @@ def _run_copilot(execution: SkillExecution, documents: QuerySet[Document]) -> No
             steps=steps,
         )
         all_step_chunks.extend(research_chunks)
+        seen_chunk_ids.update(c.id for c in research_chunks)
         logger.debug(
             "Research phase for execution %s: %d chunks collected.",
             execution.id,
@@ -562,17 +672,48 @@ def _run_copilot(execution: SkillExecution, documents: QuerySet[Document]) -> No
         step_output_mode, step_table_schema = _resolve_step_output_config(step)
         is_table_step = step_output_mode == ExecutionOutputMode.TABLE
 
-        query_text = f"{step.title}. {step.instructions}".strip()
-        chunks = fetch_relevant_chunks(
-            user=execution.owner,
-            query_text=query_text,
-            allowed_documents=documents,
-            top_n=DEFAULT_CHUNKS,
-            retrieval_strategy=effective_retrieval_strategy,
-            k_per_doc=skill.k_per_doc,
-            total_limit=skill.total_limit,
-            max_chunks_per_doc=skill.max_per_doc_after_rerank,
-        )
+        # Enrich the query with a brief hint from the most recent step output
+        # so the embedding pulls toward the thread of the current section.
+        prev_hint = (previous_outputs[-1] if previous_outputs else "")[:300]
+        query_text = f"{step.title}. {step.instructions}. {prev_hint}".strip()
+
+        # Vector retrieval
+        try:
+            v_chunks = fetch_relevant_chunks(
+                user=execution.owner,
+                query_text=query_text,
+                allowed_documents=documents,
+                top_n=DEFAULT_CHUNKS,
+                retrieval_strategy=effective_retrieval_strategy,
+                k_per_doc=skill.k_per_doc,
+                total_limit=skill.total_limit,
+                max_chunks_per_doc=skill.max_per_doc_after_rerank,
+            )
+        except Exception as exc:
+            logger.warning("Step %s vector retrieval failed: %s", step.id, exc)
+            v_chunks = []
+
+        # Lexical retrieval
+        try:
+            step_lex_chunks = lexical_search(step_base_qs, query_text, top_n=DEFAULT_CHUNKS)
+        except Exception as exc:
+            logger.warning("Step %s lexical search failed: %s", step.id, exc)
+            step_lex_chunks = []
+
+        # RRF fusion + threshold filter
+        step_ranked = [lst for lst in [v_chunks, step_lex_chunks] if lst]
+        fused = rrf_fuse(step_ranked, top_n=skill.total_limit) if step_ranked else v_chunks
+        fused = [
+            c for c in fused
+            if _chunk_similarity(c) is None or _chunk_similarity(c) >= RAG_MIN_SIMILARITY
+        ]
+
+        # Prioritise chunks not yet seen in earlier steps; fall back to repeats if needed.
+        new_chunks = [c for c in fused if c.id not in seen_chunk_ids]
+        repeat_chunks = [c for c in fused if c.id in seen_chunk_ids]
+        chunks = (new_chunks + repeat_chunks)[:DEFAULT_CHUNKS]
+
+        seen_chunk_ids.update(c.id for c in chunks)
         all_step_chunks.extend(chunks)
         context_block = build_context_block(chunks)
 

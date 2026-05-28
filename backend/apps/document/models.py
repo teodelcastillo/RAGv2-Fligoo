@@ -209,6 +209,9 @@ class SmartChunk(models.Model):
         def top_similar(self, *args, **kwargs):
             return self.get_queryset().top_similar(*args, **kwargs)
 
+        def top_similar2(self, *args, **kwargs):
+            return self.get_queryset().top_similar2(*args, **kwargs)
+
     # class SmartChunkManager(models.Manager):
     #     #  def get_queryset(self):
     #     #     return super().get_queryset()

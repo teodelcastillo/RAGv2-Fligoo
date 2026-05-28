@@ -124,6 +124,7 @@ def generate_chunk_context(
     doc_summary: str,
     chunk_index: int,
     *,
+    section_title: str = "",
     model: str | None = None,
     max_tokens: int = 150,
 ) -> str:
@@ -131,6 +132,9 @@ def generate_chunk_context(
     Genera 2-3 oraciones que sitúan un chunk dentro de su documento.
     Se usa para contextual retrieval: el resultado se antepone al contenido
     del chunk tanto en el embedding como en el prompt del LLM.
+
+    ``section_title`` (opcional): encabezado de la sección detectada por el chunker.
+    Cuando está disponible, lo incluye en el prompt para dar más precisión al LLM.
     """
     content = (chunk_content or "").strip()[:1200]
     if not content:
@@ -138,6 +142,7 @@ def generate_chunk_context(
 
     title = (doc_name or "").strip() or "Sin título"
     summary = (doc_summary or "").strip()[:500] or "No disponible"
+    section_hint = f"\nSección: {section_title.strip()}" if section_title.strip() else ""
 
     messages = [
         {
@@ -152,7 +157,7 @@ def generate_chunk_context(
         {
             "role": "user",
             "content": (
-                f'Documento: "{title}"\n'
+                f'Documento: "{title}"{section_hint}\n'
                 f"Resumen del documento: {summary}\n\n"
                 f"Fragmento #{chunk_index + 1}:\n{content}\n\n"
                 "Escribe 2-3 oraciones que expliquen qué sección o tema del documento representa "

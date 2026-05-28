@@ -137,16 +137,64 @@ def _semantic_paragraphs(text: str) -> List[dict]:
             segments.append({"text": merged, "title": title, "tokens": toks})
 
     def _slide_long(para: str, title: str) -> None:
-        """Token-sliding fallback for paragraphs that exceed MAX_TOKENS."""
-        tokens = encode_text(para)
-        i = 0
-        while i < len(tokens):
-            window = tokens[i : i + MAX_TOKENS]
-            chunk_text = decode_text(window)
-            segments.append(
-                {"text": chunk_text, "title": title, "tokens": len(window)}
-            )
-            i += MAX_TOKENS - OVERLAP_TOKENS
+        """
+        Sentence-aware fallback for paragraphs exceeding MAX_TOKENS.
+
+        Splits on natural sentence boundaries first (.  !  ?  …).  Each
+        accumulated sentence group is flushed before exceeding MAX_TOKENS.
+        If an individual sentence is itself longer than MAX_TOKENS (rare in ESG
+        text), it falls back to a token window for that sentence only.
+        When no sentence boundaries exist at all, the whole paragraph gets the
+        pure token-sliding treatment.
+        """
+        _SENTENCE_RE = re.compile(
+            r'(?<=[.!?…])\s+(?=[A-ZÁÉÍÓÚÑ"\'\(])',
+            re.UNICODE,
+        )
+        sentences = _SENTENCE_RE.split(para)
+
+        if len(sentences) <= 1:
+            # No sentence boundaries — token-window fallback (same as before)
+            tokens = encode_text(para)
+            i = 0
+            while i < len(tokens):
+                window = tokens[i: i + MAX_TOKENS]
+                segments.append({"text": decode_text(window), "title": title, "tokens": len(window)})
+                i += MAX_TOKENS - OVERLAP_TOKENS
+            return
+
+        current_sentences: List[str] = []
+        current_toks = 0
+
+        for sentence in sentences:
+            s_toks = token_count(sentence)
+
+            if s_toks > MAX_TOKENS:
+                # Flush accumulated sentences first
+                if current_sentences:
+                    merged = " ".join(current_sentences)
+                    segments.append({"text": merged, "title": title, "tokens": token_count(merged)})
+                    current_sentences, current_toks = [], 0
+                # Single sentence too long → token-window for this sentence only
+                toks = encode_text(sentence)
+                i = 0
+                while i < len(toks):
+                    window = toks[i: i + MAX_TOKENS]
+                    segments.append({"text": decode_text(window), "title": title, "tokens": len(window)})
+                    i += MAX_TOKENS - OVERLAP_TOKENS
+                continue
+
+            if current_toks + s_toks > MAX_TOKENS and current_sentences:
+                merged = " ".join(current_sentences)
+                segments.append({"text": merged, "title": title, "tokens": token_count(merged)})
+                current_sentences, current_toks = [], 0
+
+            current_sentences.append(sentence)
+            current_toks += s_toks
+
+        if current_sentences:
+            merged = " ".join(current_sentences)
+            segments.append({"text": merged, "title": title, "tokens": token_count(merged)})
 
     for para in raw_paras:
         if _is_heading(para):
@@ -271,6 +319,7 @@ def chunk_text_and_embed(
                 doc_name=document_name,
                 doc_summary=content_summary or "",
                 chunk_index=idx,
+                section_title=chunk_title or "",
             )
         except Exception as exc:
             logger.warning(

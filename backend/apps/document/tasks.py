@@ -56,6 +56,18 @@ def process_document_chunks(self, doc_id: int) -> str:
 
         text = parse_file(tmp_path) or ""
 
+        # ── Early exit: no extractable text ──────────────────────────────────
+        if not text.strip():
+            logger.warning("Document %s: no extractable text after parsing.", doc_id)
+            Document.objects.filter(pk=doc_id).update(
+                last_error=(
+                    "No se pudo extraer texto del archivo. "
+                    "El archivo puede estar vacío, protegido o en un formato no soportado."
+                ),
+                chunking_status=ChunkingStatus.ERROR,
+            )
+            return "empty"
+
         content_summary = ""
         if _document_auto_summary_enabled() and text.strip():
             try:
@@ -134,6 +146,7 @@ def backfill_chunk_context_for_document(self, doc_id: int, batch_size: int = 50)
     qs = SmartChunk.objects.filter(
         document_id=doc_id,
         context_summary="",
+        chunk_index__gt=0,   # skip the summary anchor (chunk #0) — it has no context to generate
     ).order_by("chunk_index")
 
     total = qs.count()

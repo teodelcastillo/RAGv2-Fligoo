@@ -4,9 +4,16 @@ from typing import Callable, Dict
 import re
 
 def clean_text_spacing(text: str) -> str:
-    # Remove line breaks inside paragraphs but keep double newlines (real paragraph breaks)
-    text = re.sub(r'(?<!\n)\n(?!\n)', ' ', text)
-    # Collapse multiple spaces
+    # Collapse single newlines to spaces, but PRESERVE them when the following
+    # line starts with a list marker (-, *, •, or digit + . / )).
+    # This keeps bullet/numbered lists intact after extraction.
+    _LIST_START = r'[ \t]*(?:[-*•]|\d+[.)]) '
+    text = re.sub(
+        rf'(?<!\n)\n(?!\n)(?!{_LIST_START})',
+        ' ',
+        text,
+    )
+    # Collapse multiple spaces / tabs
     text = re.sub(r'[ \t]+', ' ', text)
     # Collapse 3+ newlines to 2
     text = re.sub(r'\n{3,}', '\n\n', text)
@@ -61,7 +68,32 @@ def _read_docx(path: str) -> str:
     import docx  # python-docx
 
     doc = docx.Document(path)
-    return "\n".join(p.text for p in doc.paragraphs if p.text).strip()
+
+    parts: list[str] = []
+
+    # --- Body paragraphs ---
+    for p in doc.paragraphs:
+        if p.text.strip():
+            parts.append(p.text.strip())
+
+    # --- Tables → pipe-delimited rows ---
+    # python-docx repeats the value of merged cells for every position they occupy;
+    # deduplicate adjacent identical values to avoid noise.
+    for table in doc.tables:
+        table_lines: list[str] = []
+        for row in table.rows:
+            cells = [cell.text.strip() for cell in row.cells]
+            deduped: list[str] = [cells[0]] if cells else []
+            for cell in cells[1:]:
+                if cell != deduped[-1]:
+                    deduped.append(cell)
+            row_text = " | ".join(deduped)
+            if row_text.strip(" |"):
+                table_lines.append(row_text)
+        if table_lines:
+            parts.append("\n".join(table_lines))
+
+    return "\n\n".join(parts).strip()
 
 
 def _parse_file(file_path: str) -> str:

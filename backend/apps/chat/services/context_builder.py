@@ -34,6 +34,23 @@ CITATION_INSTRUCTIONS = (
     "No lo rellenes con conocimiento general sin marcarlo."
 )
 
+# Variant for PANORAMA / COMPARATIVE queries where the task is to *synthesize*
+# across many fragments rather than look for a pre-compiled answer in a single one.
+PANORAMA_CITATION_INSTRUCTIONS = (
+    "Reglas de citación para respuesta de panorama regional:\n"
+    "- Cita inline con [#N] cada dato que extraigas de un fragmento.\n"
+    "- Solo adjuntá [#N] si ese fragmento contiene explícitamente el dato citado.\n"
+    "- Si usás conocimiento propio, escribí [información general] en esa afirmación "
+    "y nunca le adjuntés un [#N].\n"
+    "- Tu tarea es COMPILAR y SINTETIZAR lo que cada fragmento dice: "
+    "NO escribas 'No encontré evidencia documental' cuando hay fragmentos en el contexto. "
+    "Si un fragmento cubre un país pero no incluye el dato específico pedido, "
+    "anotá 'dato no especificado en el fragmento recuperado' para ese país, "
+    "y seguí con los demás países.\n"
+    "- No omitas ningún país que tenga fragmento en el contexto, aunque el fragmento "
+    "sea parcial o no responda directamente la pregunta."
+)
+
 
 def build_context_block(
     chunks: Iterable[SmartChunk],
@@ -70,8 +87,15 @@ def build_context_block(
     return "\n\n".join(sections).strip()
 
 
-def build_citation_prompt() -> str:
-    """Return the system snippet that instructs the LLM to cite sources."""
+def build_citation_prompt(query_type: str | None = None) -> str:
+    """Return the system snippet that instructs the LLM to cite sources.
+
+    For PANORAMA / COMPARATIVE queries, returns a synthesis-oriented variant
+    that tells the model to compile across fragments rather than look for a
+    pre-compiled list.
+    """
+    if query_type in {"panorama", "comparative"}:
+        return PANORAMA_CITATION_INSTRUCTIONS
     return CITATION_INSTRUCTIONS
 
 

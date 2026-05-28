@@ -26,6 +26,8 @@ from apps.chat.models import ChatMessage, ChatSession, MessageRole, touch_chat_s
 from apps.chat.services.context_builder import build_citation_prompt
 from apps.chat.services.query_analysis import (
     COVERAGE_MODE_ALL,
+    QUERY_TYPE_COMPARATIVE,
+    QUERY_TYPE_PANORAMA,
     apply_response_mode_override,
     classify_query,
     classify_query_hybrid,
@@ -304,6 +306,9 @@ def _compose_messages(
 
     if retrieval.context_block:
         doc_count = retrieval.diagnostics.get("documents_in_scope") or session.allowed_documents.count()
+        query_type = retrieval.analysis.query_type if retrieval.analysis else None
+        is_panorama = query_type in {QUERY_TYPE_PANORAMA, QUERY_TYPE_COMPARATIVE}
+
         if doc_count == 1:
             single_doc = session.allowed_documents.first()
             doc_label = f'del documento "{single_doc.name}"' if single_doc else "del documento"
@@ -313,6 +318,31 @@ def _compose_messages(
                 "Basate en este contexto para responder con precisión. "
                 "Si la información solicitada no aparece en el contexto, indícalo claramente. "
                 "No hagas referencia a otros documentos ni a información que no esté en este contexto. "
+            )
+        elif is_panorama:
+            # For PANORAMA / COMPARATIVE queries each fragment comes from a
+            # different document (country/entity). The LLM must SYNTHESIZE
+            # across all fragments and compile a structured answer. It must NOT
+            # fire the "No encontré evidencia documental" clause just because
+            # the context doesn't contain a single pre-compiled list — that
+            # clause is for truly absent information, not for distributed data
+            # spread across per-country fragments.
+            unique_docs = retrieval.diagnostics.get("unique_documents") or len(
+                {c.document_id for c in (retrieval.chunks or [])}
+            )
+            context_preamble = (
+                f"El siguiente contexto contiene {unique_docs} fragmento(s) de documentos distintos "
+                "de la biblioteca de Ecofilia, cada uno correspondiente a un país o entidad diferente. "
+                "Tu objetivo es SINTETIZAR y COMPILAR la información de todos los fragmentos "
+                "para construir una respuesta de panorama regional. "
+                "Lee cada fragmento e EXTRAE los datos relevantes para la consulta del usuario; "
+                "luego PRESENTÁ una lista, tabla o resumen con lo que cada fragmento indica. "
+                "Si un fragmento cubre un país pero no contiene el dato específico pedido, "
+                "inclúyelo de todas formas con la nota 'dato no especificado en el fragmento'. "
+                "NO escribas 'No encontré evidencia documental' cuando hay fragmentos en el contexto: "
+                "esa frase está reservada para países o entidades sobre los que NO hay ningún fragmento. "
+                "Si usás conocimiento propio (no documental), marcalo con [información general] "
+                "y NO le adjuntés una cita [#N] a esa afirmación. "
             )
         else:
             context_preamble = (
@@ -330,7 +360,7 @@ def _compose_messages(
                 "role": str(MessageRole.SYSTEM),
                 "content": (
                     context_preamble
-                    + build_citation_prompt()
+                    + build_citation_prompt(query_type=query_type)
                     + _build_coverage_instruction(session, retrieval)
                     + f"\n\n{retrieval.context_block}"
                 ),

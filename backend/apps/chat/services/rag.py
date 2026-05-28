@@ -227,6 +227,39 @@ def retrieve_from_library(
                     len(geo_doc_ids),
                 )
 
+    # ── 2c. Re-scale pool when geo-filter shrinks the scope ───────────────
+    # pool_top_n was sized for the full library (top_n × multiplier = 30 by
+    # default).  After geo-filtering the accessible pool drops to ~10-50 docs.
+    # If pool_top_n < doc_count, some documents never get a chunk into the
+    # pgvector LIMIT window, so they can't appear in the final result no
+    # matter how we cap or rerank afterwards.
+    #
+    # Example: 35 geo-filtered docs, pool_top_n=30 → the 5 docs whose best
+    # chunk ranks ≥31 by cosine distance are permanently excluded.  A
+    # Portuguese-language NDC (Brasil) sitting at position 31 will never
+    # appear even though it's in the geo-filtered scope.
+    #
+    # Fix: ensure every geo-filtered doc has GEO_POOL_SLOTS_PER_DOC (default 3)
+    # chunk slots in the candidate pool.  Also relax final_limit so the
+    # per-doc cap doesn't immediately undo the coverage gain.
+    #
+    # Note: for filtered pgvector queries on small sets (<200 docs) the planner
+    # often switches to a sequential scan, so a larger LIMIT is cheap; for
+    # larger sets the HNSW ef_search budget still applies but the filter
+    # already narrows the graph traversal.
+    if diagnostics["geo_filter_applied"]:
+        _geo_n = len(accessible_doc_ids)
+        _slots = int(os.environ.get("GEO_POOL_SLOTS_PER_DOC", "3"))
+        pool_top_n = max(pool_top_n, _geo_n * _slots)
+        # Allow up to 1 chunk per geo-filtered doc in the final result,
+        # capped at GEO_PANORAMA_FINAL_CAP to keep LLM context manageable.
+        _geo_final_cap = int(os.environ.get("GEO_PANORAMA_FINAL_CAP", "40"))
+        final_limit = max(final_limit, min(_geo_n, _geo_final_cap))
+        logger.debug(
+            "Geo pool rescaled: geo_docs=%d pool_top_n=%d final_limit=%d",
+            _geo_n, pool_top_n, final_limit,
+        )
+
     # ── 3. Vector search: ONE query, pgvector does the heavy lifting ───────
     # No JOINs, no DISTINCT on the chunks table (incompatible with ORDER BY
     # embedding), no Python-side embedding comparisons.

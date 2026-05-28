@@ -195,6 +195,38 @@ def retrieve_from_library(
         diagnostics["elapsed_seconds"] = round(time.perf_counter() - started, 4)
         return RetrievalResult(analysis=analysis, diagnostics=diagnostics)
 
+    # ── 2b. Geographic scope filter (broad queries only) ──────────────────
+    # Detects a regional scope in the query ("Sudamérica", "LATAM", etc.) and
+    # filters accessible_doc_ids to only include documents whose region or name
+    # matches that scope.  Falls back to the full scope when fewer than
+    # _GEO_FILTER_MIN_DOCS documents survive the filter (avoids empty results
+    # caused by missing Document.region metadata).
+    geo_scope: str | None = None
+    diagnostics["geo_scope"] = None
+    diagnostics["geo_filter_applied"] = False
+    diagnostics["geo_filtered_docs"] = None
+    if is_broad_query:
+        geo_scope = _extract_geo_scope(query_text)
+        diagnostics["geo_scope"] = geo_scope
+        if geo_scope:
+            geo_doc_ids = _filter_docs_by_geo(accessible_doc_ids, geo_scope)
+            diagnostics["geo_filtered_docs"] = len(geo_doc_ids)
+            if len(geo_doc_ids) >= _GEO_FILTER_MIN_DOCS:
+                accessible_doc_ids = geo_doc_ids
+                diagnostics["geo_filter_applied"] = True
+                logger.info(
+                    "Geo filter applied: scope=%s, docs_before=%d, docs_after=%d",
+                    geo_scope,
+                    diagnostics["documents_in_scope"],
+                    len(accessible_doc_ids),
+                )
+            else:
+                logger.info(
+                    "Geo filter skipped (too few docs): scope=%s, matched=%d",
+                    geo_scope,
+                    len(geo_doc_ids),
+                )
+
     # ── 3. Vector search: ONE query, pgvector does the heavy lifting ───────
     # No JOINs, no DISTINCT on the chunks table (incompatible with ORDER BY
     # embedding), no Python-side embedding comparisons.
@@ -560,6 +592,105 @@ _RETRIEVAL_DOMAIN_HINTS = (
     "climático",
     "climatico",
 )
+
+# ---------------------------------------------------------------------------
+# Geographic scope filtering (PANORAMA / COMPARATIVE queries)
+# ---------------------------------------------------------------------------
+# Maps a scope key to a regex that detects it in the normalized query text.
+# More specific scopes are listed first so the first match wins.
+_GEO_SCOPE_PATTERNS: dict[str, str] = {
+    "sudamerica": (
+        r"\b(sudamérica|sudamerica|sudamericanos?|am[eé]rica del sur|south america"
+        r"|pa[ií]ses? sudamericanos?|cono sur|región andina|regi[oó]n andina)\b"
+    ),
+    "centroamerica": (
+        r"\b(centroam[eé]rica|am[eé]rica central|central america"
+        r"|pa[ií]ses? centroamericanos?)\b"
+    ),
+    "caribe": (
+        r"\b(carib[eé]|caribbean|pa[ií]ses? caribeños?)\b"
+    ),
+    "latam": (
+        r"\b(am[eé]rica latina|latinoam[eé]rica|latam|latin america"
+        r"|pa[ií]ses? latinoamericanos?|iberoam[eé]rica|iberoamerica)\b"
+    ),
+}
+
+# Country / region name substrings to match against Document.region and Document.name.
+# Used as case-insensitive containment filters (icontains).
+_GEO_COUNTRY_LISTS: dict[str, list[str]] = {
+    "sudamerica": [
+        "argentina", "bolivia", "brasil", "brazil", "chile", "colombia",
+        "ecuador", "guyana", "paraguay", "perú", "peru", "surinam", "suriname",
+        "uruguay", "venezuela",
+        # region strings that might appear in the region field
+        "sudamérica", "sudamerica", "sur américa", "sur america",
+        "south america", "américa del sur", "america del sur",
+    ],
+    "centroamerica": [
+        "costa rica", "el salvador", "guatemala", "honduras", "nicaragua",
+        "panamá", "panama", "belice", "belize",
+        "centroamérica", "centroamerica", "central america",
+    ],
+    "caribe": [
+        "cuba", "república dominicana", "dominicana", "haití", "haiti",
+        "jamaica", "trinidad", "barbados", "bahamas", "carib",
+    ],
+    "latam": [
+        "argentina", "bolivia", "brasil", "brazil", "chile", "colombia",
+        "costa rica", "cuba", "ecuador", "el salvador", "guatemala", "honduras",
+        "méxico", "mexico", "nicaragua", "panamá", "panama", "paraguay",
+        "perú", "peru", "dominicana", "surinam", "suriname", "uruguay",
+        "venezuela",
+        "latinoam", "latam", "américa latina", "america latina",
+    ],
+}
+
+# Minimum number of geo-filtered documents required to actually apply the filter.
+# Below this threshold we fall back to the full unfiltered scope so the user
+# doesn't get empty or degenerate results due to missing metadata.
+_GEO_FILTER_MIN_DOCS: int = 3
+
+
+def _extract_geo_scope(text: str) -> str | None:
+    """
+    Return the first matching geographic scope key for ``text``, or ``None``.
+
+    Scopes are checked from most-specific to least-specific so that
+    "países de Sudamérica" maps to ``"sudamerica"`` rather than ``"latam"``.
+    """
+    norm = (text or "").strip().lower()
+    if not norm:
+        return None
+    for scope, pattern in _GEO_SCOPE_PATTERNS.items():
+        if re.search(pattern, norm):
+            return scope
+    return None
+
+
+def _filter_docs_by_geo(doc_ids: list[int], geo_scope: str) -> list[int]:
+    """
+    Return the subset of ``doc_ids`` whose Document.region OR Document.name
+    contains at least one of the country / region strings for ``geo_scope``.
+
+    Falls back to the full list when the scope is unrecognised or the lookup
+    would be empty.
+    """
+    country_strings = _GEO_COUNTRY_LISTS.get(geo_scope, [])
+    if not country_strings or not doc_ids:
+        return doc_ids
+
+    q = Q()
+    for cs in country_strings:
+        q |= Q(region__icontains=cs)
+        q |= Q(name__icontains=cs)
+
+    return list(
+        Document.objects.filter(id__in=doc_ids)
+        .filter(q)
+        .values_list("id", flat=True)
+        .distinct()
+    )
 
 
 def _decide_retrieval_mode(query_text: str, analysis: QueryAnalysis) -> tuple[str, str | None]:

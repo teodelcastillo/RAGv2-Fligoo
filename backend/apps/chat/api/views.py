@@ -317,10 +317,12 @@ def _compose_messages(
         else:
             context_preamble = (
                 "El siguiente contexto proviene de documentos de la biblioteca de Ecofilia. "
-                "Respondé únicamente con información que aparezca EXPLÍCITAMENTE en los fragmentos del contexto. "
-                "Si el contexto no tiene evidencia sobre un país, entidad o dato específico, "
-                "declaralo: 'No encontré evidencia documental sobre [X] en esta consulta.' "
-                "Si necesitás usar conocimiento propio (no documental), marcalo con [información general] "
+                "Basá tu respuesta en la información de los fragmentos. "
+                "Podés sintetizar y relacionar lo que dicen los fragmentos, pero no inventes datos "
+                "que no estén respaldados por al menos un fragmento. "
+                "Si para un país, entidad o dato específico no hay ningún fragmento con evidencia, "
+                "indicalo brevemente: 'Sin evidencia documental sobre [X].' "
+                "Si usás conocimiento propio (no documental), marcalo con [información general] "
                 "y NO le adjuntés una cita [#N] a esa afirmación. "
             )
         base_messages.append(

@@ -160,20 +160,25 @@ def retrieve_from_library(
         diagnostics["elapsed_seconds"] = round(time.perf_counter() - started, 4)
         return RetrievalResult(analysis=analysis, diagnostics=diagnostics)
 
-    # ── PANORAMA/COMPARATIVE: expand the retrieval pool for broad queries ──
+    # ── PANORAMA/COMPARATIVE: expand pool + per-doc cap for broad queries ──
     # When the query asks for information across many entities (countries,
-    # sectors, years), all relevant documents sit at similar cosine distances.
-    # A small pool returns chunks dominated by 2-3 documents. A large pool
-    # followed by a per-document cap gives systematic coverage across all
-    # documents without loading them all into Python.
+    # sectors, years), all relevant documents sit at very similar cosine distances
+    # so a small pool is dominated by whichever 2-3 docs rank first.
+    #
+    # Strategy:
+    # - Expand pool by LIBRARY_PANORAMA_POOL_MULTIPLIER (default 2) — kept ≤ 2×
+    #   so we stay within pgvector's default hnsw.ef_search=40; larger values
+    #   degrade HNSW recall and add latency without benefit.
+    # - Per-document cap of 1 chunk maximises unique-document coverage.
+    # - Skip the RAG_MIN_SIMILARITY threshold for broad queries: every document
+    #   in the library is a plausible source for a pan-regional listing query,
+    #   and the threshold would kill the diversity gain from the wider pool.
     is_broad_query = analysis.query_type in {QUERY_TYPE_PANORAMA, QUERY_TYPE_COMPARATIVE}
-    panorama_multiplier = int(os.environ.get("LIBRARY_PANORAMA_POOL_MULTIPLIER", "6"))
+    panorama_multiplier = int(os.environ.get("LIBRARY_PANORAMA_POOL_MULTIPLIER", "2"))
     pool_top_n = (top_n * panorama_multiplier) if is_broad_query else top_n
-    # Cap the final result at 2× top_n for broad queries; standard top_n otherwise.
-    final_limit = (top_n * 2) if is_broad_query else top_n
-    # Per-document cap for broad queries: max 2 chunks/doc keeps the context
-    # diverse and prevents any single country from dominating.
-    max_per_doc = int(os.environ.get("LIBRARY_PANORAMA_MAX_PER_DOC", "2")) if is_broad_query else None
+    # Final result: up to 1 chunk/doc, max LIBRARY_PANORAMA_FINAL (default 25).
+    final_limit = int(os.environ.get("LIBRARY_PANORAMA_FINAL", "25")) if is_broad_query else top_n
+    max_per_doc = 1 if is_broad_query else None
 
     # ── 2. Accessible document IDs — query on documents table only ─────────
     # .values_list().distinct() on Document (small table) is fast.
@@ -236,11 +241,15 @@ def retrieve_from_library(
         fused = cap_per_document(fused, max_per_doc=max_per_doc, total_limit=final_limit)
 
     # ── 6. Relevance threshold ─────────────────────────────────────────────
-    final_chunks: list[SmartChunk] = [
-        c for c in fused
-        if _chunk_similarity(c) is None or _chunk_similarity(c) >= RAG_MIN_SIMILARITY
-    ]
-    if not is_broad_query:
+    # For broad queries the threshold is intentionally skipped: all documents in
+    # the library are plausible sources and the cap already bounds the output.
+    if is_broad_query:
+        final_chunks = list(fused)
+    else:
+        final_chunks = [
+            c for c in fused
+            if _chunk_similarity(c) is None or _chunk_similarity(c) >= RAG_MIN_SIMILARITY
+        ]
         final_chunks = final_chunks[:top_n]
 
     # ── 7. Context block ───────────────────────────────────────────────────

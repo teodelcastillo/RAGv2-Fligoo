@@ -544,7 +544,7 @@ def contextualize_query(
     if not history:
         return text
 
-    recent = history[-6:]
+    recent = history[-4:]
 
     history_block = "\n".join(
         f"{'Usuario' if m['role'] == 'user' else 'Asistente'}: {(m.get('content') or '')[:300]}"

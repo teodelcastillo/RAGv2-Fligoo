@@ -55,6 +55,58 @@ _CONVERSATIONAL_FALLBACK_PROMPT = (
     "documentos de la biblioteca o formule una pregunta más concreta."
 )
 
+# ---------------------------------------------------------------------------
+# Query contextualization guard
+# ---------------------------------------------------------------------------
+# Calling contextualize_query() costs ~2-5s (LLM round-trip). We only need
+# it when the query contains anaphoric references that can't be resolved
+# without conversation history. Self-contained questions (specific country,
+# year, metric — no pronouns or dangling references) are used as-is.
+
+_ANAPHORA_STARTERS = re.compile(
+    r"^(y\b|¿y\b|también\b|tambien\b|además\b|ademas\b|pero\b|"
+    r"sin embargo\b|al respecto\b|sobre eso\b|en ese caso\b|"
+    r"con respecto a eso\b|en relación\b|en relacion\b)",
+    re.IGNORECASE | re.UNICODE,
+)
+_ANAPHORA_PRONOUNS = re.compile(
+    r"\b(él|ella|ellos|ellas|eso|esto|esos|esas|ese|esta(?!\s+\w+\s+(país|region|zona))|"
+    r"el mismo|la misma|los mismos|las mismas|"
+    r"dicho|dichos|dichas|mencionado|mencionada|mencionados|mencionadas|"
+    r"anterior|lo anterior|lo mencionado|lo dicho|el tema|el punto)\b",
+    re.IGNORECASE | re.UNICODE,
+)
+_SUBJECTLESS_VERBS = re.compile(
+    r"^(dame\b|dime\b|explicame\b|explícame\b|cuéntame\b|cuentame\b|"
+    r"amplía\b|amplia\b|profundiza\b|detalla\b|resume\b|comparalo\b|"
+    r"compáralo\b|compárala\b)",
+    re.IGNORECASE | re.UNICODE,
+)
+
+
+def _query_needs_context(text: str) -> bool:
+    """
+    Return True when the query contains anaphoric references that require
+    conversation history to be resolved — contextualize_query() should run.
+    Return False when the query is self-contained — skip the LLM call.
+
+    Conservative by design: ambiguous cases return True (call the LLM).
+    Catches the most common patterns: dangling pronouns, anaphoric starters,
+    subjectless verbs, and very short elliptic follow-ups.
+    """
+    norm = (text or "").strip()
+    # Very short queries are almost always elliptic follow-ups.
+    if len(norm.split()) < 4:
+        return True
+    norm_lower = norm.lower()
+    if _ANAPHORA_STARTERS.match(norm_lower):
+        return True
+    if _ANAPHORA_PRONOUNS.search(norm_lower):
+        return True
+    if _SUBJECTLESS_VERBS.match(norm_lower):
+        return True
+    return False
+
 
 def _chat_retrieval_params(
     session: ChatSession,
@@ -217,18 +269,21 @@ def _run_retrieval(
     self-contained and the LLM call (10s timeout) would be wasteful.
     """
     # ── 1. Shared: history-aware query rewrite ────────────────────────────────
+    # Only rewrite when the query contains anaphoric references (pronouns,
+    # dangling subjects, elliptic follow-ups). Self-contained questions are
+    # used as-is, skipping the LLM round-trip (~2-5s saved per message).
     retrieval_query = content
     history_qs = (
         session.messages
         .exclude(role=MessageRole.SYSTEM)
-        .order_by("-created_at")[:6]
+        .order_by("-created_at")[:4]
     )
     history = [
         {"role": str(m.role), "content": m.content or ""}
         for m in reversed(list(history_qs))
     ]
     content_words = len((content or "").split())
-    if history and content_words >= 5:
+    if history and content_words >= 5 and _query_needs_context(content):
         try:
             retrieval_query = contextualize_query(content, history)
         except Exception as exc:

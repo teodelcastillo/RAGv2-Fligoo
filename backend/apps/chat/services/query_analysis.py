@@ -44,6 +44,10 @@ _PANORAMA_PATTERNS = (
     r"\b(base documental|documentacion|documentación|biblioteca|repositorio|repository)\b",
     r"\b(rasgos generales|de qu[eé] trata|en t[eé]rminos generales)\b",
     r"\b(overall|high[- ]level|across|across all)\b",
+    # Listing / enumeration queries → treat as PANORAMA (need wide retrieval)
+    r"\b(listados?|list[ao]|listame|listarme|listar|enumera[mr]?|enumeraci[oó]n)\b",
+    r"\b(cu[aá]les son|cu[aá]les (son |fueron |han sido )?los|cu[aá]les (son |fueron |han sido )?las)\b",
+    r"\b(qu[eé] pa[ií]ses|pa[ií]ses que|pa[ií]ses de (la |los |las )?)\b",
 )
 
 _ALL_COVERAGE_PATTERNS = (

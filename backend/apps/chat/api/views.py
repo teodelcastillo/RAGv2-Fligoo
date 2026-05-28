@@ -316,13 +316,12 @@ def _compose_messages(
             )
         else:
             context_preamble = (
-                "El siguiente contexto proviene de documentos accesibles en la biblioteca de Ecofilia "
-                "(incluyendo documentos públicos curados y, cuando corresponda, documentos con acceso del usuario). "
-                "Prioriza este contexto para responder. "
-                "Si la información del contexto es suficiente, basate principalmente en ella. "
-                "Si el contexto no contiene información relevante o es insuficiente, "
-                "puedes complementar con tu conocimiento general, pero indica claramente "
-                "qué parte proviene del documento y qué parte de tu conocimiento general. "
+                "El siguiente contexto proviene de documentos de la biblioteca de Ecofilia. "
+                "Respondé únicamente con información que aparezca EXPLÍCITAMENTE en los fragmentos del contexto. "
+                "Si el contexto no tiene evidencia sobre un país, entidad o dato específico, "
+                "declaralo: 'No encontré evidencia documental sobre [X] en esta consulta.' "
+                "Si necesitás usar conocimiento propio (no documental), marcalo con [información general] "
+                "y NO le adjuntés una cita [#N] a esa afirmación. "
             )
         base_messages.append(
             {

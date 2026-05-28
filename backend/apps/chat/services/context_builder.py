@@ -23,13 +23,15 @@ logger = logging.getLogger(__name__)
 
 
 CITATION_INSTRUCTIONS = (
-    "Cuando uses información del contexto, cita la fuente al final de la "
-    "afirmación con marcadores tipo [#1], [#2], etc. (donde el número "
-    "corresponde al fragmento listado abajo). Si combinas varias fuentes, "
-    "cítalas todas. Para respuestas con varias afirmaciones, cita inline cada "
-    "afirmación factual relevante (no solo al final del párrafo). "
-    "Si la información necesaria no está en el contexto, "
-    "indícalo de forma explícita en lugar de inventar."
+    "Reglas de citación:\n"
+    "- Cita inline con [#N] cada afirmación factual que provenga de un fragmento del contexto.\n"
+    "- Solo adjuntá [#N] si ese fragmento contiene EXPLÍCITAMENTE el dato que afirmás. "
+    "No cites un fragmento porque sea temáticamente similar o habla del mismo tema general.\n"
+    "- Si usás conocimiento propio (no documental), escribí [información general] "
+    "en esa afirmación en lugar de [#N]. Nunca adjuntes un [#N] a datos de tu entrenamiento.\n"
+    "- Si la información sobre un país, entidad o hecho específico no está en el contexto, "
+    "declaralo explícitamente: 'No encontré evidencia documental sobre [X].' "
+    "No lo rellenes con conocimiento general sin marcarlo."
 )
 
 

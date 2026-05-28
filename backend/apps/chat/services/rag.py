@@ -160,6 +160,21 @@ def retrieve_from_library(
         diagnostics["elapsed_seconds"] = round(time.perf_counter() - started, 4)
         return RetrievalResult(analysis=analysis, diagnostics=diagnostics)
 
+    # ── PANORAMA/COMPARATIVE: expand the retrieval pool for broad queries ──
+    # When the query asks for information across many entities (countries,
+    # sectors, years), all relevant documents sit at similar cosine distances.
+    # A small pool returns chunks dominated by 2-3 documents. A large pool
+    # followed by a per-document cap gives systematic coverage across all
+    # documents without loading them all into Python.
+    is_broad_query = analysis.query_type in {QUERY_TYPE_PANORAMA, QUERY_TYPE_COMPARATIVE}
+    panorama_multiplier = int(os.environ.get("LIBRARY_PANORAMA_POOL_MULTIPLIER", "6"))
+    pool_top_n = (top_n * panorama_multiplier) if is_broad_query else top_n
+    # Cap the final result at 2× top_n for broad queries; standard top_n otherwise.
+    final_limit = (top_n * 2) if is_broad_query else top_n
+    # Per-document cap for broad queries: max 2 chunks/doc keeps the context
+    # diverse and prevents any single country from dominating.
+    max_per_doc = int(os.environ.get("LIBRARY_PANORAMA_MAX_PER_DOC", "2")) if is_broad_query else None
+
     # ── 2. Accessible document IDs — query on documents table only ─────────
     # .values_list().distinct() on Document (small table) is fast.
     # Hard cap at 2000 docs to keep the IN clause sane; real libraries will
@@ -187,7 +202,7 @@ def retrieve_from_library(
                 embedding__isnull=False,
             )
             .annotate(distance=CosineDistance("embedding", query_embedding))
-            .order_by("distance")[:top_n]
+            .order_by("distance")[:pool_top_n]
         )
 
     # ── 4. Lexical search: trigram similarity, same scope ──────────────────
@@ -197,7 +212,7 @@ def retrieve_from_library(
     )
     lex_chunks: list[SmartChunk] = []
     try:
-        lex_chunks = lexical_search(base_qs, query_text, top_n=top_n)
+        lex_chunks = lexical_search(base_qs, query_text, top_n=pool_top_n)
     except Exception as exc:
         logger.warning("Library lexical search failed: %s", exc)
 
@@ -212,13 +227,21 @@ def retrieve_from_library(
         diagnostics["elapsed_seconds"] = round(time.perf_counter() - started, 4)
         return RetrievalResult(analysis=analysis, diagnostics=diagnostics)
 
-    fused = rrf_fuse(ranked_lists, top_n=top_n)
+    fused = rrf_fuse(ranked_lists, top_n=pool_top_n)
+
+    # ── 5b. Per-document cap for PANORAMA/COMPARATIVE diversity ───────────
+    # Applied after RRF so ranking order is preserved; cap just prevents any
+    # single document from consuming more than max_per_doc slots.
+    if max_per_doc is not None:
+        fused = cap_per_document(fused, max_per_doc=max_per_doc, total_limit=final_limit)
 
     # ── 6. Relevance threshold ─────────────────────────────────────────────
     final_chunks: list[SmartChunk] = [
         c for c in fused
         if _chunk_similarity(c) is None or _chunk_similarity(c) >= RAG_MIN_SIMILARITY
     ]
+    if not is_broad_query:
+        final_chunks = final_chunks[:top_n]
 
     # ── 7. Context block ───────────────────────────────────────────────────
     context_block = _build_context_block(final_chunks, with_citations=True)

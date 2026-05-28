@@ -92,8 +92,14 @@ def process_document_chunks(self, doc_id: int) -> str:
             logger.warning("No chunks produced for document %s.", doc_id)
 
         with transaction.atomic():
+            # Delete any previously-created chunks before inserting the fresh batch.
+            # Makes the task idempotent: safe if SQS redelivers the message or the
+            # task is manually retried. The unique_together DB constraint is the
+            # last-resort guard; this delete is the application-level guard.
+            SmartChunk.objects.filter(document_id=doc_id).delete()
+
             if chunks:
-                SmartChunk.objects.bulk_create(chunks, ignore_conflicts=True, batch_size=1000)
+                SmartChunk.objects.bulk_create(chunks, batch_size=1000)
 
             (Document.objects
                 .filter(pk=doc_id)

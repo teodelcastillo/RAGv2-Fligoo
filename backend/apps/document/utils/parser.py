@@ -5,11 +5,12 @@ import re
 
 def clean_text_spacing(text: str) -> str:
     # Collapse single newlines to spaces, but PRESERVE them when the following
-    # line starts with a list marker (-, *, •, or digit + . / )).
-    # This keeps bullet/numbered lists intact after extraction.
+    # line starts with a list marker (-, *, •, or digit + . / )) or a page
+    # marker (<<<PAGE:N>>>) so structural information survives extraction.
     _LIST_START = r'[ \t]*(?:[-*•]|\d+[.)]) '
+    _PAGE_MARKER = r'<<<PAGE:\d+>>>'
     text = re.sub(
-        rf'(?<!\n)\n(?!\n)(?!{_LIST_START})',
+        rf'(?<!\n)\n(?!\n)(?!{_LIST_START})(?!{_PAGE_MARKER})',
         ' ',
         text,
     )
@@ -30,19 +31,32 @@ def _read_txt(path: str, encoding: str = "utf-8") -> str:
         return f.read()
 
 
+_PAGE_MARKER_PREFIX = "<<<PAGE:"
+_PAGE_MARKER_SUFFIX = ">>>"
+
+
+def _make_page_marker(page_num: int) -> str:
+    return f"{_PAGE_MARKER_PREFIX}{page_num}{_PAGE_MARKER_SUFFIX}"
+
+
 def _read_pdf_pymupdf(path: str, top_pct: float = HEADER_FOOTER_PCT, bottom_pct: float = HEADER_FOOTER_PCT) -> str:
-    """Extract text blocks from a PDF using PyMuPDF, removing headers/footers by position."""
+    """Extract text blocks from a PDF using PyMuPDF, removing headers/footers by position.
+
+    Each page's content is prefixed with a <<<PAGE:N>>> marker so the chunker can
+    track which source page each chunk came from.
+    """
     import fitz  # PyMuPDF
 
     doc = fitz.open(path)
     try:
-        blocks_out = []
-        for page in doc:
+        pages_out = []
+        for page_num, page in enumerate(doc, start=1):
             height = page.rect.height
             top_y = height * top_pct
             bottom_y = height * (1 - bottom_pct)
 
             # Each block: (x0, y0, x1, y1, text, block_no, block_type, ...)
+            blocks_out = []
             for x0, y0, x1, y1, text, *_ in page.get_text("blocks"):
                 if y1 < top_y or y0 > bottom_y:
                     continue
@@ -50,7 +64,12 @@ def _read_pdf_pymupdf(path: str, top_pct: float = HEADER_FOOTER_PCT, bottom_pct:
                 if text:
                     blocks_out.append(text)
 
-        return "\n\n".join(blocks_out).strip()
+            if blocks_out:
+                pages_out.append(
+                    _make_page_marker(page_num) + "\n\n" + "\n\n".join(blocks_out)
+                )
+
+        return "\n\n".join(pages_out).strip()
     finally:
         doc.close()
 
@@ -65,14 +84,30 @@ def _read_pdf_pypdf2(path: str) -> str:
 
 
 def _read_docx(path: str) -> str:
+    """Extract text from a DOCX file including tables.
+
+    Detects explicit page breaks (w:br type="page") to emit <<<PAGE:N>>> markers
+    so the chunker can tag each chunk with its source page number.
+    """
     import docx  # python-docx
+    from docx.oxml.ns import qn
 
     doc = docx.Document(path)
-
     parts: list[str] = []
+    current_page = 1
+
+    # Start with a page marker for page 1
+    parts.append(_make_page_marker(current_page))
 
     # --- Body paragraphs ---
     for p in doc.paragraphs:
+        # Detect explicit page breaks inside paragraph runs
+        for run in p.runs:
+            for br in run._r.findall(qn("w:br")):
+                if br.get(qn("w:type")) == "page":
+                    current_page += 1
+                    parts.append(_make_page_marker(current_page))
+
         if p.text.strip():
             parts.append(p.text.strip())
 

@@ -111,14 +111,20 @@ def _extract_keywords(text: str, max_terms: int = 10) -> List[str]:
 # Semantic paragraph splitter
 # ---------------------------------------------------------------------------
 
+_PAGE_MARKER_RE = re.compile(r"^<<<PAGE:(\d+)>>>$")
+
 
 def _semantic_paragraphs(text: str) -> List[dict]:
     """
-    Walk ``text`` paragraph by paragraph, tracking section headings.
+    Walk ``text`` paragraph by paragraph, tracking section headings and page numbers.
 
-    Returns a list of ``{"text": ..., "title": ..., "tokens": int}``.
+    Returns a list of ``{"text": ..., "title": ..., "tokens": int, "page": int|None}``.
     Merges adjacent short paragraphs (< MIN_TOKENS) into the same chunk.
-    Splits long paragraphs (> MAX_TOKENS) with a sliding token window.
+    Splits long paragraphs (> MAX_TOKENS) with a sentence-aware fallback.
+
+    ``<<<PAGE:N>>>`` markers emitted by the parser are consumed here and used to
+    tag each segment with its source page number. They are never included in
+    stored chunk content.
     """
     raw_paras = re.split(r"\n{2,}", (text or "").strip())
     raw_paras = [p.strip() for p in raw_paras if p.strip()]
@@ -127,6 +133,7 @@ def _semantic_paragraphs(text: str) -> List[dict]:
     current_title = ""
     current_parts: List[str] = []
     current_tokens: int = 0
+    current_page: int | None = None
 
     def _flush(parts: List[str], title: str) -> None:
         if not parts:
@@ -134,7 +141,7 @@ def _semantic_paragraphs(text: str) -> List[dict]:
         merged = "\n\n".join(parts)
         toks = token_count(merged)
         if toks >= MIN_TOKENS:
-            segments.append({"text": merged, "title": title, "tokens": toks})
+            segments.append({"text": merged, "title": title, "tokens": toks, "page": current_page})
 
     def _slide_long(para: str, title: str) -> None:
         """
@@ -159,7 +166,7 @@ def _semantic_paragraphs(text: str) -> List[dict]:
             i = 0
             while i < len(tokens):
                 window = tokens[i: i + MAX_TOKENS]
-                segments.append({"text": decode_text(window), "title": title, "tokens": len(window)})
+                segments.append({"text": decode_text(window), "title": title, "tokens": len(window), "page": current_page})
                 i += MAX_TOKENS - OVERLAP_TOKENS
             return
 
@@ -173,20 +180,20 @@ def _semantic_paragraphs(text: str) -> List[dict]:
                 # Flush accumulated sentences first
                 if current_sentences:
                     merged = " ".join(current_sentences)
-                    segments.append({"text": merged, "title": title, "tokens": token_count(merged)})
+                    segments.append({"text": merged, "title": title, "tokens": token_count(merged), "page": current_page})
                     current_sentences, current_toks = [], 0
                 # Single sentence too long → token-window for this sentence only
                 toks = encode_text(sentence)
                 i = 0
                 while i < len(toks):
                     window = toks[i: i + MAX_TOKENS]
-                    segments.append({"text": decode_text(window), "title": title, "tokens": len(window)})
+                    segments.append({"text": decode_text(window), "title": title, "tokens": len(window), "page": current_page})
                     i += MAX_TOKENS - OVERLAP_TOKENS
                 continue
 
             if current_toks + s_toks > MAX_TOKENS and current_sentences:
                 merged = " ".join(current_sentences)
-                segments.append({"text": merged, "title": title, "tokens": token_count(merged)})
+                segments.append({"text": merged, "title": title, "tokens": token_count(merged), "page": current_page})
                 current_sentences, current_toks = [], 0
 
             current_sentences.append(sentence)
@@ -194,9 +201,15 @@ def _semantic_paragraphs(text: str) -> List[dict]:
 
         if current_sentences:
             merged = " ".join(current_sentences)
-            segments.append({"text": merged, "title": title, "tokens": token_count(merged)})
+            segments.append({"text": merged, "title": title, "tokens": token_count(merged), "page": current_page})
 
     for para in raw_paras:
+        # ── Page marker (<<<PAGE:N>>>) — update current page, never store ──────
+        page_match = _PAGE_MARKER_RE.match(para)
+        if page_match:
+            current_page = int(page_match.group(1))
+            continue
+
         if _is_heading(para):
             # Flush current accumulation before starting a new section
             _flush(current_parts, current_title)
@@ -339,6 +352,7 @@ def chunk_text_and_embed(
                 keywords=keywords,
                 token_count=token_count(chunk_content),
                 embedding=embed_text(embed_input),
+                page_number=seg.get("page"),
             )
         )
         idx += 1

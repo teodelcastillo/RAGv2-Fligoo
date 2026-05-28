@@ -197,7 +197,15 @@ class SmartChunk(models.Model):
         default="",
     )
     embedding = VectorField(dimensions=1536, blank=True, null=True)
+    page_number = models.IntegerField(
+        null=True,
+        blank=True,
+        help_text="Página del documento de origen (1-based). Null para docs sin información de página.",
+    )
     created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        unique_together = [("document", "chunk_index")]
 
 
 

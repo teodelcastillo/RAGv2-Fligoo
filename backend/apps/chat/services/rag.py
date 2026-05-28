@@ -596,34 +596,85 @@ _RETRIEVAL_DOMAIN_HINTS = (
 # ---------------------------------------------------------------------------
 # Geographic scope filtering (PANORAMA / COMPARATIVE queries)
 # ---------------------------------------------------------------------------
-# Maps a scope key to a regex that detects it in the normalized query text.
-# More specific scopes are listed first so the first match wins.
+# Scopes are ordered from most-specific to least-specific.
+# _extract_geo_scope() returns the FIRST matching scope, so sub-regional
+# patterns (mercosur, andina) must appear before their parent (sudamerica),
+# and continental groupings before latam.
+#
+# Pattern rules:
+# - Use \b word boundaries to avoid partial matches.
+# - Include Spanish, English and common abbreviation variants.
+# - Avoid ambiguous bare words: "pacific" can mean "Acuerdo del Pacífico"
+#   (a trade bloc), so oceania requires "islas del Pacífico" or "Oceanía".
 _GEO_SCOPE_PATTERNS: dict[str, str] = {
+    # ── Sub-regional LATAM (most specific — checked before sudamerica/latam) ─
+    "mercosur": (
+        r"\b(mercosur|pa[ií]ses? del mercosur|bloque del mercosur)\b"
+    ),
+    "andina": (
+        r"\b(comunidad andina|regi[oó]n andina|pa[ií]ses? andinos?|andean "
+        r"community|andean countries)\b"
+    ),
+    # ── Broad LATAM sub-regions ───────────────────────────────────────────────
     "sudamerica": (
         r"\b(sudamérica|sudamerica|sudamericanos?|am[eé]rica del sur|south america"
-        r"|pa[ií]ses? sudamericanos?|cono sur|región andina|regi[oó]n andina)\b"
+        r"|pa[ií]ses? sudamericanos?|cono sur)\b"
     ),
     "centroamerica": (
         r"\b(centroam[eé]rica|am[eé]rica central|central america"
         r"|pa[ií]ses? centroamericanos?)\b"
     ),
     "caribe": (
-        r"\b(carib[eé]|caribbean|pa[ií]ses? caribeños?)\b"
+        r"\b(carib[eé]|caribbean|pa[ií]ses? caribeños?|islas? caribeñas?)\b"
+    ),
+    "norteamerica": (
+        r"\b(am[eé]rica del norte|norteam[eé]rica|north america"
+        r"|pa[ií]ses? norteamericanos?)\b"
     ),
     "latam": (
         r"\b(am[eé]rica latina|latinoam[eé]rica|latam|latin america"
         r"|pa[ií]ses? latinoamericanos?|iberoam[eé]rica|iberoamerica)\b"
     ),
+    # ── Rest of world ─────────────────────────────────────────────────────────
+    "europa": (
+        r"\b(europa|europe|europeos?|european|uni[oó]n europea|european union"
+        r"|pa[ií]ses? europeos?)\b"
+    ),
+    "oriente_medio": (
+        r"\b(oriente medio|middle east|pa[ií]ses? [aá]rabes?|regi[oó]n [aá]rabe"
+        r"|golfo p[eé]rsico|persian gulf)\b"
+    ),
+    "africa": (
+        r"\b([aá]frica|africa|africanos?|african|pa[ií]ses? africanos?"
+        r"|sub[- ]?sahariano?s?)\b"
+    ),
+    "asia": (
+        r"\b(asia(?!\s*pac[ií]fico)|asi[aá]tico|asian|pa[ií]ses? asi[aá]ticos?"
+        r"|sureste asi[aá]tico|southeast asia)\b"
+    ),
+    "oceania": (
+        r"\b(ocean[ií]a|oceania|islas? del pac[ií]fico|pacific islands?"
+        r"|pa[ií]ses? del pac[ií]fico|small island developing)\b"
+    ),
 }
 
-# Country / region name substrings to match against Document.region and Document.name.
-# Used as case-insensitive containment filters (icontains).
+# Country / region name substrings matched against Document.region and Document.name
+# using case-insensitive containment (icontains).  Each list covers the canonical
+# country names that belong to that scope so a document tagged "Argentina" is
+# found when the query scope is "sudamerica", "mercosur", or "latam".
 _GEO_COUNTRY_LISTS: dict[str, list[str]] = {
+    "mercosur": [
+        "argentina", "brasil", "brazil", "uruguay", "paraguay", "bolivia",
+        "venezuela", "mercosur",
+    ],
+    "andina": [
+        "bolivia", "colombia", "ecuador", "perú", "peru",
+        "comunidad andina",
+    ],
     "sudamerica": [
         "argentina", "bolivia", "brasil", "brazil", "chile", "colombia",
         "ecuador", "guyana", "paraguay", "perú", "peru", "surinam", "suriname",
         "uruguay", "venezuela",
-        # region strings that might appear in the region field
         "sudamérica", "sudamerica", "sur américa", "sur america",
         "south america", "américa del sur", "america del sur",
     ],
@@ -634,15 +685,75 @@ _GEO_COUNTRY_LISTS: dict[str, list[str]] = {
     ],
     "caribe": [
         "cuba", "república dominicana", "dominicana", "haití", "haiti",
-        "jamaica", "trinidad", "barbados", "bahamas", "carib",
+        "jamaica", "trinidad", "barbados", "bahamas", "antigua", "dominica",
+        "granada", "grenada", "san vicente", "saint vincent",
+        "caribe", "caribbean",
+    ],
+    "norteamerica": [
+        "méxico", "mexico", "estados unidos", "united states", "canadá", "canada",
+        "norteamérica", "norteamerica", "north america",
     ],
     "latam": [
         "argentina", "bolivia", "brasil", "brazil", "chile", "colombia",
         "costa rica", "cuba", "ecuador", "el salvador", "guatemala", "honduras",
         "méxico", "mexico", "nicaragua", "panamá", "panama", "paraguay",
         "perú", "peru", "dominicana", "surinam", "suriname", "uruguay",
-        "venezuela",
+        "venezuela", "belice", "belize", "haití", "haiti",
         "latinoam", "latam", "américa latina", "america latina",
+    ],
+    "europa": [
+        "alemania", "germany", "austria", "bélgica", "belgica", "belgium",
+        "bulgaria", "chipre", "cyprus", "croacia", "croatia", "dinamarca", "denmark",
+        "eslovenia", "slovenia", "eslovaquia", "slovakia", "españa", "spain",
+        "estonia", "finlandia", "finland", "francia", "france",
+        "grecia", "greece", "hungría", "hungary", "irlanda", "ireland",
+        "italia", "italy", "letonia", "latvia", "lituania", "lithuania",
+        "luxemburgo", "luxembourg", "malta", "países bajos", "netherlands",
+        "holanda", "holland", "polonia", "poland", "portugal",
+        "república checa", "czech", "rumanía", "romania", "suecia", "sweden",
+        "noruega", "norway", "suiza", "switzerland", "reino unido", "united kingdom",
+        "islandia", "iceland", "albania", "serbia", "montenegro", "moldova",
+        "ucrania", "ukraine", "georgia", "armenia", "azerbaiyán", "azerbaijan",
+        "europa", "europe",
+    ],
+    "oriente_medio": [
+        "arabia saudita", "saudi", "emiratos", "qatar", "kuwait",
+        "baréin", "bahrain", "omán", "oman", "irak", "iraq", "irán", "iran",
+        "siria", "syria", "líbano", "lebanon", "jordania", "jordan",
+        "israel", "palestina", "palestine", "yemen", "turquía", "turkey",
+        "oriente medio", "middle east",
+    ],
+    "africa": [
+        "nigeria", "kenia", "kenya", "etiopía", "etiopia", "ethiopia",
+        "sudáfrica", "south africa", "marruecos", "morocco", "egipto", "egypt",
+        "ghana", "tanzania", "uganda", "ruanda", "rwanda", "mozambique",
+        "angola", "zambia", "zimbabue", "zimbabwe", "malí", "mali",
+        "senegal", "camerún", "cameroon", "costa de marfil", "ivory coast",
+        "madagascar", "malawi", "namibia", "botswana", "mauritania",
+        "gambia", "guinea", "benin", "togo", "eritrea", "somalia",
+        "sudán", "sudan", "libia", "libya", "argelia", "algeria",
+        "túnez", "tunisia", "chad", "níger", "niger", "burkina faso",
+        "liberia", "sierra leona",
+        "africa", "áfrica",
+    ],
+    "asia": [
+        "china", "india", "indonesia", "japón", "japan", "vietnam",
+        "tailandia", "thailand", "malasia", "malaysia", "filipinas", "philippines",
+        "corea del sur", "south korea", "corea del norte", "north korea",
+        "bangladesh", "pakistán", "pakistan", "nepal", "sri lanka",
+        "myanmar", "camboya", "cambodia", "laos", "mongolia",
+        "kirguistán", "kyrgyzstan", "uzbekistán", "uzbekistan",
+        "tayikistán", "tajikistan", "turkmenistán", "turkmenistan",
+        "kazajistán", "kazakhstan", "timor", "singapur", "singapore",
+        "brunéi", "brunei", "bután", "bhutan", "maldivas", "maldives",
+        "asia",
+    ],
+    "oceania": [
+        "australia", "nueva zelanda", "new zealand", "fiyi", "fiji", "tuvalu",
+        "vanuatu", "samoa", "kiribati", "micronesia", "tonga",
+        "islas salomón", "solomon islands", "nauru", "marshall",
+        "palaos", "palau", "papúa", "papua",
+        "oceanía", "oceania",
     ],
 }
 

@@ -13,6 +13,7 @@ from apps.document.utils.client_openia import (
     generate_document_content_summary,
 )
 from apps.document.utils.parser import parse_file
+from apps.document.utils.region_detector import detect_country_region
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +68,17 @@ def process_document_chunks(self, doc_id: int) -> str:
                 chunking_status=ChunkingStatus.ERROR,
             )
             return "empty"
+
+        # ── Auto-detect region (only when not already set by the user) ──────
+        # Pure regex scan of the doc name + first characters of extracted text;
+        # no LLM call, negligible CPU cost.
+        if not (doc.region or "").strip():
+            detected_region = detect_country_region(doc.name or "", text)
+            if detected_region:
+                Document.objects.filter(pk=doc_id).update(region=detected_region)
+                logger.info(
+                    "Document %s: auto-detected region=%r", doc_id, detected_region
+                )
 
         content_summary = ""
         if _document_auto_summary_enabled() and text.strip():

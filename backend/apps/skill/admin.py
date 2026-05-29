@@ -5,6 +5,7 @@ from apps.skill.models import Skill, SkillExecution, SkillStep
 
 class SkillStepInline(admin.TabularInline):
     model = SkillStep
+    fk_name = "skill"
     extra = 0
     fields = ("position", "title", "instructions")
 

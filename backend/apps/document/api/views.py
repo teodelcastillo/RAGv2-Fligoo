@@ -556,7 +556,15 @@ class DocumentViewSet(
     permission_classes = [permissions.IsAuthenticated, DocumentAccessPermission]
     lookup_field = 'slug'
     lookup_url_kwarg = 'slug'
-    
+
+    def get_permissions(self):
+        # chat_session only reads the document; the action itself checks can_view().
+        # Excluding DocumentAccessPermission avoids the superuser-only gate that
+        # fires for non-SAFE methods on public documents.
+        if getattr(self, 'action', None) == 'chat_session':
+            return [permissions.IsAuthenticated()]
+        return super().get_permissions()
+
     def get_serializer_class(self):
         """Use different serializers for different operations"""
         if self.action == 'retrieve':

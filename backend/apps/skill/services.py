@@ -23,6 +23,7 @@ from apps.skill.models import (
     RetrievalStrategy,
     SkillExecution,
     SkillStep,
+    SkillStepType,
     SkillType,
 )
 from apps.skill.table_schema import schema_has_columns
@@ -611,6 +612,144 @@ def _rebuild_previous_outputs(step_results: list[dict]) -> List[str]:
     return previous_outputs
 
 
+def _resolve_step_documents(
+    step: SkillStep,
+    documents: QuerySet[Document],
+) -> QuerySet[Document]:
+    """
+    Narrow the execution's document scope to a single step's ``document_slugs``.
+
+    When the step declares an explicit document subset, only those documents
+    (intersected with the execution context) are visible to that step. An empty
+    list means "use all context documents" — the original behaviour.
+    """
+    slugs = [s for s in (step.document_slugs or []) if isinstance(s, str) and s.strip()]
+    if not slugs:
+        return documents
+    scoped = documents.filter(slug__in=slugs)
+    # Defensive: if the step references docs not in the context (e.g. removed
+    # after the workflow was authored), fall back to the full context so the
+    # step still produces something rather than running on an empty corpus.
+    return scoped if scoped.exists() else documents
+
+
+def _run_skill_ref_step(
+    *,
+    execution: SkillExecution,
+    step: SkillStep,
+    step_documents: QuerySet[Document],
+    previous_outputs: List[str],
+) -> tuple[dict, dict, list]:
+    """
+    Execute a workflow step that delegates to an existing QUICK skill.
+
+    Mirrors the quick-skill retrieval + prompt pipeline using the *linked*
+    skill's configuration, scoped to this step's documents. The output is
+    folded into the workflow as a regular text step entry.
+
+    Returns ``(step_entry, usage, chunks)``.
+    """
+    from apps.skill.tools import SkillToolContext
+
+    linked = step.linked_skill
+    if linked is None:
+        # Should not happen (serializer enforces it) but stay defensive.
+        return (
+            {
+                "step_id": step.id,
+                "title": step.title,
+                "output_mode": ExecutionOutputMode.TEXT,
+                "content": "_(Skill referenciada no disponible.)_",
+            },
+            {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+            [],
+        )
+
+    # Build retrieval query from the linked skill's config (+ run extras).
+    extra = execution.extra_instructions or ""
+    if linked.retrieval_query_template:
+        retrieval_query = linked.retrieval_query_template.replace(
+            "{{extra_instructions}}", extra
+        ).strip()
+    else:
+        retrieval_query = f"{linked.name}. {linked.description}. {extra}".strip()
+
+    effective_strategy = (
+        RetrievalStrategy.HYBRID_PER_DOCUMENT
+        if linked.comparative_mode_enabled
+        else linked.retrieval_strategy
+    )
+
+    try:
+        v_chunks = fetch_relevant_chunks(
+            user=execution.owner,
+            query_text=retrieval_query,
+            allowed_documents=step_documents,
+            top_n=DEFAULT_CHUNKS,
+            retrieval_strategy=effective_strategy,
+            k_per_doc=linked.k_per_doc,
+            total_limit=linked.total_limit,
+            max_chunks_per_doc=linked.max_per_doc_after_rerank,
+        )
+    except Exception as exc:
+        logger.warning("skill_ref step %s retrieval failed: %s", step.id, exc)
+        v_chunks = []
+
+    doc_ids = list(step_documents.values_list("id", flat=True))
+    base_qs = SmartChunk.objects.filter(document_id__in=doc_ids).exclude(
+        embedding__isnull=True
+    )
+    try:
+        lex_chunks = lexical_search(base_qs, retrieval_query, top_n=linked.total_limit)
+    except Exception as exc:
+        logger.warning("skill_ref step %s lexical failed: %s", step.id, exc)
+        lex_chunks = []
+
+    ranked = [lst for lst in [v_chunks, lex_chunks] if lst]
+    fused = rrf_fuse(ranked, top_n=linked.total_limit) if ranked else v_chunks
+    final_chunks = [
+        c for c in fused
+        if _chunk_similarity(c) is None or _chunk_similarity(c) >= RAG_MIN_SIMILARITY
+    ]
+    context_block = build_context_block(final_chunks)
+
+    prompt = _render_prompt_variables(
+        linked.prompt_template,
+        context_block=context_block,
+        extra_instructions=extra,
+        input_values=execution.input_values,
+    )
+    if linked.comparative_mode_enabled:
+        prompt = (
+            f"{prompt}\n\n{_comparative_instruction_block(linked.strict_missing_evidence)}"
+        ).strip()
+
+    # Give the linked skill awareness of the workflow context so its output
+    # connects with the sections written before it.
+    if previous_outputs:
+        prior = "\n".join(previous_outputs[-2:])
+        prompt = f"{prompt}\n\n## Secciones previas del documento:\n{prior}"
+
+    messages = [
+        {"role": "system", "content": linked.system_prompt},
+        {"role": "user", "content": prompt},
+    ]
+    tool_ctx = SkillToolContext(user=execution.owner, allowed_documents=step_documents)
+    content, usage = _call_model(messages, skill=linked, tool_ctx=tool_ctx)
+    chunks = final_chunks + tool_ctx.additional_chunks
+
+    step_entry = {
+        "step_id": step.id,
+        "title": step.title,
+        "output_mode": ExecutionOutputMode.TEXT,
+        "content": content,
+        "via_skill": linked.slug,
+        "via_skill_name": linked.name,
+    }
+    previous_outputs.append(f"### {step.title}\n{content}")
+    return step_entry, usage, chunks
+
+
 def _run_copilot(execution: SkillExecution, documents: QuerySet[Document]) -> None:
     from apps.skill.tools import SkillToolContext
 
@@ -669,131 +808,160 @@ def _run_copilot(execution: SkillExecution, documents: QuerySet[Document]) -> No
         if step_index < resume_from_position:
             continue
 
-        step_output_mode, step_table_schema = _resolve_step_output_config(step)
-        is_table_step = step_output_mode == ExecutionOutputMode.TABLE
+        # Resolve the document scope for THIS step. When the step declares an
+        # explicit subset, it only sees those documents; otherwise the full
+        # execution context is used.
+        step_documents = _resolve_step_documents(step, documents)
 
-        # Enrich the query with a brief hint from the most recent step output
-        # so the embedding pulls toward the thread of the current section.
-        prev_hint = (previous_outputs[-1] if previous_outputs else "")[:300]
-        query_text = f"{step.title}. {step.instructions}. {prev_hint}".strip()
-
-        # Vector retrieval
-        try:
-            v_chunks = fetch_relevant_chunks(
-                user=execution.owner,
-                query_text=query_text,
-                allowed_documents=documents,
-                top_n=DEFAULT_CHUNKS,
-                retrieval_strategy=effective_retrieval_strategy,
-                k_per_doc=skill.k_per_doc,
-                total_limit=skill.total_limit,
-                max_chunks_per_doc=skill.max_per_doc_after_rerank,
+        # ── Skill-reference step: delegate to an existing quick skill ──
+        if step.step_type == SkillStepType.SKILL_REF and step.linked_skill_id:
+            step_entry, usage, ref_chunks = _run_skill_ref_step(
+                execution=execution,
+                step=step,
+                step_documents=step_documents,
+                previous_outputs=previous_outputs,
             )
-        except Exception as exc:
-            logger.warning("Step %s vector retrieval failed: %s", step.id, exc)
-            v_chunks = []
-
-        # Lexical retrieval
-        try:
-            step_lex_chunks = lexical_search(step_base_qs, query_text, top_n=DEFAULT_CHUNKS)
-        except Exception as exc:
-            logger.warning("Step %s lexical search failed: %s", step.id, exc)
-            step_lex_chunks = []
-
-        # RRF fusion + threshold filter
-        step_ranked = [lst for lst in [v_chunks, step_lex_chunks] if lst]
-        fused = rrf_fuse(step_ranked, top_n=skill.total_limit) if step_ranked else v_chunks
-        fused = [
-            c for c in fused
-            if _chunk_similarity(c) is None or _chunk_similarity(c) >= RAG_MIN_SIMILARITY
-        ]
-
-        # Prioritise chunks not yet seen in earlier steps; fall back to repeats if needed.
-        new_chunks = [c for c in fused if c.id not in seen_chunk_ids]
-        repeat_chunks = [c for c in fused if c.id in seen_chunk_ids]
-        chunks = (new_chunks + repeat_chunks)[:DEFAULT_CHUNKS]
-
-        seen_chunk_ids.update(c.id for c in chunks)
-        all_step_chunks.extend(chunks)
-        context_block = build_context_block(chunks)
-
-        # Compose the user prompt for this step
-        lines = [
-            f"## Task: {step.title}",
-            "",
-            f"Instructions: {step.instructions}",
-        ]
-        # Inject typed parameter values as a context note
-        if execution.input_values:
-            param_lines = [
-                f"- {k}: {v}"
-                for k, v in execution.input_values.items()
-                if v not in (None, "")
-            ]
-            if param_lines:
-                lines.append("\n## Run parameters:\n" + "\n".join(param_lines))
-
-        if execution.extra_instructions:
-            lines.append(f"\nAdditional instructions from user: {execution.extra_instructions}")
-        if previous_outputs:
-            lines.append("\n## Previous sections already written:")
-            for prev in previous_outputs:
-                lines.append(prev)
-        # Shared research scratchpad (Sprint 2A)
-        if shared_scratchpad:
-            lines.append(f"\n## Research scratchpad (broad corpus overview):\n{shared_scratchpad}")
-        if context_block:
-            lines.append(f"\n## Document context (targeted for this section):\n{context_block}")
+            all_step_chunks.extend(ref_chunks)
+            seen_chunk_ids.update(c.id for c in ref_chunks if hasattr(c, "id"))
         else:
-            lines.append("\n(No document content found for this section — note this in your output.)")
-        if skill.comparative_mode_enabled and not is_table_step:
-            lines.append(
-                f"\n## Comparative constraints:\n{_comparative_instruction_block(skill.strict_missing_evidence)}"
-            )
+            # ── Instruction step: author content from the step's own prompt ──
+            step_output_mode, step_table_schema = _resolve_step_output_config(step)
+            is_table_step = step_output_mode == ExecutionOutputMode.TABLE
 
-        prompt = "\n".join(lines)
-        system_prompt = (
-            build_table_system_prompt(skill.system_prompt, step_table_schema)
-            if is_table_step
-            else skill.system_prompt
-        )
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": prompt},
-        ]
+            # Per-step lexical base queryset (scoped to the step's documents).
+            step_doc_ids_local = list(step_documents.values_list("id", flat=True))
+            step_base_qs_local = SmartChunk.objects.filter(
+                document_id__in=step_doc_ids_local
+            ).exclude(embedding__isnull=True)
 
-        tool_ctx = SkillToolContext(user=execution.owner, allowed_documents=documents)
-        content, usage = _call_model(messages, skill=skill, tool_ctx=tool_ctx)
-        all_step_chunks.extend(tool_ctx.additional_chunks)
+            # Enrich the query with a brief hint from the most recent step output
+            # so the embedding pulls toward the thread of the current section.
+            prev_hint = (previous_outputs[-1] if previous_outputs else "")[:300]
+            query_text = f"{step.title}. {step.instructions}. {prev_hint}".strip()
 
-        step_entry: dict = {
-            "step_id": step.id,
-            "title": step.title,
-            "output_mode": step_output_mode,
-        }
-        if is_table_step:
+            # Vector retrieval
             try:
-                table = coerce_table_output(
-                    output_text=content, table_schema=step_table_schema
+                v_chunks = fetch_relevant_chunks(
+                    user=execution.owner,
+                    query_text=query_text,
+                    allowed_documents=step_documents,
+                    top_n=DEFAULT_CHUNKS,
+                    retrieval_strategy=effective_retrieval_strategy,
+                    k_per_doc=skill.k_per_doc,
+                    total_limit=skill.total_limit,
+                    max_chunks_per_doc=skill.max_per_doc_after_rerank,
                 )
-            except ValueError as exc:
-                logger.warning(
-                    "Step %s of execution %s produced invalid table JSON: %s",
-                    step.id,
-                    execution.id,
-                    exc,
+            except Exception as exc:
+                logger.warning("Step %s vector retrieval failed: %s", step.id, exc)
+                v_chunks = []
+
+            # Lexical retrieval
+            try:
+                step_lex_chunks = lexical_search(step_base_qs_local, query_text, top_n=DEFAULT_CHUNKS)
+            except Exception as exc:
+                logger.warning("Step %s lexical search failed: %s", step.id, exc)
+                step_lex_chunks = []
+
+            # RRF fusion + threshold filter
+            step_ranked = [lst for lst in [v_chunks, step_lex_chunks] if lst]
+            fused = rrf_fuse(step_ranked, top_n=skill.total_limit) if step_ranked else v_chunks
+            fused = [
+                c for c in fused
+                if _chunk_similarity(c) is None or _chunk_similarity(c) >= RAG_MIN_SIMILARITY
+            ]
+
+            # Prioritise chunks not yet seen in earlier steps; fall back to repeats if needed.
+            new_chunks = [c for c in fused if c.id not in seen_chunk_ids]
+            repeat_chunks = [c for c in fused if c.id in seen_chunk_ids]
+            chunks = (new_chunks + repeat_chunks)[:DEFAULT_CHUNKS]
+
+            seen_chunk_ids.update(c.id for c in chunks)
+            all_step_chunks.extend(chunks)
+            context_block = build_context_block(chunks)
+
+            # Compose the user prompt for this step
+            lines = [
+                f"## Task: {step.title}",
+                "",
+                f"Instructions: {step.instructions}",
+            ]
+            # Note the document scope so the model is aware it's narrowed.
+            if step.document_slugs:
+                lines.append(
+                    "\n## Document scope: este paso analiza solo un subconjunto "
+                    "de los documentos del contexto."
                 )
-                step_entry["output_mode"] = ExecutionOutputMode.TEXT
-                step_entry["content"] = content
-                step_entry["table_error"] = str(exc)
-                previous_outputs.append(f"### {step.title}\n{content}")
+            # Inject typed parameter values as a context note
+            if execution.input_values:
+                param_lines = [
+                    f"- {k}: {v}"
+                    for k, v in execution.input_values.items()
+                    if v not in (None, "")
+                ]
+                if param_lines:
+                    lines.append("\n## Run parameters:\n" + "\n".join(param_lines))
+
+            if execution.extra_instructions:
+                lines.append(f"\nAdditional instructions from user: {execution.extra_instructions}")
+            if previous_outputs:
+                lines.append("\n## Previous sections already written:")
+                for prev in previous_outputs:
+                    lines.append(prev)
+            # Shared research scratchpad (Sprint 2A)
+            if shared_scratchpad:
+                lines.append(f"\n## Research scratchpad (broad corpus overview):\n{shared_scratchpad}")
+            if context_block:
+                lines.append(f"\n## Document context (targeted for this section):\n{context_block}")
             else:
-                step_entry["table"] = table
-                step_entry["content"] = ""
-                previous_outputs.append(_table_summary_for_history(step.title, table))
-        else:
-            step_entry["content"] = content
-            previous_outputs.append(f"### {step.title}\n{content}")
+                lines.append("\n(No document content found for this section — note this in your output.)")
+            if skill.comparative_mode_enabled and not is_table_step:
+                lines.append(
+                    f"\n## Comparative constraints:\n{_comparative_instruction_block(skill.strict_missing_evidence)}"
+                )
+
+            prompt = "\n".join(lines)
+            system_prompt = (
+                build_table_system_prompt(skill.system_prompt, step_table_schema)
+                if is_table_step
+                else skill.system_prompt
+            )
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": prompt},
+            ]
+
+            tool_ctx = SkillToolContext(user=execution.owner, allowed_documents=step_documents)
+            content, usage = _call_model(messages, skill=skill, tool_ctx=tool_ctx)
+            all_step_chunks.extend(tool_ctx.additional_chunks)
+
+            step_entry: dict = {
+                "step_id": step.id,
+                "title": step.title,
+                "output_mode": step_output_mode,
+            }
+            if is_table_step:
+                try:
+                    table = coerce_table_output(
+                        output_text=content, table_schema=step_table_schema
+                    )
+                except ValueError as exc:
+                    logger.warning(
+                        "Step %s of execution %s produced invalid table JSON: %s",
+                        step.id,
+                        execution.id,
+                        exc,
+                    )
+                    step_entry["output_mode"] = ExecutionOutputMode.TEXT
+                    step_entry["content"] = content
+                    step_entry["table_error"] = str(exc)
+                    previous_outputs.append(f"### {step.title}\n{content}")
+                else:
+                    step_entry["table"] = table
+                    step_entry["content"] = ""
+                    previous_outputs.append(_table_summary_for_history(step.title, table))
+            else:
+                step_entry["content"] = content
+                previous_outputs.append(f"### {step.title}\n{content}")
 
         step_results.append(step_entry)
 

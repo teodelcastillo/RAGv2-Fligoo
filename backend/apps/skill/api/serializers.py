@@ -15,6 +15,7 @@ from apps.skill.models import (
     SkillParameter,
     SkillParameterType,
     SkillStep,
+    SkillStepType,
     SkillType,
 )
 from apps.skill.table_schema import (
@@ -114,6 +115,13 @@ class SkillParameterWriteSerializer(serializers.Serializer):
 # ---------------------------------------------------------------------------
 
 class SkillStepSerializer(serializers.ModelSerializer):
+    linked_skill_slug = serializers.SlugField(
+        source="linked_skill.slug", read_only=True, allow_null=True,
+    )
+    linked_skill_name = serializers.CharField(
+        source="linked_skill.name", read_only=True, allow_null=True,
+    )
+
     class Meta:
         model = SkillStep
         fields = (
@@ -121,6 +129,10 @@ class SkillStepSerializer(serializers.ModelSerializer):
             "title",
             "instructions",
             "position",
+            "step_type",
+            "linked_skill_slug",
+            "linked_skill_name",
+            "document_slugs",
             "output_mode",
             "table_schema",
             "approval_required",
@@ -159,8 +171,25 @@ class SkillSerializer(serializers.ModelSerializer):
 
 class SkillStepWriteSerializer(serializers.Serializer):
     title = serializers.CharField(max_length=255)
-    instructions = serializers.CharField()
+    # Instructions are required for instruction steps but optional for
+    # skill_ref steps (the linked skill carries its own prompt). Validation
+    # below enforces the per-type rule.
+    instructions = serializers.CharField(required=False, allow_blank=True, default="")
     position = serializers.IntegerField(min_value=1)
+    step_type = serializers.ChoiceField(
+        choices=SkillStepType.choices,
+        required=False,
+        default=SkillStepType.INSTRUCTION,
+    )
+    linked_skill_slug = serializers.SlugField(
+        required=False, allow_null=True, allow_blank=True, default=None,
+    )
+    document_slugs = serializers.ListField(
+        child=serializers.SlugField(),
+        required=False,
+        allow_empty=True,
+        default=list,
+    )
     output_mode = serializers.ChoiceField(
         choices=ExecutionOutputMode.choices,
         required=False,
@@ -170,9 +199,32 @@ class SkillStepWriteSerializer(serializers.Serializer):
     approval_required = serializers.BooleanField(required=False, default=False)
 
     def validate(self, attrs):
+        step_type = attrs.get("step_type", SkillStepType.INSTRUCTION)
+        linked_slug = attrs.get("linked_skill_slug")
+        instructions = (attrs.get("instructions") or "").strip()
+
+        if step_type == SkillStepType.SKILL_REF:
+            # A skill_ref step must reference an existing QUICK skill the user
+            # can access. Validation of the actual object happens in the parent
+            # serializer's create/update where we have the request user.
+            if not linked_slug:
+                raise serializers.ValidationError(
+                    {"linked_skill_slug": "Skill-reference steps require a linked skill."}
+                )
+            # skill_ref steps inherit the linked skill's output shape; force text.
+            attrs["output_mode"] = ExecutionOutputMode.TEXT
+            attrs["table_schema"] = {}
+            return attrs
+
+        # instruction step
+        attrs["linked_skill_slug"] = None
+        if not instructions:
+            raise serializers.ValidationError(
+                {"instructions": "Instruction steps require instructions."}
+            )
+
         output_mode = attrs.get("output_mode", ExecutionOutputMode.TEXT)
         table_schema = attrs.get("table_schema") or {}
-
         if output_mode == ExecutionOutputMode.TABLE:
             attrs["table_schema"] = _normalize_table_schema_or_raise(
                 table_schema, field="table_schema"
@@ -344,12 +396,52 @@ class SkillWriteSerializer(serializers.ModelSerializer):
 
         return attrs
 
+    def _resolve_linked_skill(self, slug: str):
+        """
+        Resolve a linked_skill_slug to a QUICK Skill the user can reference.
+        Only quick skills can be used as workflow sub-steps; copilot skills
+        would recurse. Templates and the user's own skills are allowed.
+        """
+        if not slug:
+            return None
+        request = self.context.get("request")
+        user = request.user if request else None
+        from django.db.models import Q
+
+        qs = Skill.objects.filter(slug=slug, skill_type=SkillType.QUICK)
+        if user is not None and not user.is_staff:
+            qs = qs.filter(Q(owner__isnull=True) | Q(owner=user))
+        skill = qs.first()
+        if skill is None:
+            raise serializers.ValidationError(
+                {
+                    "steps": (
+                        f"La skill referenciada '{slug}' no existe, no es una quick "
+                        "skill, o no tenés acceso a ella."
+                    )
+                }
+            )
+        return skill
+
+    def _materialize_step(self, skill: Skill, step_data: dict) -> SkillStep:
+        data = dict(step_data)
+        linked_slug = data.pop("linked_skill_slug", None)
+        step_type = data.get("step_type", SkillStepType.INSTRUCTION)
+        linked_skill = (
+            self._resolve_linked_skill(linked_slug)
+            if step_type == SkillStepType.SKILL_REF
+            else None
+        )
+        return SkillStep.objects.create(
+            skill=skill, linked_skill=linked_skill, **data
+        )
+
     def create(self, validated_data):
         steps_data = validated_data.pop("steps", [])
         parameters_data = validated_data.pop("parameters", [])
         skill = Skill.objects.create(**validated_data)
         for step in steps_data:
-            SkillStep.objects.create(skill=skill, **step)
+            self._materialize_step(skill, step)
         for param in parameters_data:
             SkillParameter.objects.create(skill=skill, **param)
         return skill
@@ -363,7 +455,7 @@ class SkillWriteSerializer(serializers.ModelSerializer):
         if steps_data is not None:
             instance.steps.all().delete()
             for step in steps_data:
-                SkillStep.objects.create(skill=instance, **step)
+                self._materialize_step(instance, step)
         if parameters_data is not None:
             instance.parameters.all().delete()
             for param in parameters_data:

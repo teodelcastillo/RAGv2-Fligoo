@@ -282,13 +282,54 @@ class SkillParameter(models.Model):
 # Copilot steps  (ordered sections for COPILOT skills)
 # ---------------------------------------------------------------------------
 
+class SkillStepType(models.TextChoices):
+    INSTRUCTION = "instruction", _("Instruction")
+    SKILL_REF = "skill_ref", _("Run existing skill")
+
+
 class SkillStep(models.Model):
     skill = models.ForeignKey(Skill, related_name="steps", on_delete=models.CASCADE)
     title = models.CharField(max_length=255)
     instructions = models.TextField(
-        help_text="What the AI should produce for this section of the output."
+        blank=True,
+        help_text="What the AI should produce for this section of the output.",
     )
     position = models.PositiveIntegerField(default=1)
+
+    # Step type — an "instruction" step authors content from the step's own
+    # prompt; a "skill_ref" step runs an existing QUICK skill inline and folds
+    # its output into the workflow as this step's content.
+    step_type = models.CharField(
+        max_length=20,
+        choices=SkillStepType.choices,
+        default=SkillStepType.INSTRUCTION,
+        help_text=(
+            "'instruction' authors from the step's own prompt. 'skill_ref' runs "
+            "an existing quick skill inline and uses its output as this step."
+        ),
+    )
+    linked_skill = models.ForeignKey(
+        Skill,
+        related_name="referenced_in_steps",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        help_text=(
+            "Only for step_type='skill_ref': the quick skill to execute for this "
+            "step. Its prompt/retrieval config is used against this step's documents."
+        ),
+    )
+    # Per-step document scope. When non-empty, this step only sees these
+    # documents (intersected with the execution context). Empty = all context
+    # documents, preserving the original behaviour.
+    document_slugs = models.JSONField(
+        default=list,
+        blank=True,
+        help_text=(
+            "Optional subset of document slugs this step runs against. "
+            "Empty = all documents in the execution context."
+        ),
+    )
     output_mode = models.CharField(
         max_length=20,
         choices=ExecutionOutputMode.choices,

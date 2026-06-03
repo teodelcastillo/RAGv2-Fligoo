@@ -121,6 +121,102 @@ class StepApprovalGateTestCase(TestCase):
         self.assertIsNone(execution.current_step_position)
 
 
+class ReviewEachStepTestCase(TestCase):
+    """
+    Block-by-block confirmation: review_each_step=True forces a pause after
+    every step except the last, regardless of each step's approval_required.
+    This is the fix for "approving one step confirms all the rest".
+    """
+
+    def setUp(self):
+        self.user = User.objects.create_user(
+            email="review@example.com", password="secret123", username="review"
+        )
+        self.project = Project.objects.create(owner=self.user, name="ReviewProject")
+        self.doc = Document.objects.create(owner=self.user, name="Doc", slug="doc-review")
+        ProjectDocument.objects.create(project=self.project, document=self.doc, added_by=self.user)
+
+        self.skill = Skill.objects.create(
+            owner=self.user,
+            name="Review Copilot",
+            skill_type=SkillType.COPILOT,
+            allowed_contexts=["project"],
+            system_prompt="ESG.",
+        )
+        # Three steps, none marked approval_required.
+        for pos, title in [(1, "Scope"), (2, "Risks"), (3, "Summary")]:
+            SkillStep.objects.create(
+                skill=self.skill, title=title, instructions=f"{title}.", position=pos,
+            )
+
+    def _make_execution(self):
+        return SkillExecution.objects.create(
+            skill=self.skill,
+            owner=self.user,
+            project=self.project,
+            metadata={"review_each_step": True},
+        )
+
+    @patch("apps.skill.services.generate_chat_completion")
+    @patch("apps.skill.services.fetch_relevant_chunks")
+    def test_pauses_after_first_step_without_approval_flag(self, mock_fetch, mock_completion):
+        mock_fetch.return_value = [_make_chunk(self.doc)]
+        mock_completion.return_value = ("Scope output.", {"total_tokens": 5})
+
+        execution = self._make_execution()
+        execute_skill(execution)
+        execution.refresh_from_db()
+
+        self.assertEqual(execution.status, ExecutionStatus.AWAITING_APPROVAL)
+        self.assertEqual(execution.current_step_position, 1)
+        self.assertEqual(len(execution.output_structured.get("steps", [])), 1)
+        self.assertEqual(mock_completion.call_count, 1)
+
+    @patch("apps.skill.services.generate_chat_completion")
+    @patch("apps.skill.services.fetch_relevant_chunks")
+    def test_pauses_at_each_step_then_completes_on_last(self, mock_fetch, mock_completion):
+        mock_fetch.return_value = [_make_chunk(self.doc)]
+        mock_completion.return_value = ("step output", {"total_tokens": 5})
+
+        execution = self._make_execution()
+
+        # Step 1 → pause
+        execute_skill(execution)
+        execution.refresh_from_db()
+        self.assertEqual(execution.status, ExecutionStatus.AWAITING_APPROVAL)
+        self.assertEqual(execution.current_step_position, 1)
+
+        # Approve → step 2 → pause again (not the last step)
+        approve_step(execution)
+        execute_skill(execution)
+        execution.refresh_from_db()
+        self.assertEqual(execution.status, ExecutionStatus.AWAITING_APPROVAL)
+        self.assertEqual(execution.current_step_position, 2)
+
+        # Approve → step 3 (last) → completes without pausing
+        approve_step(execution)
+        execute_skill(execution)
+        execution.refresh_from_db()
+        self.assertEqual(execution.status, ExecutionStatus.COMPLETED)
+        self.assertIsNone(execution.current_step_position)
+        self.assertEqual(len(execution.output_structured["steps"]), 3)
+
+    @patch("apps.skill.services.generate_chat_completion")
+    @patch("apps.skill.services.fetch_relevant_chunks")
+    def test_per_step_and_global_sources_populated(self, mock_fetch, mock_completion):
+        mock_fetch.return_value = [_make_chunk(self.doc, index=2)]
+        mock_completion.return_value = ("output", {"total_tokens": 5})
+
+        execution = self._make_execution()
+        execute_skill(execution)
+        execution.refresh_from_db()
+
+        step = execution.output_structured["steps"][0]
+        self.assertTrue(step.get("sources"))
+        self.assertEqual(step["sources"][0]["document_slug"], "doc-review")
+        self.assertEqual(step["sources"][0]["chunk_index"], 2)
+
+
 class ApproveStepServiceTestCase(TestCase):
     """approve_step() state transitions and override behaviour."""
 

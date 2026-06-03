@@ -40,10 +40,33 @@ class StepAwaitingApproval(Exception):
 
 DEFAULT_CHUNKS = int(os.environ.get("SKILL_CONTEXT_CHUNKS", "6"))
 
+# Per-step context budget for Copilot workflows. Larger than DEFAULT_CHUNKS so
+# each section is authored from substantially more evidence, producing more
+# complete, professional deliverables. Kept separate from DEFAULT_CHUNKS so
+# synchronous quick skills are not slowed down.
+COPILOT_STEP_CHUNKS = int(os.environ.get("SKILL_COPILOT_STEP_CHUNKS", "12"))
+
 # Maximum chunks assembled from the research phase scratchpad.
 RESEARCH_SCRATCHPAD_MAX_CHUNKS = int(os.environ.get("SKILL_RESEARCH_SCRATCHPAD_CHUNKS", "20"))
 # Maximum distinct research queries derived automatically from step instructions.
 RESEARCH_AUTO_QUERIES_MAX = int(os.environ.get("SKILL_RESEARCH_AUTO_QUERIES", "8"))
+
+# Quality bar injected into each authored (non-table) Copilot step so the
+# output reads like a professional consulting deliverable rather than a terse
+# answer. Traceability is surfaced via clickable source chips in the UI, so we
+# ask the model to name source documents in prose instead of emitting literal
+# [#N] markers (which the result view renders as plain text).
+COPILOT_DELIVERABLE_STANDARD = (
+    "## Estándar de entregable profesional\n"
+    "- Redactá esta sección como parte de un entregable de consultoría en sostenibilidad/ESG: "
+    "completa, precisa y bien estructurada.\n"
+    "- Desarrollá el análisis en profundidad; usá subtítulos, párrafos y listas o tablas markdown "
+    "cuando aporten claridad. Evitá respuestas superficiales o de una sola línea.\n"
+    "- Fundamentá cada afirmación en la evidencia documental provista; cuando uses un dato puntual, "
+    "mencioná el documento del que proviene por su nombre. No inventes datos ni rellenes con "
+    "generalidades no sustentadas.\n"
+    "- Si la evidencia es insuficiente para algún punto, declaralo explícitamente en lugar de inferir."
+)
 
 
 # ---------------------------------------------------------------------------
@@ -160,6 +183,32 @@ def _comparative_instruction_block(strict_missing_evidence: bool) -> str:
             "3) If evidence is missing, state that limitation clearly and avoid unsupported inference."
         )
     return "\n".join(lines).strip()
+
+
+def _chunks_to_sources(chunks) -> list[dict]:
+    """
+    Serialize a list of chunks into the citation-friendly ``sources`` shape the
+    frontend uses to render clickable source chips (slug + chunk index resolve
+    the vector/chunk viewer modal). De-duplicated by (slug, chunk_index).
+    """
+    sources: list[dict] = []
+    seen: set[tuple[str, int]] = set()
+    for c in chunks:
+        document = getattr(c, "document", None)
+        if document is None:
+            continue
+        key = (document.slug, c.chunk_index)
+        if key in seen:
+            continue
+        seen.add(key)
+        sources.append(
+            {
+                "document_slug": document.slug,
+                "document_name": document.name,
+                "chunk_index": c.chunk_index,
+            }
+        )
+    return sources
 
 
 def _collect_source_stats(chunks, total_docs: int) -> dict:
@@ -758,6 +807,7 @@ def _run_skill_ref_step(
         "content": content,
         "via_skill": linked.slug,
         "via_skill_name": linked.name,
+        "sources": _chunks_to_sources(chunks),
     }
     previous_outputs.append(f"### {step.title}\n{content}")
     return step_entry, usage, chunks
@@ -770,6 +820,12 @@ def _run_copilot(execution: SkillExecution, documents: QuerySet[Document]) -> No
     steps: List[SkillStep] = list(skill.steps.all())
     if not steps:
         raise ValueError("This Copilot skill has no steps defined.")
+
+    # Block-by-block confirmation: when the run requested it, pause after every
+    # step for human review (the last step is exempt — there is nothing left to
+    # gate, and the final draft is reviewed/edited in the completed view).
+    review_each_step = bool((execution.metadata or {}).get("review_each_step"))
+    last_step_position = steps[-1].position
 
     # Resume: load any steps already completed in a previous run segment.
     already_done: list[dict] = list(
@@ -861,7 +917,7 @@ def _run_copilot(execution: SkillExecution, documents: QuerySet[Document]) -> No
                     user=execution.owner,
                     query_text=query_text,
                     allowed_documents=step_documents,
-                    top_n=DEFAULT_CHUNKS,
+                    top_n=COPILOT_STEP_CHUNKS,
                     retrieval_strategy=effective_retrieval_strategy,
                     k_per_doc=skill.k_per_doc,
                     total_limit=skill.total_limit,
@@ -873,7 +929,7 @@ def _run_copilot(execution: SkillExecution, documents: QuerySet[Document]) -> No
 
             # Lexical retrieval
             try:
-                step_lex_chunks = lexical_search(step_base_qs_local, query_text, top_n=DEFAULT_CHUNKS)
+                step_lex_chunks = lexical_search(step_base_qs_local, query_text, top_n=COPILOT_STEP_CHUNKS)
             except Exception as exc:
                 logger.warning("Step %s lexical search failed: %s", step.id, exc)
                 step_lex_chunks = []
@@ -889,7 +945,7 @@ def _run_copilot(execution: SkillExecution, documents: QuerySet[Document]) -> No
             # Prioritise chunks not yet seen in earlier steps; fall back to repeats if needed.
             new_chunks = [c for c in fused if c.id not in seen_chunk_ids]
             repeat_chunks = [c for c in fused if c.id in seen_chunk_ids]
-            chunks = (new_chunks + repeat_chunks)[:DEFAULT_CHUNKS]
+            chunks = (new_chunks + repeat_chunks)[:COPILOT_STEP_CHUNKS]
 
             seen_chunk_ids.update(c.id for c in chunks)
             all_step_chunks.extend(chunks)
@@ -934,6 +990,10 @@ def _run_copilot(execution: SkillExecution, documents: QuerySet[Document]) -> No
                 lines.append(
                     f"\n## Comparative constraints:\n{_comparative_instruction_block(skill.strict_missing_evidence)}"
                 )
+            # Professional deliverable standard — only for authored prose steps.
+            # Table steps must return strict JSON, so we never relax their format.
+            if not is_table_step:
+                lines.append(f"\n{COPILOT_DELIVERABLE_STANDARD}")
 
             prompt = "\n".join(lines)
             system_prompt = (
@@ -954,6 +1014,7 @@ def _run_copilot(execution: SkillExecution, documents: QuerySet[Document]) -> No
                 "step_id": step.id,
                 "title": step.title,
                 "output_mode": step_output_mode,
+                "sources": _chunks_to_sources(chunks + tool_ctx.additional_chunks),
             }
             if is_table_step:
                 try:
@@ -989,8 +1050,13 @@ def _run_copilot(execution: SkillExecution, documents: QuerySet[Document]) -> No
         execution.steps_completed = len(step_results)
         execution.save(update_fields=["output_structured", "steps_completed"])
 
-        # Sprint 4: if this step requires human approval, pause the run here.
-        if step.approval_required:
+        # Sprint 4 + block-by-block confirmation: pause for human review when the
+        # step opts in via approval_required, OR when the run requested
+        # review_each_step (every step except the last — see top of function).
+        needs_review = step.approval_required or (
+            review_each_step and step.position != last_step_position
+        )
+        if needs_review:
             execution.current_step_position = step.position
             execution.save(update_fields=["current_step_position"])
             raise StepAwaitingApproval(
@@ -1000,13 +1066,27 @@ def _run_copilot(execution: SkillExecution, documents: QuerySet[Document]) -> No
     # Final metadata written once all steps complete.
     execution.output_structured = {"steps": step_results}
     source_stats = _collect_source_stats(all_step_chunks, total_docs=documents.count())
+    # Aggregate global sources from each step's persisted sources rather than
+    # all_step_chunks: on resumed (HITL) runs all_step_chunks only holds chunks
+    # from the last segment, but step_results carries every step's sources.
+    global_sources: list[dict] = []
+    seen_sources: set[tuple] = set()
+    for entry in step_results:
+        for src in entry.get("sources", []):
+            key = (src.get("document_slug"), src.get("chunk_index"))
+            if key in seen_sources:
+                continue
+            seen_sources.add(key)
+            global_sources.append(src)
     execution.metadata = {
         "usage": total_usage,
         "research_phase_enabled": skill.research_phase_enabled,
         "comparative_mode_enabled": skill.comparative_mode_enabled,
         "strict_missing_evidence": skill.strict_missing_evidence,
         "retrieval_strategy_used": effective_retrieval_strategy,
+        "review_each_step": review_each_step,
         **source_stats,
+        "sources": global_sources,
         "table_columns": execution.metadata.get("table_columns", []),
         "table_schema": execution.metadata.get("table_schema", {}),
     }

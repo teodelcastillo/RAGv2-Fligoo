@@ -577,6 +577,11 @@ class RunSkillSerializer(serializers.Serializer):
         required=False,
         default=dict,
     )
+    # Copilot only. When true, the workflow pauses after every step for human
+    # review (block-by-block confirmation), regardless of each step's
+    # definition-time approval_required flag. Per-step approval_required is
+    # still honored on top of this.
+    review_each_step = serializers.BooleanField(required=False, default=False)
     table_schema = serializers.DictField(required=False)
     table_columns = serializers.ListField(
         child=serializers.CharField(max_length=120),

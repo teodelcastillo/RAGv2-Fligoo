@@ -160,6 +160,7 @@ class SkillViewSet(viewsets.ModelViewSet):
                 ],
                 "table_schema": effective_table_schema,
                 "document_slugs_filter": requested_doc_slugs,
+                "step_document_overrides": data.get("step_document_overrides") or {},
             },
             status=ExecutionStatus.PENDING,
         )

@@ -569,6 +569,14 @@ class RunSkillSerializer(serializers.Serializer):
         choices=ExecutionOutputMode.choices,
         required=False,
     )
+    # Per-step document overrides for copilot workflows.  Keys are step
+    # positions (as strings), values are lists of document slugs that
+    # override the step's definition-time document_slugs for this run.
+    step_document_overrides = serializers.DictField(
+        child=serializers.ListField(child=serializers.SlugField()),
+        required=False,
+        default=dict,
+    )
     table_schema = serializers.DictField(required=False)
     table_columns = serializers.ListField(
         child=serializers.CharField(max_length=120),

@@ -615,19 +615,32 @@ def _rebuild_previous_outputs(step_results: list[dict]) -> List[str]:
 def _resolve_step_documents(
     step: SkillStep,
     documents: QuerySet[Document],
+    runtime_override_slugs: list[str] | None = None,
 ) -> QuerySet[Document]:
     """
-    Narrow the execution's document scope to a single step's ``document_slugs``.
+    Narrow the execution's document scope to a single step's documents.
 
-    When the step declares an explicit document subset, only those documents
-    (intersected with the execution context) are visible to that step. An empty
-    list means "use all context documents" — the original behaviour.
+    Resolution order (first non-empty wins):
+    1. **Runtime overrides** — per-step slugs the user chose when launching the
+       workflow (stored in ``execution.metadata["step_document_overrides"]``).
+    2. **Definition-time slugs** — ``step.document_slugs`` set in the skill
+       builder.
+    3. **Full context** — all documents from the execution's repository/project.
+
+    An empty list at any level means "not specified" and falls through to the
+    next level.
     """
-    slugs = [s for s in (step.document_slugs or []) if isinstance(s, str) and s.strip()]
-    if not slugs:
+    # Pick the first non-empty slug list.
+    effective_slugs: list[str] = []
+    if runtime_override_slugs:
+        effective_slugs = [s for s in runtime_override_slugs if isinstance(s, str) and s.strip()]
+    if not effective_slugs:
+        effective_slugs = [s for s in (step.document_slugs or []) if isinstance(s, str) and s.strip()]
+    if not effective_slugs:
         return documents
-    scoped = documents.filter(slug__in=slugs)
-    # Defensive: if the step references docs not in the context (e.g. removed
+
+    scoped = documents.filter(slug__in=effective_slugs)
+    # Defensive: if the slugs reference docs not in the context (e.g. removed
     # after the workflow was authored), fall back to the full context so the
     # step still produces something rather than running on an empty corpus.
     return scoped if scoped.exists() else documents
@@ -808,10 +821,13 @@ def _run_copilot(execution: SkillExecution, documents: QuerySet[Document]) -> No
         if step_index < resume_from_position:
             continue
 
-        # Resolve the document scope for THIS step. When the step declares an
-        # explicit subset, it only sees those documents; otherwise the full
-        # execution context is used.
-        step_documents = _resolve_step_documents(step, documents)
+        # Resolve the document scope for THIS step.  Priority:
+        # 1. Runtime overrides from execution.metadata (user chose at launch)
+        # 2. Definition-time step.document_slugs (set in skill builder)
+        # 3. Full execution context
+        runtime_overrides = (execution.metadata or {}).get("step_document_overrides", {})
+        step_runtime_slugs = runtime_overrides.get(str(step.position), [])
+        step_documents = _resolve_step_documents(step, documents, step_runtime_slugs)
 
         # ── Skill-reference step: delegate to an existing quick skill ──
         if step.step_type == SkillStepType.SKILL_REF and step.linked_skill_id:

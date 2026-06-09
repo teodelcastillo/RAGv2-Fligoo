@@ -31,8 +31,17 @@ from apps.document.api.serializers import (
     CategorySerializer,
     CategoryWriteSerializer,
 )
-from apps.chat.models import ChatSession
+from apps.chat.models import ChatSession, DEFAULT_CHAT_MODEL
 from apps.chat.api.serializers import ChatSessionSerializer
+
+DOCUMENT_CHAT_SYSTEM_PROMPT = (
+    "Eres Ecofilia, un asistente especializado en análisis documental. "
+    'El usuario está analizando el documento "{doc_name}". '
+    "Todas las preguntas se refieren exclusivamente a este documento. "
+    "Responde siempre basándote en el contenido recuperado del documento. "
+    "Si la información no aparece en el contexto proporcionado, indícalo claramente "
+    "en lugar de inventar o hacer referencia a otros documentos."
+)
 
 
 def _can_manage_public_documents(user) -> bool:
@@ -715,13 +724,29 @@ class DocumentViewSet(
             )
             return Response(serializer.data, status=status.HTTP_200_OK)
         
-        # Crear nueva sesión
+        # Crear nueva sesión (body opcional: title, system_prompt, model, etc.)
+        data = request.data if isinstance(request.data, dict) else {}
+        doc_name = document.name or document.slug
+        title = (data.get("title") or "").strip() or f"Chat: {doc_name}"
+        system_prompt = (data.get("system_prompt") or "").strip() or (
+            DOCUMENT_CHAT_SYSTEM_PROMPT.format(doc_name=doc_name)
+        )
+        model = (data.get("model") or "").strip() or DEFAULT_CHAT_MODEL
+        language = (data.get("language") or "").strip() or "es"
+        try:
+            temperature = float(data.get("temperature", 0.3))
+        except (TypeError, ValueError):
+            temperature = 0.3
+
         session = ChatSession.objects.create(
             owner=request.user,
             primary_document=document,
-            title=f"Chat: {document.name}",
+            title=title,
+            system_prompt=system_prompt,
+            model=model,
+            temperature=temperature,
+            language=language,
         )
-        # Asociar el documento a allowed_documents también
         session.allowed_documents.add(document)
 
         serializer = ChatSessionSerializer(

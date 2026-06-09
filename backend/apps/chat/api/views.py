@@ -54,6 +54,15 @@ _CONVERSATIONAL_FALLBACK_PROMPT = (
     "Si necesita información específica de documentos, sugiérele que seleccione "
     "documentos de la biblioteca o formule una pregunta más concreta."
 )
+_SINGLE_DOC_NO_CONTEXT_PROMPT = (
+    "Eres Ecofilia, un asistente especializado en análisis documental. "
+    'El usuario está analizando el documento "{doc_name}". '
+    "Todas las preguntas se refieren exclusivamente a este documento. "
+    "No pidas al usuario que cargue, suba ni seleccione documentos: ya está en una "
+    "sesión acotada a este archivo. "
+    "Si no hay contexto recuperado para la consulta, indícalo claramente y sugiere "
+    "reformular la pregunta de forma más concreta sobre el contenido del documento."
+)
 
 # ---------------------------------------------------------------------------
 # Query contextualization guard
@@ -353,7 +362,16 @@ def _compose_messages(
     # context-dependent default, substitute a conversational fallback so the
     # LLM doesn't respond with "No tengo información disponible."
     if not retrieval.context_block and _RAG_CONTEXT_REQUIRED_MARKER in system_text:
-        system_text = _CONVERSATIONAL_FALLBACK_PROMPT
+        doc_count = session.allowed_documents.count()
+        if doc_count == 1:
+            single_doc = session.allowed_documents.first()
+            doc_name = single_doc.name if single_doc else "el documento"
+            system_text = _SINGLE_DOC_NO_CONTEXT_PROMPT.format(doc_name=doc_name)
+        elif session.primary_document_id is not None:
+            doc_name = session.primary_document.name if session.primary_document else "el documento"
+            system_text = _SINGLE_DOC_NO_CONTEXT_PROMPT.format(doc_name=doc_name)
+        else:
+            system_text = _CONVERSATIONAL_FALLBACK_PROMPT
 
     base_messages: list[dict] = [
         {"role": str(MessageRole.SYSTEM), "content": system_text},

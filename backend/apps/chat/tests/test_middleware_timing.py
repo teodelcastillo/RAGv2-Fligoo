@@ -38,7 +38,7 @@ class RetrievalModeRoutingTests(TestCase):
             owner=self.user, name="Test Doc", slug="test-doc"
         )
 
-    def _retrieve(self, query_text, **env_overrides):
+    def _retrieve(self, query_text, *, doc_count: int = 1, **env_overrides):
         env = {
             "RAG_RETRIEVAL_GATE_ENABLED": "1",
             "RAG_LIGHT_MODE_ENABLED": "1",
@@ -49,6 +49,14 @@ class RetrievalModeRoutingTests(TestCase):
         }
         session = ChatSession.objects.create(owner=self.user, title="T")
         session.allowed_documents.add(self.doc)
+        if doc_count > 1:
+            for i in range(1, doc_count):
+                extra = Document.objects.create(
+                    owner=self.user,
+                    name=f"Extra Doc {i}",
+                    slug=f"extra-doc-{i}",
+                )
+                session.allowed_documents.add(extra)
         with patch.dict(os.environ, env, clear=False):
             with patch("apps.chat.services.rag.fetch_relevant_chunks", return_value=[]):
                 with patch("apps.chat.services.rag.lexical_search", return_value=[]):
@@ -58,17 +66,27 @@ class RetrievalModeRoutingTests(TestCase):
                         allowed_documents=session.allowed_documents.all(),
                     )
 
-    # --- Mode: none (greetings / trivial queries) ---
+    # --- Mode: none (greetings / trivial queries, multi-doc only) ---
 
-    def test_greeting_uses_none_mode(self):
-        result = self._retrieve("hola")
+    def test_greeting_uses_none_mode_for_multi_doc(self):
+        result = self._retrieve("hola", doc_count=2)
         self.assertEqual(result.diagnostics["retrieval_mode"], "none")
         self.assertEqual(result.diagnostics["retrieval_skipped_reason"], "simple_query")
         self.assertEqual(result.chunk_ids, [])
 
-    def test_short_trivial_without_domain_uses_none_mode(self):
-        result = self._retrieve("que tal")
+    def test_short_trivial_without_domain_uses_none_mode_for_multi_doc(self):
+        result = self._retrieve("que tal", doc_count=2)
         self.assertEqual(result.diagnostics["retrieval_mode"], "none")
+
+    def test_single_doc_short_summary_uses_light_not_none(self):
+        result = self._retrieve("Haz un resumen", doc_count=1)
+        self.assertEqual(result.diagnostics["retrieval_mode"], "light")
+        self.assertIsNone(result.diagnostics["retrieval_skipped_reason"])
+
+    def test_single_doc_greeting_uses_light_not_none(self):
+        result = self._retrieve("hola", doc_count=1)
+        self.assertEqual(result.diagnostics["retrieval_mode"], "light")
+        self.assertIsNone(result.diagnostics["retrieval_skipped_reason"])
 
     def test_short_domain_query_does_not_use_none_mode(self):
         # "emisiones" is in _RETRIEVAL_DOMAIN_HINTS → short query but has domain hint → retrieve

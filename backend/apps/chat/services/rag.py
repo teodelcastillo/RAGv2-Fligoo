@@ -154,7 +154,7 @@ def retrieve_from_library(
 
     # ── 1. Retrieval gate: skip expensive DB work for trivial queries ──────
     analysis = classify_query(query_text)  # pure-regex, no LLM call
-    retrieval_mode, skip_reason = _decide_retrieval_mode(query_text, analysis)
+    retrieval_mode, skip_reason = _decide_retrieval_mode(query_text, analysis, doc_count=0)
     diagnostics["retrieval_skipped_reason"] = skip_reason
     if retrieval_mode == "none":
         diagnostics["elapsed_seconds"] = round(time.perf_counter() - started, 4)
@@ -557,6 +557,32 @@ def _scope_qs_for_user(user, doc_ids: list) -> QuerySet[SmartChunk]:
     return qs
 
 
+def _single_doc_retrieval_fallback(
+    user,
+    doc_ids: list[int],
+    query_text: str,
+    *,
+    total_limit: int,
+) -> list[SmartChunk]:
+    """
+    When vector/lexical fusion yields nothing for a single-document session,
+    pull the best available chunks (including chunk 0 summary) without the
+    similarity threshold so short queries like "Resúmelo" still get context.
+    """
+    if len(doc_ids) != 1:
+        return []
+    base_qs = _scope_qs_for_user(user, doc_ids)
+    if not base_qs.exists():
+        return []
+    filled = _fill_missing_documents(
+        base_qs=base_qs,
+        query_text=query_text,
+        missing_doc_ids=doc_ids,
+        existing_chunks=[],
+    )
+    return filled[:total_limit]
+
+
 def _fill_missing_documents(
     *,
     base_qs: QuerySet[SmartChunk],
@@ -837,7 +863,12 @@ def _filter_docs_by_geo(doc_ids: list[int], geo_scope: str) -> list[int]:
     )
 
 
-def _decide_retrieval_mode(query_text: str, analysis: QueryAnalysis) -> tuple[str, str | None]:
+def _decide_retrieval_mode(
+    query_text: str,
+    analysis: QueryAnalysis,
+    *,
+    doc_count: int = 0,
+) -> tuple[str, str | None]:
     """
     Decide retrieval mode before expensive chunk search.
     Returns (mode, skip_reason) where mode is none|light|full.
@@ -849,6 +880,11 @@ def _decide_retrieval_mode(query_text: str, analysis: QueryAnalysis) -> tuple[st
     words = norm.split()
     if not norm:
         return "none", "empty_query"
+
+    # Single-document sessions: always retrieve (light) so short queries like
+    # "Resúmelo" still pull document context instead of skipping entirely.
+    if doc_count == 1:
+        return "light", None
 
     trivial = len(words) <= 3
     greeting_like = norm in {"hola", "hello", "hi", "buenas", "q mas hay", "qué más hay", "que mas hay"}
@@ -927,7 +963,9 @@ def retrieve_for_chat(
 
     analysis = classify_query_hybrid(query_text)
     analysis = apply_response_mode_override(analysis, response_mode)
-    retrieval_mode, skip_reason = _decide_retrieval_mode(query_text, analysis)
+    retrieval_mode, skip_reason = _decide_retrieval_mode(
+        query_text, analysis, doc_count=len(doc_ids)
+    )
     diagnostics["retrieval_mode"] = retrieval_mode
     diagnostics["retrieval_skipped_reason"] = skip_reason
 
@@ -1048,6 +1086,25 @@ def retrieve_for_chat(
         ranked_lists.append(lex_chunks)
 
     if not ranked_lists:
+        fallback_limit = total_limit or base_top_n
+        fallback_chunks = _single_doc_retrieval_fallback(
+            user,
+            doc_ids,
+            query_text,
+            total_limit=fallback_limit,
+        )
+        if fallback_chunks:
+            diagnostics["single_doc_fallback"] = True
+            diagnostics["final_chunks"] = len(fallback_chunks)
+            diagnostics["unique_documents"] = 1
+            diagnostics["retrieval_confidence"] = "low"
+            diagnostics["elapsed_seconds"] = round(time.perf_counter() - started, 4)
+            return RetrievalResult(
+                chunks=fallback_chunks,
+                context_block=_build_context_block(fallback_chunks, with_citations=True),
+                analysis=analysis,
+                diagnostics=diagnostics,
+            )
         diagnostics["elapsed_seconds"] = time.perf_counter() - started
         return RetrievalResult(analysis=analysis, diagnostics=diagnostics)
 
@@ -1135,6 +1192,18 @@ def retrieve_for_chat(
             else:
                 diagnostics["retrieval_confidence"] = "none"
         elif final_chunks:
+            diagnostics["retrieval_confidence"] = "low"
+
+    if not final_chunks and len(doc_ids) == 1:
+        fallback_chunks = _single_doc_retrieval_fallback(
+            user,
+            doc_ids,
+            query_text,
+            total_limit=safe_total,
+        )
+        if fallback_chunks:
+            final_chunks = fallback_chunks
+            diagnostics["single_doc_fallback"] = True
             diagnostics["retrieval_confidence"] = "low"
 
     context_block = _build_context_block(final_chunks, with_citations=True)

@@ -8,8 +8,10 @@ from rest_framework import status
 from rest_framework.test import APITestCase
 
 from apps.chat.api.views import (
+    _CONVERSATIONAL_FALLBACK_PROMPT,
     _chat_retrieval_params,
     _chunk_ids_from_citations,
+    _compose_messages,
     _extract_citation_payload,
 )
 from apps.chat.models import ChatSession
@@ -273,9 +275,13 @@ class ChatAPITestCase(APITestCase):
         self.assertIn("citation_integrity", metadata)
         self.assertEqual(metadata["citation_integrity"], "complete")
 
-    def test_retrieve_for_chat_uses_none_mode_for_simple_query(self):
+    def test_retrieve_for_chat_uses_none_mode_for_simple_query_multi_doc(self):
         session = ChatSession.objects.create(owner=self.user, title="Simple")
         session.allowed_documents.add(self.document)
+        second = Document.objects.create(
+            owner=self.user, name="Doc 2", slug="doc-2", is_public=False
+        )
+        session.allowed_documents.add(second)
         with patch.dict(os.environ, {"RAG_RETRIEVAL_GATE_ENABLED": "1"}, clear=False):
             result = retrieve_for_chat(
                 user=self.user,
@@ -285,6 +291,57 @@ class ChatAPITestCase(APITestCase):
         self.assertEqual(result.diagnostics.get("retrieval_mode"), "none")
         self.assertEqual(result.diagnostics.get("retrieval_skipped_reason"), "simple_query")
         self.assertEqual(result.chunk_ids, [])
+
+    def test_retrieve_for_chat_single_doc_does_not_skip_simple_query(self):
+        session = ChatSession.objects.create(owner=self.user, title="Single")
+        session.allowed_documents.add(self.document)
+        with patch.dict(os.environ, {"RAG_RETRIEVAL_GATE_ENABLED": "1"}, clear=False):
+            with patch("apps.chat.services.rag.fetch_relevant_chunks", return_value=[]):
+                with patch("apps.chat.services.rag.lexical_search", return_value=[]):
+                    result = retrieve_for_chat(
+                        user=self.user,
+                        query_text="Haz un resumen",
+                        allowed_documents=session.allowed_documents.all(),
+                    )
+        self.assertEqual(result.diagnostics.get("retrieval_mode"), "light")
+        self.assertIsNone(result.diagnostics.get("retrieval_skipped_reason"))
+
+    def test_compose_messages_single_doc_uses_document_fallback_not_library(self):
+        session = ChatSession.objects.create(
+            owner=self.user,
+            title="Doc chat",
+            system_prompt=(
+                "Eres un asistente especializado en aprovechar el contexto entregado. "
+                "Responde únicamente con la información disponible y menciona la fuente."
+            ),
+        )
+        session.allowed_documents.add(self.document)
+        retrieval = RetrievalResult()
+        messages = _compose_messages(session, "Resúmelo", retrieval)
+        system_content = messages[0]["content"]
+        self.assertIn(self.document.name, system_content)
+        self.assertNotIn("seleccione", system_content.lower())
+        self.assertNotEqual(system_content, _CONVERSATIONAL_FALLBACK_PROMPT)
+
+    def test_document_chat_session_post_persists_custom_system_prompt(self):
+        url = reverse("document-chat-session", kwargs={"slug": self.document.slug})
+        custom_prompt = "Prompt personalizado para análisis documental."
+        response = self.client.post(
+            url,
+            {
+                "title": "Mi chat",
+                "system_prompt": custom_prompt,
+                "model": "gpt-4o-mini",
+                "temperature": 0.2,
+                "language": "es",
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(response.data["system_prompt"], custom_prompt)
+        self.assertEqual(response.data["title"], "Mi chat")
+        self.assertEqual(response.data["document_slugs"], [self.document.slug])
+        self.assertEqual(response.data["primary_document_slug"], self.document.slug)
 
     def test_retrieve_for_chat_marks_timeout_when_budget_exceeded(self):
         session = ChatSession.objects.create(owner=self.user, title="Budget")

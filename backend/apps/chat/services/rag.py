@@ -37,6 +37,7 @@ from apps.chat.services.context_builder import (
 )
 from apps.chat.services.query_analysis import (
     COVERAGE_MODE_ALL,
+    COVERAGE_MODE_BALANCED,
     QUERY_TYPE_COMPARATIVE,
     QUERY_TYPE_NUMERIC,
     QUERY_TYPE_PANORAMA,
@@ -66,6 +67,24 @@ RAG_MIN_SIMILARITY = float(os.environ.get("RAG_MIN_SIMILARITY", "0.3"))
 RAG_ALL_DOCS_MIN_COVERAGE_RATIO = float(
     os.environ.get("RAG_ALL_DOCS_MIN_COVERAGE_RATIO", "1.0")
 )
+
+# --- Phase 1: recall-oriented retrieval ---------------------------------------
+# All default ON. Set the corresponding flag to 0 to reproduce the pre-Phase-1
+# behaviour for A/B measurement against the eval baseline.
+#
+# RAG_RECALL_MODE      : the similarity threshold stops *dropping* evidence and
+#                        is used only to label confidence; the budget-capped
+#                        ranked set is kept (the data, if retrieved, survives).
+# RAG_PER_DOC_FLOOR /  : adaptive budget — scale the context window with the
+# RAG_MAX_CONTEXT_CHUNKS number of in-scope documents for distributed/per-entity
+#                        tasks, bounded so huge corpora don't blow the context.
+# RAG_PARENT_EXPANSION/: small-to-big — widen each anchor chunk with its
+# RAG_PARENT_WINDOW      neighbours so the model reads a contiguous passage.
+RAG_RECALL_MODE = _env_bool("RAG_RECALL_MODE", "True")
+RAG_PER_DOC_FLOOR = int(os.environ.get("RAG_PER_DOC_FLOOR", "1"))
+RAG_MAX_CONTEXT_CHUNKS = int(os.environ.get("RAG_MAX_CONTEXT_CHUNKS", "24"))
+RAG_PARENT_EXPANSION = _env_bool("RAG_PARENT_EXPANSION", "True")
+RAG_PARENT_WINDOW = int(os.environ.get("RAG_PARENT_WINDOW", "1"))
 
 
 GENERAL_QUERY_PATTERNS = (
@@ -620,6 +639,75 @@ def _fill_missing_documents(
     return filled
 
 
+def _expand_to_parents(
+    chunks: list[SmartChunk],
+    user,
+    *,
+    window: int,
+    max_total: int,
+) -> list[SmartChunk]:
+    """Small-to-big expansion.
+
+    Widen each anchor chunk with its neighbours from the same document
+    (``chunk_index`` within ±``window``), reconstructing a contiguous passage so
+    the model reads surrounding context instead of an isolated fragment. Anchor
+    chunks are always retained; only neighbours are trimmed to honour
+    ``max_total``. Output is grouped by document (anchor order) and ordered by
+    ``chunk_index`` so the context block reads contiguously.
+    """
+    if window <= 0 or not chunks:
+        return list(chunks)
+
+    anchors_by_doc: dict[int, set[int]] = {}
+    doc_order: list[int] = []
+    for c in chunks:
+        if c.document_id not in anchors_by_doc:
+            anchors_by_doc[c.document_id] = set()
+            doc_order.append(c.document_id)
+        anchors_by_doc[c.document_id].add(c.chunk_index)
+
+    # Desired indices (anchors + neighbours) per document.
+    want: dict[int, set[int]] = {}
+    for doc_id, idxs in anchors_by_doc.items():
+        wanted: set[int] = set()
+        for i in idxs:
+            for j in range(i - window, i + window + 1):
+                if j >= 0:
+                    wanted.add(j)
+        want[doc_id] = wanted
+
+    by_key: dict[tuple[int, int], SmartChunk] = {
+        (c.document_id, c.chunk_index): c for c in chunks
+    }
+    base = _scope_qs_for_user(user, list(anchors_by_doc.keys()))
+    for doc_id, idxs in want.items():
+        missing = sorted(
+            i for i in idxs if (doc_id, i) not in by_key
+        )
+        if not missing:
+            continue
+        for neighbour in base.filter(document_id=doc_id, chunk_index__in=missing):
+            by_key[(neighbour.document_id, neighbour.chunk_index)] = neighbour
+
+    # Ordered output: (doc_id, chunk_index, is_anchor).
+    ordered: list[tuple[int, int, bool]] = []
+    for doc_id in doc_order:
+        for i in sorted(want[doc_id]):
+            if (doc_id, i) in by_key:
+                ordered.append((doc_id, i, i in anchors_by_doc[doc_id]))
+
+    # Trim neighbours (never anchors) to honour the budget.
+    if len(ordered) > max_total:
+        anchors = [t for t in ordered if t[2]]
+        neighbours = [t for t in ordered if not t[2]]
+        keep_neighbours = max(0, max_total - len(anchors))
+        keep = {(d, i) for (d, i, _) in anchors}
+        keep |= {(d, i) for (d, i, _) in neighbours[:keep_neighbours]}
+        ordered = [t for t in ordered if (t[0], t[1]) in keep]
+
+    return [by_key[(d, i)] for (d, i, _) in ordered]
+
+
 def _chunk_similarity(chunk: SmartChunk) -> float | None:
     """Best-effort normalized similarity in [0, 1] for relevance filtering."""
     distance = getattr(chunk, "distance", None)
@@ -1002,6 +1090,20 @@ def retrieve_for_chat(
         base_top_n = max(base_top_n, len(doc_ids))
         total_limit = max(total_limit or base_top_n, len(doc_ids))
         max_chunks_per_doc = 1
+    elif (
+        RAG_RECALL_MODE
+        and multi_doc
+        and analysis.coverage_mode == COVERAGE_MODE_BALANCED
+    ):
+        # Phase 1 — adaptive budget for distributed tasks (panorama / comparative
+        # / "X de cada documento"): guarantee room for ~PER_DOC_FLOOR chunks per
+        # in-scope document instead of a fixed cap, bounded by RAG_MAX_CONTEXT_CHUNKS.
+        adaptive_floor = min(
+            len(doc_ids) * max(1, RAG_PER_DOC_FLOOR), RAG_MAX_CONTEXT_CHUNKS
+        )
+        base_top_n = max(base_top_n, adaptive_floor)
+        total_limit = max(total_limit or base_top_n, adaptive_floor)
+        diagnostics["adaptive_budget"] = adaptive_floor
     if retrieval_mode == "light":
         base_top_n = max(2, min(base_top_n, 4))
         vector_multiplier = min(RAG_VECTOR_POOL_MULTIPLIER, 1.25)
@@ -1165,18 +1267,28 @@ def retrieve_for_chat(
             logger.warning("MMR selection failed, falling back to capped: %s", exc)
             final_chunks = capped
 
-    # --- Relevance threshold filtering ---
+    # --- Relevance threshold / confidence labeling ---
+    # Phase 1 (RAG_RECALL_MODE): the absolute similarity cutoff no longer *drops*
+    # evidence — dropping below a fixed cosine threshold is exactly what made
+    # real-but-low-similarity passages disappear ("el dato existía pero el RAG lo
+    # tiró"). We keep the budget-capped ranked set and use the threshold only to
+    # *label* confidence. Legacy hard-drop is available via RAG_RECALL_MODE=0.
     if final_chunks:
-        filtered_chunks: list[SmartChunk] = []
-        scored_similarities: list[float] = []
-        for chunk in final_chunks:
-            sim = _chunk_similarity(chunk)
-            if sim is not None:
-                scored_similarities.append(sim)
-            if sim is None or sim >= RAG_MIN_SIMILARITY:
-                filtered_chunks.append(chunk)
+        scored_similarities = [
+            s for s in (_chunk_similarity(c) for c in final_chunks) if s is not None
+        ]
 
-        final_chunks = filtered_chunks
+        if not RAG_RECALL_MODE:
+            final_chunks = [
+                c
+                for c in final_chunks
+                if _chunk_similarity(c) is None
+                or _chunk_similarity(c) >= RAG_MIN_SIMILARITY
+            ]
+        else:
+            diagnostics["below_threshold_kept"] = sum(
+                1 for s in scored_similarities if s < RAG_MIN_SIMILARITY
+            )
 
         if scored_similarities:
             max_similarity = max(scored_similarities)
@@ -1205,6 +1317,28 @@ def retrieve_for_chat(
             final_chunks = fallback_chunks
             diagnostics["single_doc_fallback"] = True
             diagnostics["retrieval_confidence"] = "low"
+
+    # --- Phase 1: small-to-big parent expansion ---
+    # Widen each surviving chunk with its neighbours (same document, adjacent
+    # chunk_index) so the model reads a contiguous passage instead of an
+    # isolated ~500-token fragment. Anchors are never dropped.
+    if RAG_PARENT_EXPANSION and final_chunks and not budget_exceeded():
+        try:
+            expanded = _expand_to_parents(
+                final_chunks,
+                user,
+                window=RAG_PARENT_WINDOW,
+                max_total=max(safe_total, RAG_MAX_CONTEXT_CHUNKS),
+            )
+            if expanded:
+                diagnostics["parent_expansion"] = {
+                    "anchors": len(final_chunks),
+                    "expanded": len(expanded),
+                    "window": RAG_PARENT_WINDOW,
+                }
+                final_chunks = expanded
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("Parent expansion failed: %s", exc)
 
     context_block = _build_context_block(final_chunks, with_citations=True)
 

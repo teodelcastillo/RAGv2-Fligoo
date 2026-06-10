@@ -92,6 +92,33 @@ Lista JSON. Cada objeto:
 `cases.example.json` es una **plantilla** con slugs ficticios — copialo a
 `cases.json` y completalo con tus documentos reales.
 
+## Medir Fase 1 (recall del retrieval) contra el baseline
+
+Los cambios de Fase 1 vienen **activados por default** y son reversibles por env
+var. Para un A/B limpio, corré el harness dos veces sobre el mismo dataset:
+
+```bash
+# Baseline (comportamiento pre-Fase-1): umbral duro, budget fijo, sin expansión
+RAG_RECALL_MODE=0 RAG_PARENT_EXPANSION=0 \
+  python manage.py rag_eval_quality --user-email TU@email --cases evals/cases.json \
+  --out evals/baseline.json
+
+# Fase 1 (default ON) y diff contra el baseline
+python manage.py rag_eval_quality --user-email TU@email --cases evals/cases.json \
+  --baseline evals/baseline.json
+```
+
+Esperá ver subir `retrieval_recall` y `answer_recall` (sobre todo en los dos
+cuellos de botella) sin que se desplome `faithfulness_rate`. Flags de Fase 1:
+
+| Env var | Default | Qué controla |
+|---|---|---|
+| `RAG_RECALL_MODE` | `1` | El umbral de similitud deja de *descartar* evidencia; solo etiqueta confianza |
+| `RAG_PER_DOC_FLOOR` | `1` | Chunks mínimos por documento en el budget adaptativo (tareas distribuidas) |
+| `RAG_MAX_CONTEXT_CHUNKS` | `24` | Tope del budget adaptativo + expansión (evita reventar el contexto) |
+| `RAG_PARENT_EXPANSION` | `1` | Small-to-big: expande cada chunk a sus vecinos (pasaje contiguo) |
+| `RAG_PARENT_WINDOW` | `1` | Cuántos chunks vecinos a cada lado del ancla |
+
 ## Modelos (env vars)
 
 - `RAG_EVAL_ANSWER_MODEL` — modelo de generación. Default: el de producción

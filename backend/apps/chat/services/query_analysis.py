@@ -299,6 +299,7 @@ def classify_query_llm(text: str) -> QueryAnalysis | None:
         return None
     try:
         from apps.document.utils.client_openia import generate_chat_completion
+        from apps.document.utils.llm import ROLE_FAST, resolve_model
 
         messages = [
             {"role": "system", "content": _LLM_ROUTER_SYSTEM_PROMPT},
@@ -306,7 +307,7 @@ def classify_query_llm(text: str) -> QueryAnalysis | None:
         ]
         body, _usage = generate_chat_completion(
             messages,
-            model=os.environ.get("RAG_ROUTER_MODEL", "gpt-4o-mini"),
+            model=os.environ.get("RAG_ROUTER_MODEL") or resolve_model(ROLE_FAST),
             temperature=0.0,
             max_tokens=80,
             timeout=8,

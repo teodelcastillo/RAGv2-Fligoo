@@ -119,6 +119,40 @@ cuellos de botella) sin que se desplome `faithfulness_rate`. Flags de Fase 1:
 | `RAG_PARENT_EXPANSION` | `1` | Small-to-big: expande cada chunk a sus vecinos (pasaje contiguo) |
 | `RAG_PARENT_WINDOW` | `1` | Cuántos chunks vecinos a cada lado del ancla |
 
+## Medir Fase 2 (migración de generación a Claude)
+
+El ruteo es por **model-id**: cualquier id `claude-*` se despacha a Anthropic;
+el resto sigue en OpenAI. Los embeddings NO se tocan (siguen en OpenAI), así que
+no hay que re-embeber nada.
+
+Dos formas de medir Claude vs OpenAI en el harness (necesitás `ANTHROPIC_API_KEY`):
+
+```bash
+# (a) Apuntar solo la generación del harness a Claude (juez sigue en OpenAI):
+RAG_EVAL_ANSWER_MODEL=claude-sonnet-4-6 \
+  python manage.py rag_eval_quality --user-email TU@email --cases evals/cases.json \
+  --baseline evals/baseline.json
+
+# (b) Flipear todo el motor a Claude por tiers (chat→Sonnet, router/rerank→Haiku):
+LLM_PROVIDER=anthropic \
+  python manage.py rag_eval_quality --user-email TU@email --cases evals/cases.json \
+  --baseline evals/baseline.json
+```
+
+Flags de Fase 2:
+
+| Env var | Default | Qué controla |
+|---|---|---|
+| `LLM_PROVIDER` | `openai` | `anthropic` flipea los tiers a Claude (chat→Sonnet, máquina→Haiku, síntesis→Opus) |
+| `LLM_MODEL_FAST` / `_BALANCED` / `_DEEP` | — | Override explícito del modelo por tier (gana sobre el provider) |
+| `LLM_PROMPT_CACHING` | `1` | Cachea el prefijo de sistema/contexto (cache_control) en el path Anthropic |
+| `LLM_THINKING` | `0` | Activa adaptive thinking en Claude para la respuesta |
+| `LLM_MAX_TOKENS` | `4096` | `max_tokens` por defecto (Anthropic lo exige) |
+
+> Embeddings siguen en `MODEL_EMBEDDING` (OpenAI). Tool-use de skills
+> (`generate_with_tools`) y structured outputs / citas nativas quedan como
+> follow-ups de Fase 2 — por ahora esos paths permanecen en OpenAI.
+
 ## Modelos (env vars)
 
 - `RAG_EVAL_ANSWER_MODEL` — modelo de generación. Default: el de producción

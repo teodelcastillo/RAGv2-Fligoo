@@ -8,9 +8,13 @@ from django.db import models
 from django.utils.translation import gettext_lazy as _
 
 from apps.document.models import Document
+from apps.document.utils.llm import ROLE_BALANCED, resolve_model
 from apps.project.models import Project
 
-DEFAULT_CHAT_MODEL = os.environ.get("MODEL_COMPLETION", "gpt-4o-mini")
+# Phase 2: resolves to OpenAI MODEL_COMPLETION by default, or the Claude
+# "balanced" tier (Sonnet) when LLM_PROVIDER=anthropic. Only affects new
+# sessions; existing sessions keep their stored model.
+DEFAULT_CHAT_MODEL = resolve_model(ROLE_BALANCED)
 
 
 class ChatSessionType(models.TextChoices):

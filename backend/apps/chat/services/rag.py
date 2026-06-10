@@ -1004,6 +1004,7 @@ def retrieve_for_chat(
     k_per_doc: int = 2,
     topics: list[str] | None = None,
     response_mode: str | None = None,
+    retrieval_strategy: str | None = None,
 ) -> RetrievalResult:
     """
     Full RAG retrieval pipeline:
@@ -1137,7 +1138,11 @@ def retrieve_for_chat(
         lexical_per_query = min(lexical_per_query, max(4, base_top_n + 2))
 
     # Strategy matrix based on query analysis (never on corpus size alone).
-    if requires_all_docs:
+    # Phase 5: an explicit caller override (skills / evaluations) wins so the
+    # unified retrieval path can still honour stack-specific configuration.
+    if retrieval_strategy in {"global", "hybrid_per_document"}:
+        vector_strategy = retrieval_strategy
+    elif requires_all_docs:
         vector_strategy = "hybrid_per_document"
     elif analysis.query_type == QUERY_TYPE_PANORAMA:
         vector_strategy = "hybrid_per_document"

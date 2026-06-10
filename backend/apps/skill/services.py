@@ -422,35 +422,23 @@ def _run_research_phase(
     if not research_queries:
         return "", []
 
-    doc_ids = list(documents.values_list("id", flat=True))
-    base_qs = SmartChunk.objects.filter(
-        document_id__in=doc_ids
-    ).exclude(embedding__isnull=True)
-
+    # Phase 5: each research query goes through the unified engine; the per-query
+    # ranked lists are still RRF-fused for cross-query breadth.
     all_ranked_lists: list[list] = []
     for query in research_queries[:RESEARCH_AUTO_QUERIES_MAX]:
         try:
-            v_chunks = fetch_relevant_chunks(
+            r = retrieve_for_chat(
                 user=execution.owner,
                 query_text=query,
                 allowed_documents=documents,
                 top_n=6,
-                retrieval_strategy="global",
                 total_limit=6,
+                retrieval_strategy="global",
             )
+            if r.chunks:
+                all_ranked_lists.append(list(r.chunks))
         except Exception as exc:
-            logger.warning("Research phase vector query %r failed: %s", query, exc)
-            v_chunks = []
-
-        try:
-            lex_chunks = lexical_search(base_qs, query, top_n=6)
-        except Exception as exc:
-            logger.warning("Research phase lexical query %r failed: %s", query, exc)
-            lex_chunks = []
-
-        for lst in [v_chunks, lex_chunks]:
-            if lst:
-                all_ranked_lists.append(lst)
+            logger.warning("Research phase query %r failed: %s", query, exc)
 
     if not all_ranked_lists:
         return "", []
@@ -883,36 +871,22 @@ def _run_copilot(execution: SkillExecution, documents: QuerySet[Document]) -> No
             prev_hint = (previous_outputs[-1] if previous_outputs else "")[:300]
             query_text = f"{step.title}. {step.instructions}. {prev_hint}".strip()
 
-            # Vector retrieval
+            # Vector + lexical + fusion via the unified engine (Phase 5).
             try:
-                v_chunks = fetch_relevant_chunks(
+                step_retrieval = retrieve_for_chat(
                     user=execution.owner,
                     query_text=query_text,
                     allowed_documents=step_documents,
                     top_n=COPILOT_STEP_CHUNKS,
-                    retrieval_strategy=effective_retrieval_strategy,
-                    k_per_doc=skill.k_per_doc,
                     total_limit=skill.total_limit,
                     max_chunks_per_doc=skill.max_per_doc_after_rerank,
+                    k_per_doc=skill.k_per_doc,
+                    retrieval_strategy=effective_retrieval_strategy,
                 )
+                fused = list(step_retrieval.chunks)
             except Exception as exc:
-                logger.warning("Step %s vector retrieval failed: %s", step.id, exc)
-                v_chunks = []
-
-            # Lexical retrieval
-            try:
-                step_lex_chunks = lexical_search(step_base_qs_local, query_text, top_n=COPILOT_STEP_CHUNKS)
-            except Exception as exc:
-                logger.warning("Step %s lexical search failed: %s", step.id, exc)
-                step_lex_chunks = []
-
-            # RRF fusion + threshold filter
-            step_ranked = [lst for lst in [v_chunks, step_lex_chunks] if lst]
-            fused = rrf_fuse(step_ranked, top_n=skill.total_limit) if step_ranked else v_chunks
-            fused = [
-                c for c in fused
-                if _chunk_similarity(c) is None or _chunk_similarity(c) >= RAG_MIN_SIMILARITY
-            ]
+                logger.warning("Step %s retrieval failed: %s", step.id, exc)
+                fused = []
 
             # Prioritise chunks not yet seen in earlier steps; fall back to repeats if needed.
             new_chunks = [c for c in fused if c.id not in seen_chunk_ids]

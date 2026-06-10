@@ -119,6 +119,29 @@ cuellos de botella) sin que se desplome `faithfulness_rate`. Flags de Fase 1:
 | `RAG_PARENT_EXPANSION` | `1` | Small-to-big: expande cada chunk a sus vecinos (pasaje contiguo) |
 | `RAG_PARENT_WINDOW` | `1` | Cuántos chunks vecinos a cada lado del ancla |
 
+## Medir Fase 3 (router de tareas)
+
+F3 enseña al clasificador la intención **`extract_per_entity`** ("X de cada
+documento" → cobertura ALL / map por-documento) más los ejes **localidad**
+(localizado/distribuido) y **operación** (lookup/extract/compare/synthesize), y
+expone un `RetrievalPlan` compartido (`plan_for_query`) que chat usa hoy y que
+skills/evaluaciones pueden adoptar.
+
+El harness mide **`routing_accuracy`**: ¿el `query_type` que predice el
+clasificador coincide con el `task_type` declarado del caso? (La taxonomía del
+clasificador y la del dataset están alineadas: `factual` / `numeric` /
+`extract_per_entity` / `comparative` / `panorama`.) Aparece en el resumen y por
+caso (`routing_predicted` / `routing_correct`), y el `retrieval_plan` queda en
+`trace.diagnostics`.
+
+```bash
+# Corre offline (sin LLM) si RAG_LLM_ROUTER_ENABLED=0 — el clasificador regex
+# ya cubre los casos fuertes (incluido per-entity).
+RAG_LLM_ROUTER_ENABLED=0 \
+  python manage.py rag_eval_quality --user-email TU@email --cases evals/cases.json \
+  --skip-generation
+```
+
 ## Medir Fase 2 (migración de generación a Claude)
 
 El ruteo es por **model-id**: cualquier id `claude-*` se despacha a Anthropic;

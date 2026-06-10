@@ -39,11 +39,13 @@ from apps.chat.services.query_analysis import (
     COVERAGE_MODE_ALL,
     COVERAGE_MODE_BALANCED,
     QUERY_TYPE_COMPARATIVE,
+    QUERY_TYPE_EXTRACTION_PER_ENTITY,
     QUERY_TYPE_NUMERIC,
     QUERY_TYPE_PANORAMA,
     QueryAnalysis,
     apply_response_mode_override,
     build_query_set,
+    build_retrieval_plan,
     classify_query,
     classify_query_hybrid,
 )
@@ -1069,7 +1071,10 @@ def retrieve_for_chat(
     diagnostics["classifier_confidence"] = analysis.classifier_confidence
     diagnostics["sub_queries"] = max(0, len(queries) - 1)
 
-    requires_all_docs = analysis.coverage_mode == COVERAGE_MODE_ALL
+    requires_all_docs = (
+        analysis.coverage_mode == COVERAGE_MODE_ALL
+        or analysis.query_type == QUERY_TYPE_EXTRACTION_PER_ENTITY
+    )
     coverage_target_ratio = RAG_ALL_DOCS_MIN_COVERAGE_RATIO if requires_all_docs else None
     diagnostics["coverage_target_ratio"] = coverage_target_ratio
 
@@ -1082,6 +1087,9 @@ def retrieve_for_chat(
     # Sizing the candidate pools.
     base_top_n = top_n or MAX_CONTEXT_CHUNKS
     multi_doc = len(doc_ids) > 1
+    # Phase 3 — record the shared retrieval plan (routing decision) for telemetry.
+    plan = build_retrieval_plan(analysis, doc_count=len(doc_ids))
+    diagnostics["retrieval_plan"] = plan.to_dict()
     if requires_all_docs and multi_doc:
         # Coverage mode makes sense only with multiple documents: ensure at
         # least one chunk per document.  For single-document sessions we keep

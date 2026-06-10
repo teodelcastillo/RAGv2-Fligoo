@@ -144,6 +144,9 @@ class QualityCaseResult:
     retrieved_slugs: List[str] = field(default_factory=list)
     diagnostics: dict = field(default_factory=dict)
     error: str = ""
+    # Routing (Phase 3): classifier prediction vs the case's declared task_type.
+    routing_predicted: str = ""
+    routing_correct: Optional[bool] = None
 
     def to_dict(self) -> dict:
         return {
@@ -162,6 +165,8 @@ class QualityCaseResult:
                 "abstained": self.abstained,
                 "fabricated": self.fabricated,
                 "faithful": self.faithful,
+                "routing_predicted": self.routing_predicted,
+                "routing_correct": self.routing_correct,
             },
             "answer": self.answer,
             "unsupported_claims": self.unsupported_claims,
@@ -239,6 +244,12 @@ class QualityReport:
                 for r in positives
                 if r.faithful is not None
             ),
+            # Routing (Phase 3)
+            "routing_accuracy": _safe_mean(
+                (1.0 if r.routing_correct else 0.0)
+                for r in rs
+                if r.routing_correct is not None
+            ),
             # Cost / latency
             "avg_latency": _safe_mean(r.latency_seconds for r in rs),
         }
@@ -290,6 +301,8 @@ class QualityReport:
             f"    abstention_rate (neg)     : {fmt(agg['abstention_rate'])}",
             f"    fabrication_rate (neg)    : {fmt(agg['fabrication_rate'])}",
             f"    faithfulness_rate (pos)   : {fmt(agg['faithfulness_rate'])}",
+            "  Routing:",
+            f"    routing_accuracy          : {fmt(agg['routing_accuracy'])}",
             f"  avg latency (s)             : {fmt(agg['avg_latency'])}",
         ]
         return "\n".join(lines)
@@ -571,6 +584,15 @@ def run_quality_eval(
         ]
         full_text = "\n".join((c.content or "") for c in chunks)
 
+        routing_predicted = (
+            getattr(result.analysis, "query_type", "") if result.analysis else ""
+        )
+        routing_correct = (
+            routing_predicted == case.task_type
+            if case.task_type in VALID_TASK_TYPES
+            else None
+        )
+
         retrieval_recall_docs = _coverage(slugs, case.expected_document_slugs)
         retrieval_recall_pages = _retrieval_recall_pages(chunks, case.expected_evidence)
         keyword_recall = _keyword_recall(full_text, case.expected_keywords)
@@ -629,6 +651,8 @@ def run_quality_eval(
                 usage=usage,
                 retrieved_slugs=slugs,
                 diagnostics=result.diagnostics or {},
+                routing_predicted=routing_predicted,
+                routing_correct=routing_correct,
             )
         )
     return report

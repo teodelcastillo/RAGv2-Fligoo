@@ -34,6 +34,7 @@ from apps.chat.services.query_analysis import (
     contextualize_query,
 )
 from apps.chat.services.rag import RetrievalResult, retrieve_for_chat, retrieve_from_library, suggest_related_library_documents
+from apps.chat.services.fanout import apply_fanout, maybe_fanout
 from apps.document.models import Document
 from apps.document.utils import client_openia
 
@@ -592,6 +593,13 @@ class ChatMessageViewSet(
 
         _sync_session_documents_for_request(session, document_slugs)
         retrieval = _run_retrieval(session, content, request.user, response_mode=response_mode)
+        fanout_result = maybe_fanout(
+            retrieval,
+            user=request.user,
+            query_text=content,
+            allowed_documents=session.allowed_documents.all(),
+            response_mode=response_mode,
+        )
         messages = _compose_messages(
             session,
             content,
@@ -606,31 +614,12 @@ class ChatMessageViewSet(
                 content=content,
             )
 
-            try:
-                answer_text, usage = client_openia.generate_chat_completion(
-                    messages,
-                    model=session.model,
-                    temperature=session.temperature,
-                    timeout=90,
-                )
-            except Exception as exc:  # pragma: no cover - network failure
-                error_msg = str(exc)
-                logger.exception("Error al generar respuesta de OpenAI: %s", error_msg)
-                if "api_key" in error_msg.lower() or "authentication" in error_msg.lower():
-                    raise ChatCompletionFailed(
-                        detail="Error de autenticación con OpenAI. Verifica la configuración de la API key.",
-                    ) from exc
-                if "rate limit" in error_msg.lower() or "quota" in error_msg.lower():
-                    raise ChatCompletionFailed(
-                        detail="Límite de tasa excedido. Por favor, intenta de nuevo en unos momentos.",
-                    ) from exc
-                if "model" in error_msg.lower():
-                    raise ChatCompletionFailed(
-                        detail=f"Error con el modelo de OpenAI: {error_msg}",
-                    ) from exc
-                raise ChatCompletionFailed(
-                    detail=f"No fue posible generar la respuesta en este momento: {error_msg}",
-                ) from exc
+            if fanout_result is not None:
+                # Phase 4: per-document map-reduce answer (extract_per_entity).
+                apply_fanout(retrieval, fanout_result)
+                answer_text, usage = fanout_result.answer, fanout_result.usage
+            else:
+                answer_text, usage = _generate_answer_or_raise(messages, session)
 
             metadata: dict = {"usage": usage}
             if retrieval.diagnostics:
@@ -684,6 +673,36 @@ def _build_chat_messages(
         max_history=max_history,
     )
     return messages, retrieval
+
+
+def _generate_answer_or_raise(messages, session):
+    """Single-pass generation with friendly error mapping (provider-agnostic)."""
+    try:
+        return client_openia.generate_chat_completion(
+            messages,
+            model=session.model,
+            temperature=session.temperature,
+            timeout=90,
+        )
+    except Exception as exc:  # pragma: no cover - network failure
+        error_msg = str(exc)
+        logger.exception("Error al generar respuesta: %s", error_msg)
+        low = error_msg.lower()
+        if "api_key" in low or "authentication" in low:
+            raise ChatCompletionFailed(
+                detail="Error de autenticación con el proveedor de IA. Verifica la configuración de la API key.",
+            ) from exc
+        if "rate limit" in low or "quota" in low:
+            raise ChatCompletionFailed(
+                detail="Límite de tasa excedido. Por favor, intenta de nuevo en unos momentos.",
+            ) from exc
+        if "model" in low:
+            raise ChatCompletionFailed(
+                detail=f"Error con el modelo de IA: {error_msg}",
+            ) from exc
+        raise ChatCompletionFailed(
+            detail=f"No fue posible generar la respuesta en este momento: {error_msg}",
+        ) from exc
 
 
 def _sync_session_documents_for_request(
@@ -764,16 +783,29 @@ class ChatMessageStreamView(APIView):
                     request.user,
                     response_mode=response_mode,
                 )
-                for text_chunk in client_openia.generate_chat_completion_stream(
-                    messages,
-                    model=session.model,
-                    temperature=session.temperature,
-                    timeout=90,
-                ):
-                    collected.append(text_chunk)
-                    yield _event({"type": "chunk", "content": text_chunk})
+                fanout_result = maybe_fanout(
+                    retrieval,
+                    user=request.user,
+                    query_text=content,
+                    allowed_documents=session.allowed_documents.all(),
+                    response_mode=response_mode,
+                )
+                if fanout_result is not None:
+                    # Phase 4: per-document map-reduce (extract_per_entity).
+                    apply_fanout(retrieval, fanout_result)
+                    answer_text = fanout_result.answer
+                    yield _event({"type": "chunk", "content": answer_text})
+                else:
+                    for text_chunk in client_openia.generate_chat_completion_stream(
+                        messages,
+                        model=session.model,
+                        temperature=session.temperature,
+                        timeout=90,
+                    ):
+                        collected.append(text_chunk)
+                        yield _event({"type": "chunk", "content": text_chunk})
 
-                answer_text = "".join(collected)
+                    answer_text = "".join(collected)
                 metadata: dict = {}
                 if retrieval.diagnostics:
                     metadata["rag_diagnostics"] = retrieval.diagnostics

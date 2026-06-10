@@ -119,6 +119,27 @@ cuellos de botella) sin que se desplome `faithfulness_rate`. Flags de Fase 1:
 | `RAG_PARENT_EXPANSION` | `1` | Small-to-big: expande cada chunk a sus vecinos (pasaje contiguo) |
 | `RAG_PARENT_WINDOW` | `1` | Cuántos chunks vecinos a cada lado del ancla |
 
+## Medir Fase 4 (fan-out por documento)
+
+Cuando el router marca `per_document_answer` (consultas `extract_per_entity`
+multi-documento, p.ej. "la meta de cada NDC"), el motor hace **map-reduce**:
+recupera y extrae el dato **documento por documento** (map en tier FAST/Haiku) y
+consolida una línea por documento (reduce). El harness rutea automáticamente
+esos casos por el fan-out, así que `answer_recall` del caso NDC se mide de punta
+a punta. Las citas siguen consistentes (índices `[#N]` globales).
+
+Flags de Fase 4:
+
+| Env var | Default | Qué controla |
+|---|---|---|
+| `RAG_FANOUT_ENABLED` | `1` | Activa el fan-out para consultas per-entity multi-doc |
+| `RAG_FANOUT_MAX_DOCS` | `20` | Tope de documentos a recorrer en el map |
+| `RAG_FANOUT_PER_DOC_TOP_N` | `4` | Chunks a recuperar por documento |
+| `RAG_FANOUT_MAP_MODEL` | tier FAST | Override del modelo del map (default Haiku con `LLM_PROVIDER=anthropic`) |
+
+> El trace muestra `diagnostics.fanout` (documentos recorridos, encontrados,
+> chunks, modelo del map).
+
 ## Medir Fase 3 (router de tareas)
 
 F3 enseña al clasificador la intención **`extract_per_entity`** ("X de cada

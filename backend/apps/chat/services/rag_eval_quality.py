@@ -52,6 +52,7 @@ from typing import Iterable, List, Optional
 from django.db.models import QuerySet
 
 from apps.chat.services.context_builder import build_citation_prompt
+from apps.chat.services.fanout import run_per_document_extraction, should_fanout
 from apps.chat.services.rag import RetrievalResult, retrieve_for_chat
 from apps.chat.services.rag_evaluation import _coverage, _keyword_recall
 from apps.document.models import Document
@@ -578,7 +579,23 @@ def run_quality_eval(
             )
             continue
 
-        chunks = list(result.chunks)
+        # Phase 4: per-document fan-out (extract_per_entity) when the plan asks.
+        fanout = None
+        if not skip_generation and should_fanout(result):
+            try:
+                if allowed_documents.count() > 1:
+                    fanout = run_per_document_extraction(
+                        user=user,
+                        query_text=case.question,
+                        allowed_documents=allowed_documents,
+                    )
+                    if fanout is not None and result.diagnostics is not None:
+                        result.diagnostics.update(fanout.diagnostics)
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.warning("Fan-out failed for %r: %s", case.question, exc)
+                fanout = None
+
+        chunks = list(fanout.chunks) if fanout is not None else list(result.chunks)
         slugs = [
             getattr(getattr(c, "document", None), "slug", "") or "" for c in chunks
         ]
@@ -607,11 +624,14 @@ def run_quality_eval(
         unsupported: List[str] = []
 
         if not skip_generation:
-            try:
-                answer, usage = _generate_answer(result, case.question)
-            except Exception as exc:  # pragma: no cover
-                logger.warning("Generation failed for %r: %s", case.question, exc)
-                answer = ""
+            if fanout is not None:
+                answer, usage = fanout.answer, fanout.usage
+            else:
+                try:
+                    answer, usage = _generate_answer(result, case.question)
+                except Exception as exc:  # pragma: no cover
+                    logger.warning("Generation failed for %r: %s", case.question, exc)
+                    answer = ""
 
             cited_any, citation_correctness, expected_evidence_cited = _score_citations(
                 answer, chunks, case

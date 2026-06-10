@@ -14,6 +14,7 @@ from apps.chat.services.rag import (
     build_context_block,
     fetch_relevant_chunks,
 )
+from apps.chat.services.query_analysis import recommend_strategy
 from apps.chat.services.retrieval import lexical_search, rrf_fuse
 from apps.document.models import Document, SmartChunk
 from apps.document.utils.client_openia import generate_chat_completion
@@ -183,7 +184,12 @@ class EvaluationRunner:
         # ── Phase 2: hybrid retrieval + RRF cross-query ───────────────────────
         doc_ids = list(documents_qs.values_list("id", flat=True))
         doc_count = len(doc_ids)
-        retrieval_strategy = "hybrid_per_document" if doc_count > 1 else "global"
+        # Phase 3 brain adoption: multi-doc defaults to per-document; a distributed
+        # metric query (comparative / per-entity) upgrades a single-doc run too.
+        retrieval_strategy = recommend_strategy(
+            retrieval_queries[0] if retrieval_queries else "",
+            default="hybrid_per_document" if doc_count > 1 else "global",
+        )
         base_qs = SmartChunk.objects.filter(
             document_id__in=doc_ids
         ).exclude(embedding__isnull=True)

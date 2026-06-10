@@ -783,3 +783,24 @@ def plan_for_query(
     analysis = apply_response_mode_override(analysis, response_mode)
     plan = build_retrieval_plan(analysis, doc_count=doc_count)
     return analysis, plan
+
+
+def _auto_strategy_enabled() -> bool:
+    return os.environ.get("RAG_AUTO_STRATEGY", "1").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
+def recommend_strategy(query_text: str, *, default: str = "global") -> str:
+    """Cheap (regex-only, no LLM) retrieval-strategy recommendation for the
+    skills and evaluations stacks.
+
+    Returns ``"hybrid_per_document"`` when the query is *distributed* (per-entity
+    / comparative / panorama / all-coverage) — i.e. it benefits from per-document
+    recall — otherwise ``default``. The strategy decision is independent of the
+    corpus size, so callers don't need to pass a document count.
+    """
+    if not _auto_strategy_enabled():
+        return default
+    plan = build_retrieval_plan(classify_query(query_text or ""), doc_count=2)
+    return "hybrid_per_document" if plan.strategy == "hybrid_per_document" else default

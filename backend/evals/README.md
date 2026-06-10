@@ -145,8 +145,10 @@ Flags de Fase 4:
 F3 enseña al clasificador la intención **`extract_per_entity`** ("X de cada
 documento" → cobertura ALL / map por-documento) más los ejes **localidad**
 (localizado/distribuido) y **operación** (lookup/extract/compare/synthesize), y
-expone un `RetrievalPlan` compartido (`plan_for_query`) que chat usa hoy y que
-skills/evaluaciones pueden adoptar.
+expone un `RetrievalPlan` compartido (`plan_for_query`) que chat, **skills y
+evaluaciones** ya usan: eligen estrategia de recuperación vía
+`recommend_strategy` (auto-upgrade a per-document para tareas distribuidas,
+respetando la config explícita del skill/eval). Togglear con `RAG_AUTO_STRATEGY=0`.
 
 El harness mide **`routing_accuracy`**: ¿el `query_type` que predice el
 clasificador coincide con el `task_type` declarado del caso? (La taxonomía del

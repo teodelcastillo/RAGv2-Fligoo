@@ -14,6 +14,7 @@ from apps.chat.services.rag import (
     build_context_block,
     fetch_relevant_chunks,
 )
+from apps.chat.services.query_analysis import recommend_strategy
 from apps.chat.services.retrieval import lexical_search, rrf_fuse
 from apps.document.models import Document, SmartChunk
 from apps.document.utils.client_openia import generate_chat_completion, generate_with_tools
@@ -505,6 +506,22 @@ def _build_skill_coverage_instruction(
 # Quick skill runner
 # ---------------------------------------------------------------------------
 
+def _resolve_skill_strategy(skill_obj, query_text: str) -> str:
+    """Effective retrieval strategy for a skill (Phase 3 brain adoption).
+
+    Priority: comparative_mode → an explicitly non-default strategy → the shared
+    classifier's recommendation (auto-upgrade distributed tasks to per-document).
+    Set RAG_AUTO_STRATEGY=0 to disable the auto-upgrade.
+    """
+    if skill_obj.comparative_mode_enabled:
+        return RetrievalStrategy.HYBRID_PER_DOCUMENT
+    if skill_obj.retrieval_strategy != RetrievalStrategy.GLOBAL:
+        return skill_obj.retrieval_strategy
+    if recommend_strategy(query_text) == "hybrid_per_document":
+        return RetrievalStrategy.HYBRID_PER_DOCUMENT
+    return RetrievalStrategy.GLOBAL
+
+
 def _run_quick(execution: SkillExecution, documents: QuerySet[Document]) -> None:
     from apps.skill.tools import SkillToolContext
 
@@ -520,11 +537,7 @@ def _run_quick(execution: SkillExecution, documents: QuerySet[Document]) -> None
     else:
         retrieval_query = auto_query
 
-    effective_retrieval_strategy = (
-        RetrievalStrategy.HYBRID_PER_DOCUMENT
-        if skill.comparative_mode_enabled
-        else skill.retrieval_strategy
-    )
+    effective_retrieval_strategy = _resolve_skill_strategy(skill, retrieval_query)
 
     # 2. Vector retrieval (unchanged call site, new query variable)
     vector_chunks = fetch_relevant_chunks(
@@ -736,11 +749,7 @@ def _run_skill_ref_step(
     else:
         retrieval_query = f"{linked.name}. {linked.description}. {extra}".strip()
 
-    effective_strategy = (
-        RetrievalStrategy.HYBRID_PER_DOCUMENT
-        if linked.comparative_mode_enabled
-        else linked.retrieval_strategy
-    )
+    effective_strategy = _resolve_skill_strategy(linked, retrieval_query)
 
     try:
         v_chunks = fetch_relevant_chunks(
@@ -838,10 +847,9 @@ def _run_copilot(execution: SkillExecution, documents: QuerySet[Document]) -> No
     # Rebuild conversation context from completed steps so later steps have full history.
     previous_outputs: List[str] = _rebuild_previous_outputs(already_done)
     all_step_chunks: list = []
-    effective_retrieval_strategy = (
-        RetrievalStrategy.HYBRID_PER_DOCUMENT
-        if skill.comparative_mode_enabled
-        else skill.retrieval_strategy
+    effective_retrieval_strategy = _resolve_skill_strategy(
+        skill,
+        f"{skill.name}. {skill.description}. {execution.extra_instructions or ''}",
     )
 
     # Shared lexical scope for all steps (computed once, not per step).

@@ -119,6 +119,17 @@ cuellos de botella) sin que se desplome `faithfulness_rate`. Flags de Fase 1:
 | `RAG_PARENT_EXPANSION` | `1` | Small-to-big: expande cada chunk a sus vecinos (pasaje contiguo) |
 | `RAG_PARENT_WINDOW` | `1` | Cuántos chunks vecinos a cada lado del ancla |
 
+## Fase 5 (orquestador unificado)
+
+Los tres stacks (chat, skills, evaluaciones) ahora comparten el mismo núcleo:
+recuperación (`retrieve_for_chat` con recall de F1 + plan de F3), fan-out de F4,
+generación provider-agnóstica de F2 y el cerebro de ruteo. El punto de entrada
+único es **`apps/chat/services/engine.py` → `run_engine(EngineRequest)`**, que
+hace `retrieve → (fan-out | generación) → respuesta citada` en una sola llamada.
+
+El harness corre a través de `run_engine`, así que mide el motor unificado
+end-to-end (las métricas de F1–F4 reflejan el camino real que usan los stacks).
+
 ## Medir Fase 4 (fan-out por documento)
 
 Cuando el router marca `per_document_answer` (consultas `extract_per_entity`

@@ -52,6 +52,7 @@ from typing import Iterable, List, Optional
 from django.db.models import QuerySet
 
 from apps.chat.services.context_builder import build_citation_prompt
+from apps.chat.services.engine import EngineRequest, run_engine
 from apps.chat.services.fanout import run_per_document_extraction, should_fanout
 from apps.chat.services.rag import RetrievalResult, retrieve_for_chat
 from apps.chat.services.rag_evaluation import _coverage, _keyword_recall
@@ -564,46 +565,51 @@ def run_quality_eval(
     report = QualityReport()
     for case in cases:
         started = time.perf_counter()
+        # Phase 5: drive the harness through the unified engine. ``skip_generation``
+        # keeps a retrieval-only path (no LLM); otherwise the engine handles
+        # retrieve → (fan-out | generate) → cited answer in one call.
         try:
-            result = retrieve_for_chat(
-                user=user,
-                query_text=case.question,
-                allowed_documents=allowed_documents,
-                top_n=top_n,
-                total_limit=top_n,
-            )
+            if skip_generation:
+                retrieval = retrieve_for_chat(
+                    user=user,
+                    query_text=case.question,
+                    allowed_documents=allowed_documents,
+                    top_n=top_n,
+                    total_limit=top_n,
+                )
+                chunks = list(retrieval.chunks)
+                analysis = retrieval.analysis
+                diagnostics = retrieval.diagnostics or {}
+                context_block = retrieval.context_block
+                answer, usage = "", {}
+            else:
+                eng = run_engine(
+                    EngineRequest(
+                        user=user,
+                        query=case.question,
+                        documents=allowed_documents,
+                        top_n=top_n,
+                        total_limit=top_n,
+                    )
+                )
+                chunks = list(eng.chunks)
+                analysis = eng.analysis
+                diagnostics = eng.diagnostics or {}
+                context_block = eng.context_block
+                answer, usage = eng.answer, (eng.usage or {})
         except Exception as exc:  # pragma: no cover - eval is permissive
-            logger.warning("Retrieval failed for %r: %s", case.question, exc)
+            logger.warning("Engine/retrieval failed for %r: %s", case.question, exc)
             report.results.append(
                 _empty_result(case, latency=time.perf_counter() - started, error=str(exc))
             )
             continue
 
-        # Phase 4: per-document fan-out (extract_per_entity) when the plan asks.
-        fanout = None
-        if not skip_generation and should_fanout(result):
-            try:
-                if allowed_documents.count() > 1:
-                    fanout = run_per_document_extraction(
-                        user=user,
-                        query_text=case.question,
-                        allowed_documents=allowed_documents,
-                    )
-                    if fanout is not None and result.diagnostics is not None:
-                        result.diagnostics.update(fanout.diagnostics)
-            except Exception as exc:  # pragma: no cover - defensive
-                logger.warning("Fan-out failed for %r: %s", case.question, exc)
-                fanout = None
-
-        chunks = list(fanout.chunks) if fanout is not None else list(result.chunks)
         slugs = [
             getattr(getattr(c, "document", None), "slug", "") or "" for c in chunks
         ]
         full_text = "\n".join((c.content or "") for c in chunks)
 
-        routing_predicted = (
-            getattr(result.analysis, "query_type", "") if result.analysis else ""
-        )
+        routing_predicted = getattr(analysis, "query_type", "") if analysis else ""
         routing_correct = (
             routing_predicted == case.task_type
             if case.task_type in VALID_TASK_TYPES
@@ -614,8 +620,6 @@ def run_quality_eval(
         retrieval_recall_pages = _retrieval_recall_pages(chunks, case.expected_evidence)
         keyword_recall = _keyword_recall(full_text, case.expected_keywords)
 
-        answer = ""
-        usage: dict = {}
         answer_recall = None
         cited_any = False
         citation_correctness = None
@@ -624,23 +628,13 @@ def run_quality_eval(
         unsupported: List[str] = []
 
         if not skip_generation:
-            if fanout is not None:
-                answer, usage = fanout.answer, fanout.usage
-            else:
-                try:
-                    answer, usage = _generate_answer(result, case.question)
-                except Exception as exc:  # pragma: no cover
-                    logger.warning("Generation failed for %r: %s", case.question, exc)
-                    answer = ""
-
             cited_any, citation_correctness, expected_evidence_cited = _score_citations(
                 answer, chunks, case
             )
-
             if answer and not skip_judge:
                 if case.answer_exists:
                     answer_recall = _judge_answer_recall(answer, case.expected_facts)
-                    faith = _judge_faithfulness(result.context_block, answer)
+                    faith = _judge_faithfulness(context_block, answer)
                     if faith is not None:
                         faithful = faith["faithful"]
                         unsupported = faith["unsupported"]
@@ -670,7 +664,7 @@ def run_quality_eval(
                 latency_seconds=time.perf_counter() - started,
                 usage=usage,
                 retrieved_slugs=slugs,
-                diagnostics=result.diagnostics or {},
+                diagnostics=diagnostics,
                 routing_predicted=routing_predicted,
                 routing_correct=routing_correct,
             )

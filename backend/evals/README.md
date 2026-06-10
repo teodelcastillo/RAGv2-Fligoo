@@ -1,0 +1,104 @@
+# RAG Eval Harness — Fase 0 ("la vara")
+
+Herramienta de **QA/dev** (no es el app `evaluation`, que es el producto de scoring ESG).
+Sirve para medir, con números, si un cambio en el RAG mejora **calidad** y
+**cobertura** antes de tocar nada más.
+
+Corre el **path real de producción** (recuperación + generación), no una
+reimplementación, y puntúa cada caso contra una verdad conocida.
+
+## Cómo correr
+
+```bash
+# Eval completa (recuperación + generación + LLM-juez)
+python manage.py rag_eval_quality --user-email owner@example.com --cases evals/cases.json
+
+# Registrar un baseline
+python manage.py rag_eval_quality --user-email me@x.com --cases evals/cases.json \
+    --out evals/baseline.json
+
+# Comparar una corrida posterior contra el baseline
+python manage.py rag_eval_quality --user-email me@x.com --cases evals/cases.json \
+    --baseline evals/baseline.json
+
+# Solo recuperación (sin LLM, 100% offline) — útil para iterar barato sobre el retrieval
+python manage.py rag_eval_quality --user-email me@x.com --cases evals/cases.json \
+    --skip-generation
+```
+
+Requisitos para una corrida completa: DB con los documentos reales cargados y
+procesados (embeddings), y `OPENAI_API_KEY` (para generación + juez). Sin API
+key, usá `--skip-generation` y obtenés solo las métricas de recuperación.
+
+## Las tres métricas que importan
+
+| Métrica | Qué responde | Cómo se calcula |
+|---|---|---|
+| **retrieval_recall** (docs / pages) | ¿Se *recuperó* la evidencia que existe? | Determinístico: docs/páginas esperadas presentes en los chunks recuperados |
+| **answer_recall** | ¿La *respuesta final* incluyó el dato? | LLM-juez sobre `expected_facts` |
+| **cited_any / citation_correctness / expected_evidence_cited** | ¿Demostró de dónde salió? | Mapeo determinístico de `[#N]` → chunk → documento/página esperada |
+| **abstention_rate / fabrication_rate** (casos negativos) | ¿Dijo "no está" en vez de inventar? | LLM-juez |
+| **faithfulness_rate** (casos positivos) | ¿Toda afirmación está respaldada por el contexto? | LLM-juez |
+
+> **La brecha entre `retrieval_recall` y `answer_recall` localiza la falla:**
+> si se recuperó pero no apareció en la respuesta → falla de generación;
+> si no se recuperó → falla de retrieval. Esa es la distinción "no está" vs
+> "no lo busqué" hecha número.
+
+## Formato de un caso
+
+Lista JSON. Cada objeto:
+
+```json
+{
+  "id": "urbancode-altura-r1",
+  "task_type": "numeric",
+  "scope": "single_doc",
+  "question": "¿Cuál es la altura máxima de edificación en zona R1?",
+  "expected_document_slugs": ["codigo-urbano-xyz"],
+  "expected_facts": ["12 metros", "4 niveles"],
+  "expected_evidence": [{"document_slug": "codigo-urbano-xyz", "page": 14}],
+  "answer_exists": true,
+  "expected_keywords": ["altura", "zona"],
+  "notes": "el dato vive en una tabla de zonificación"
+}
+```
+
+| Campo | Obligatorio | Uso |
+|---|---|---|
+| `question` | sí | la consulta |
+| `id` | recomendado | identificador estable (para diffs) |
+| `task_type` | sí | `factual` \| `numeric` \| `extract_per_entity` \| `comparative` \| `panorama` |
+| `scope` | informativo | `single_doc` \| `few_docs` \| `many_docs` \| `repository` |
+| `expected_document_slugs` | para recall | docs donde vive la respuesta |
+| `expected_facts` | para answer_recall | hechos/valores que la respuesta DEBE incluir |
+| `expected_evidence` | para provenance | `[{document_slug, page}]` — ubicación exacta |
+| `answer_exists` | sí | `false` ⇒ **caso negativo** (mide abstención) |
+| `expected_keywords` | opcional | recall léxico sobre el texto recuperado (legacy) |
+| `notes` | opcional | contexto para humanos |
+
+## Cómo construir el dataset de oro
+
+1. **Usá documentos reales** (anonimizados si hace falta) cargados en un
+   workspace de prueba. Las métricas solo valen si reflejan tu realidad.
+2. Reemplazá los `expected_document_slugs` de `cases.example.json` por los
+   **slugs reales** de tus documentos (los ves en la URL/admin del documento).
+3. **Cosechá consultas reales que fallaron** — como consultora ya las tenés;
+   son el dataset más valioso.
+4. Cubrí la taxonomía completa + casos negativos (`answer_exists: false`).
+5. Empezá con ~20–40 casos y crecé. Mantené un subconjunto "smoke" chico para
+   correr en cada cambio y el set completo para corridas nocturnas.
+
+`cases.example.json` es una **plantilla** con slugs ficticios — copialo a
+`cases.json` y completalo con tus documentos reales.
+
+## Modelos (env vars)
+
+- `RAG_EVAL_ANSWER_MODEL` — modelo de generación. Default: el de producción
+  (`MODEL_COMPLETION`), para que el baseline refleje lo que ve el usuario hoy.
+- `RAG_EVAL_JUDGE_MODEL` — modelo juez. Default: `MODEL_COMPLETION`. Se
+  **recomienda un modelo más fuerte** y validar el juez contra un puñado de
+  etiquetas humanas antes de confiar en él.
+- `PROMPT_VERSION` (en `rag_eval_quality.py`) versiona los prompts de
+  generación/juez: si los cambiás, subilo, para que un movimiento de métrica
+  sea atribuible.

@@ -1,0 +1,106 @@
+[
+  {
+    "id": "urbancode-altura-r1",
+    "task_type": "numeric",
+    "scope": "single_doc",
+    "question": "¿Cuál es la altura máxima de edificación permitida en la zona R1?",
+    "expected_document_slugs": ["REEMPLAZAR-codigo-urbano"],
+    "expected_facts": ["12 metros"],
+    "expected_evidence": [{"document_slug": "REEMPLAZAR-codigo-urbano", "page": 14}],
+    "answer_exists": true,
+    "expected_keywords": ["altura", "zona", "edificación"],
+    "notes": "CUELLO DE BOTELLA 1: dato puntual en tabla de zonificación de un documento de texto plano."
+  },
+  {
+    "id": "ndc-meta-cada-pais",
+    "task_type": "extract_per_entity",
+    "scope": "many_docs",
+    "question": "Extraé la meta de mitigación (objetivo y año) de cada una de estas NDC.",
+    "expected_document_slugs": ["REEMPLAZAR-ndc-argentina", "REEMPLAZAR-ndc-colombia", "REEMPLAZAR-ndc-chile"],
+    "expected_facts": [
+      "Argentina: no superar 349 MtCO2e en 2030",
+      "Colombia: reducir 51% de emisiones para 2030",
+      "Chile: carbono neutralidad para 2050"
+    ],
+    "expected_evidence": [
+      {"document_slug": "REEMPLAZAR-ndc-argentina", "page": null},
+      {"document_slug": "REEMPLAZAR-ndc-colombia", "page": null},
+      {"document_slug": "REEMPLAZAR-ndc-chile", "page": null}
+    ],
+    "answer_exists": true,
+    "expected_keywords": ["meta", "mitigación", "2030", "2050"],
+    "notes": "CUELLO DE BOTELLA 2: map por-documento; debe cubrir CADA NDC e identificar la meta de cada una."
+  },
+  {
+    "id": "ndc-meta-argentina-puntual",
+    "task_type": "numeric",
+    "scope": "few_docs",
+    "question": "¿Cuál es la meta de mitigación de Argentina en su NDC?",
+    "expected_document_slugs": ["REEMPLAZAR-ndc-argentina"],
+    "expected_facts": ["no superar 349 MtCO2e", "2030"],
+    "expected_evidence": [{"document_slug": "REEMPLAZAR-ndc-argentina", "page": null}],
+    "answer_exists": true,
+    "expected_keywords": ["meta", "argentina", "2030"],
+    "notes": "Consulta puntual y localizada: recuperación precisa, NO leer todo el documento."
+  },
+  {
+    "id": "comparativa-ambicion-ndc",
+    "task_type": "comparative",
+    "scope": "few_docs",
+    "question": "¿Cuál de estas NDC tiene la meta de reducción más ambiciosa y por qué?",
+    "expected_document_slugs": ["REEMPLAZAR-ndc-colombia", "REEMPLAZAR-ndc-chile"],
+    "expected_facts": ["Colombia reduce 51% para 2030"],
+    "expected_evidence": [],
+    "answer_exists": true,
+    "expected_keywords": ["ambiciosa", "reducción"],
+    "notes": "Operación comparativa: requiere cobertura balanceada entre documentos."
+  },
+  {
+    "id": "panorama-biblioteca",
+    "task_type": "panorama",
+    "scope": "repository",
+    "question": "Dame un panorama general de los temas que cubre esta base documental.",
+    "expected_document_slugs": [],
+    "expected_facts": [],
+    "expected_evidence": [],
+    "answer_exists": true,
+    "expected_keywords": [],
+    "notes": "Síntesis amplia: se mide sobre todo cobertura y fidelidad, no recall puntual."
+  },
+  {
+    "id": "factual-definicion",
+    "task_type": "factual",
+    "scope": "single_doc",
+    "question": "¿Qué metodología de cálculo de emisiones utiliza el reporte?",
+    "expected_document_slugs": ["REEMPLAZAR-reporte-esg"],
+    "expected_facts": ["GHG Protocol"],
+    "expected_evidence": [{"document_slug": "REEMPLAZAR-reporte-esg", "page": null}],
+    "answer_exists": true,
+    "expected_keywords": ["metodología", "emisiones"],
+    "notes": "Lookup factual simple."
+  },
+  {
+    "id": "negativo-dato-inexistente",
+    "task_type": "numeric",
+    "scope": "single_doc",
+    "question": "¿Cuál es la huella hídrica total reportada en metros cúbicos?",
+    "expected_document_slugs": ["REEMPLAZAR-reporte-esg"],
+    "expected_facts": [],
+    "expected_evidence": [],
+    "answer_exists": false,
+    "expected_keywords": ["huella hídrica"],
+    "notes": "CASO NEGATIVO: el dato NO está en el documento. El sistema debe abstenerse, no inventar."
+  },
+  {
+    "id": "negativo-entidad-fuera-de-alcance",
+    "task_type": "factual",
+    "scope": "few_docs",
+    "question": "¿Cuál es la meta de mitigación de la NDC de Japón?",
+    "expected_document_slugs": [],
+    "expected_facts": [],
+    "expected_evidence": [],
+    "answer_exists": false,
+    "expected_keywords": ["japón"],
+    "notes": "CASO NEGATIVO: ningún documento de Japón en el corpus. Debe declarar que no está, no traer conocimiento general sin marcarlo."
+  }
+]

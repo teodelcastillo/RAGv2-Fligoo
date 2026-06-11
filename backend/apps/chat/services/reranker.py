@@ -16,6 +16,7 @@ import re
 from typing import List, Sequence
 
 from apps.document.models import SmartChunk
+from apps.document.utils.llm import ROLE_FAST, resolve_model
 
 logger = logging.getLogger(__name__)
 
@@ -75,7 +76,7 @@ def llm_rerank(
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ],
-            model=model or os.environ.get("RAG_RERANKER_MODEL", "gpt-4o-mini"),
+            model=model or os.environ.get("RAG_RERANKER_MODEL") or resolve_model(ROLE_FAST),
             temperature=0.0,
             max_tokens=120,
             timeout=20,

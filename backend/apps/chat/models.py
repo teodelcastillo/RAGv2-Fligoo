@@ -10,6 +10,10 @@ from django.utils.translation import gettext_lazy as _
 from apps.document.models import Document
 from apps.project.models import Project
 
+# Stable field default (identical to main → no makemigrations churn ever).
+# Phase 2 tier routing for NEW sessions happens at creation time in
+# ChatSessionCreateSerializer (resolve_model), not via this default, so that
+# changing LLM_PROVIDER never triggers a spurious migration diff.
 DEFAULT_CHAT_MODEL = os.environ.get("MODEL_COMPLETION", "gpt-4o-mini")
 
 

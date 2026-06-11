@@ -23,6 +23,12 @@ from typing import Generator, List, Tuple, Optional
 import httpx
 from openai import OpenAI
 
+from apps.document.utils.llm import (
+    anthropic_chat_completion,
+    anthropic_chat_completion_stream,
+    is_anthropic_model,
+)
+
 
 # Model defaults from environment
 MODEL_EMBEDDING = os.environ.get("MODEL_EMBEDDING", "text-embedding-3-small")
@@ -239,6 +245,21 @@ def generate_chat_completion(
     Raises:
         ValueError: If API returns empty response
     """
+    effective_model = model or MODEL_COMPLETION
+
+    # Phase 2: route Claude model ids to the Anthropic provider (embeddings and
+    # everything else stay on OpenAI). ``response_format`` (OpenAI JSON mode) is
+    # not forwarded — Anthropic uses output_config.format; structured outputs is
+    # a Phase 2 follow-up and callers already parse JSON defensively.
+    if is_anthropic_model(effective_model):
+        return anthropic_chat_completion(
+            messages,
+            model=effective_model,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            timeout=timeout,
+        )
+
     # Format messages for OpenAI Chat Completions API
     formatted_messages = [
         {
@@ -252,7 +273,7 @@ def generate_chat_completion(
     
     # Build request parameters
     request_params = {
-        "model": model or MODEL_COMPLETION,
+        "model": effective_model,
         "temperature": temperature,
         "messages": formatted_messages,
     }
@@ -320,8 +341,16 @@ def generate_with_tools(
     Returns:
         Tuple[str, dict]: (final_text, aggregated_usage)
     """
-    client = get_openai_client()
     effective_model = model or MODEL_COMPLETION
+    if is_anthropic_model(effective_model):
+        # Anthropic's tool-use protocol differs from OpenAI's; the agentic
+        # tool-loop is not ported yet (Phase 2 follow-up). Tool-enabled skills
+        # must use an OpenAI model for now.
+        raise NotImplementedError(
+            "generate_with_tools does not support Anthropic models yet; "
+            "use an OpenAI model for tool-enabled skills or disable tools."
+        )
+    client = get_openai_client()
     conversation = [{"role": m["role"], "content": m["content"]} for m in messages]
     total_usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
 
@@ -404,13 +433,23 @@ def generate_chat_completion_stream(
     Yields individual text chunks as they arrive.  The caller is responsible
     for assembling the full response and persisting the ChatMessage record.
     """
+    effective_model = model or MODEL_COMPLETION
+    if is_anthropic_model(effective_model):
+        yield from anthropic_chat_completion_stream(
+            messages,
+            model=effective_model,
+            temperature=temperature,
+            timeout=timeout,
+        )
+        return
+
     client = get_openai_client()
     formatted_messages = [
         {"role": m["role"], "content": m["content"]}
         for m in messages
     ]
     create_kwargs: dict = {
-        "model": model or MODEL_COMPLETION,
+        "model": effective_model,
         "temperature": temperature,
         "messages": formatted_messages,
         "stream": True,

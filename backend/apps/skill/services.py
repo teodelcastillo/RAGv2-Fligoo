@@ -13,7 +13,9 @@ from apps.chat.services.rag import (
     _chunk_similarity,
     build_context_block,
     fetch_relevant_chunks,
+    retrieve_for_chat,
 )
+from apps.chat.services.query_analysis import recommend_strategy
 from apps.chat.services.retrieval import lexical_search, rrf_fuse
 from apps.document.models import Document, SmartChunk
 from apps.document.utils.client_openia import generate_chat_completion, generate_with_tools
@@ -420,35 +422,23 @@ def _run_research_phase(
     if not research_queries:
         return "", []
 
-    doc_ids = list(documents.values_list("id", flat=True))
-    base_qs = SmartChunk.objects.filter(
-        document_id__in=doc_ids
-    ).exclude(embedding__isnull=True)
-
+    # Phase 5: each research query goes through the unified engine; the per-query
+    # ranked lists are still RRF-fused for cross-query breadth.
     all_ranked_lists: list[list] = []
     for query in research_queries[:RESEARCH_AUTO_QUERIES_MAX]:
         try:
-            v_chunks = fetch_relevant_chunks(
+            r = retrieve_for_chat(
                 user=execution.owner,
                 query_text=query,
                 allowed_documents=documents,
                 top_n=6,
-                retrieval_strategy="global",
                 total_limit=6,
+                retrieval_strategy="global",
             )
+            if r.chunks:
+                all_ranked_lists.append(list(r.chunks))
         except Exception as exc:
-            logger.warning("Research phase vector query %r failed: %s", query, exc)
-            v_chunks = []
-
-        try:
-            lex_chunks = lexical_search(base_qs, query, top_n=6)
-        except Exception as exc:
-            logger.warning("Research phase lexical query %r failed: %s", query, exc)
-            lex_chunks = []
-
-        for lst in [v_chunks, lex_chunks]:
-            if lst:
-                all_ranked_lists.append(lst)
+            logger.warning("Research phase query %r failed: %s", query, exc)
 
     if not all_ranked_lists:
         return "", []
@@ -505,6 +495,22 @@ def _build_skill_coverage_instruction(
 # Quick skill runner
 # ---------------------------------------------------------------------------
 
+def _resolve_skill_strategy(skill_obj, query_text: str) -> str:
+    """Effective retrieval strategy for a skill (Phase 3 brain adoption).
+
+    Priority: comparative_mode → an explicitly non-default strategy → the shared
+    classifier's recommendation (auto-upgrade distributed tasks to per-document).
+    Set RAG_AUTO_STRATEGY=0 to disable the auto-upgrade.
+    """
+    if skill_obj.comparative_mode_enabled:
+        return RetrievalStrategy.HYBRID_PER_DOCUMENT
+    if skill_obj.retrieval_strategy != RetrievalStrategy.GLOBAL:
+        return skill_obj.retrieval_strategy
+    if recommend_strategy(query_text) == "hybrid_per_document":
+        return RetrievalStrategy.HYBRID_PER_DOCUMENT
+    return RetrievalStrategy.GLOBAL
+
+
 def _run_quick(execution: SkillExecution, documents: QuerySet[Document]) -> None:
     from apps.skill.tools import SkillToolContext
 
@@ -520,47 +526,25 @@ def _run_quick(execution: SkillExecution, documents: QuerySet[Document]) -> None
     else:
         retrieval_query = auto_query
 
-    effective_retrieval_strategy = (
-        RetrievalStrategy.HYBRID_PER_DOCUMENT
-        if skill.comparative_mode_enabled
-        else skill.retrieval_strategy
-    )
+    effective_retrieval_strategy = _resolve_skill_strategy(skill, retrieval_query)
 
-    # 2. Vector retrieval (unchanged call site, new query variable)
-    vector_chunks = fetch_relevant_chunks(
+    # 2-6. Unified retrieval (Phase 5): delegate to the shared engine
+    # (retrieve_for_chat) so skills get F1 recall + parent expansion + the
+    # Phase-3 plan instead of re-implementing vector + lexical + RRF + threshold.
+    retrieval = retrieve_for_chat(
         user=execution.owner,
         query_text=retrieval_query,
         allowed_documents=documents,
         top_n=DEFAULT_CHUNKS,
-        retrieval_strategy=effective_retrieval_strategy,
-        k_per_doc=skill.k_per_doc,
         total_limit=skill.total_limit,
         max_chunks_per_doc=skill.max_per_doc_after_rerank,
+        k_per_doc=skill.k_per_doc,
+        retrieval_strategy=effective_retrieval_strategy,
     )
-
-    # 3. Lexical retrieval over the same document scope
-    doc_ids = list(documents.values_list("id", flat=True))
-    base_qs = SmartChunk.objects.filter(
-        document_id__in=doc_ids
-    ).exclude(embedding__isnull=True)
-    try:
-        lex_chunks = lexical_search(base_qs, retrieval_query, top_n=skill.total_limit)
-    except Exception as exc:
-        logger.warning("Skill lexical search failed for execution %s: %s", execution.id, exc)
-        lex_chunks = []
-
-    # 4. RRF fusion
-    ranked_lists = [lst for lst in [vector_chunks, lex_chunks] if lst]
-    fused = rrf_fuse(ranked_lists, top_n=skill.total_limit) if ranked_lists else vector_chunks
-
-    # 5. Relevance threshold — drop chunks that have a score but fall below the bar
-    final_chunks = [
-        c for c in fused
-        if _chunk_similarity(c) is None or _chunk_similarity(c) >= RAG_MIN_SIMILARITY
-    ]
-
-    # 6. Context block with structured citations [#N]
-    context_block = build_context_block(final_chunks)
+    final_chunks = list(retrieval.chunks)
+    context_block = retrieval.context_block or build_context_block(final_chunks)
+    vector_count = retrieval.diagnostics.get("vector_candidates", 0)
+    lexical_count = retrieval.diagnostics.get("lexical_candidates", 0)
 
     prompt = _render_prompt_variables(
         skill.prompt_template,
@@ -605,8 +589,8 @@ def _run_quick(execution: SkillExecution, documents: QuerySet[Document]) -> None
     execution.metadata = {
         "usage": usage,
         "chunks_used": len(all_chunks),
-        "vector_chunks": len(vector_chunks),
-        "lexical_chunks": len(lex_chunks),
+        "vector_chunks": vector_count,
+        "lexical_chunks": lexical_count,
         "retrieval_query": retrieval_query,
         "tool_calls_made": len(tool_ctx.additional_chunks) > 0,
         "comparative_mode_enabled": skill.comparative_mode_enabled,
@@ -736,44 +720,21 @@ def _run_skill_ref_step(
     else:
         retrieval_query = f"{linked.name}. {linked.description}. {extra}".strip()
 
-    effective_strategy = (
-        RetrievalStrategy.HYBRID_PER_DOCUMENT
-        if linked.comparative_mode_enabled
-        else linked.retrieval_strategy
+    effective_strategy = _resolve_skill_strategy(linked, retrieval_query)
+
+    # Unified retrieval (Phase 5): delegate to the shared engine.
+    retrieval = retrieve_for_chat(
+        user=execution.owner,
+        query_text=retrieval_query,
+        allowed_documents=step_documents,
+        top_n=DEFAULT_CHUNKS,
+        total_limit=linked.total_limit,
+        max_chunks_per_doc=linked.max_per_doc_after_rerank,
+        k_per_doc=linked.k_per_doc,
+        retrieval_strategy=effective_strategy,
     )
-
-    try:
-        v_chunks = fetch_relevant_chunks(
-            user=execution.owner,
-            query_text=retrieval_query,
-            allowed_documents=step_documents,
-            top_n=DEFAULT_CHUNKS,
-            retrieval_strategy=effective_strategy,
-            k_per_doc=linked.k_per_doc,
-            total_limit=linked.total_limit,
-            max_chunks_per_doc=linked.max_per_doc_after_rerank,
-        )
-    except Exception as exc:
-        logger.warning("skill_ref step %s retrieval failed: %s", step.id, exc)
-        v_chunks = []
-
-    doc_ids = list(step_documents.values_list("id", flat=True))
-    base_qs = SmartChunk.objects.filter(document_id__in=doc_ids).exclude(
-        embedding__isnull=True
-    )
-    try:
-        lex_chunks = lexical_search(base_qs, retrieval_query, top_n=linked.total_limit)
-    except Exception as exc:
-        logger.warning("skill_ref step %s lexical failed: %s", step.id, exc)
-        lex_chunks = []
-
-    ranked = [lst for lst in [v_chunks, lex_chunks] if lst]
-    fused = rrf_fuse(ranked, top_n=linked.total_limit) if ranked else v_chunks
-    final_chunks = [
-        c for c in fused
-        if _chunk_similarity(c) is None or _chunk_similarity(c) >= RAG_MIN_SIMILARITY
-    ]
-    context_block = build_context_block(final_chunks)
+    final_chunks = list(retrieval.chunks)
+    context_block = retrieval.context_block or build_context_block(final_chunks)
 
     prompt = _render_prompt_variables(
         linked.prompt_template,
@@ -838,10 +799,9 @@ def _run_copilot(execution: SkillExecution, documents: QuerySet[Document]) -> No
     # Rebuild conversation context from completed steps so later steps have full history.
     previous_outputs: List[str] = _rebuild_previous_outputs(already_done)
     all_step_chunks: list = []
-    effective_retrieval_strategy = (
-        RetrievalStrategy.HYBRID_PER_DOCUMENT
-        if skill.comparative_mode_enabled
-        else skill.retrieval_strategy
+    effective_retrieval_strategy = _resolve_skill_strategy(
+        skill,
+        f"{skill.name}. {skill.description}. {execution.extra_instructions or ''}",
     )
 
     # Shared lexical scope for all steps (computed once, not per step).
@@ -911,36 +871,22 @@ def _run_copilot(execution: SkillExecution, documents: QuerySet[Document]) -> No
             prev_hint = (previous_outputs[-1] if previous_outputs else "")[:300]
             query_text = f"{step.title}. {step.instructions}. {prev_hint}".strip()
 
-            # Vector retrieval
+            # Vector + lexical + fusion via the unified engine (Phase 5).
             try:
-                v_chunks = fetch_relevant_chunks(
+                step_retrieval = retrieve_for_chat(
                     user=execution.owner,
                     query_text=query_text,
                     allowed_documents=step_documents,
                     top_n=COPILOT_STEP_CHUNKS,
-                    retrieval_strategy=effective_retrieval_strategy,
-                    k_per_doc=skill.k_per_doc,
                     total_limit=skill.total_limit,
                     max_chunks_per_doc=skill.max_per_doc_after_rerank,
+                    k_per_doc=skill.k_per_doc,
+                    retrieval_strategy=effective_retrieval_strategy,
                 )
+                fused = list(step_retrieval.chunks)
             except Exception as exc:
-                logger.warning("Step %s vector retrieval failed: %s", step.id, exc)
-                v_chunks = []
-
-            # Lexical retrieval
-            try:
-                step_lex_chunks = lexical_search(step_base_qs_local, query_text, top_n=COPILOT_STEP_CHUNKS)
-            except Exception as exc:
-                logger.warning("Step %s lexical search failed: %s", step.id, exc)
-                step_lex_chunks = []
-
-            # RRF fusion + threshold filter
-            step_ranked = [lst for lst in [v_chunks, step_lex_chunks] if lst]
-            fused = rrf_fuse(step_ranked, top_n=skill.total_limit) if step_ranked else v_chunks
-            fused = [
-                c for c in fused
-                if _chunk_similarity(c) is None or _chunk_similarity(c) >= RAG_MIN_SIMILARITY
-            ]
+                logger.warning("Step %s retrieval failed: %s", step.id, exc)
+                fused = []
 
             # Prioritise chunks not yet seen in earlier steps; fall back to repeats if needed.
             new_chunks = [c for c in fused if c.id not in seen_chunk_ids]

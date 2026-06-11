@@ -23,9 +23,20 @@ logger = logging.getLogger(__name__)
 
 QUERY_TYPE_FACTUAL = "factual"
 QUERY_TYPE_NUMERIC = "numeric"
+QUERY_TYPE_EXTRACTION_PER_ENTITY = "extract_per_entity"
 QUERY_TYPE_COMPARATIVE = "comparative"
 QUERY_TYPE_PANORAMA = "panorama"
 QUERY_TYPE_EXTRACTION = QUERY_TYPE_NUMERIC
+
+# Locality — where the answer lives (drives retrieve-vs-read depth).
+LOCALITY_LOCALIZED = "localized"      # answer sits in one passage / document
+LOCALITY_DISTRIBUTED = "distributed"  # answer spread across docs / sections
+
+# Operation — what the task does with the evidence.
+OPERATION_LOOKUP = "lookup"
+OPERATION_EXTRACT = "extract"
+OPERATION_COMPARE = "compare"
+OPERATION_SYNTHESIZE = "synthesize"
 
 COVERAGE_MODE_FOCUSED = "focused"
 COVERAGE_MODE_BALANCED = "balanced"
@@ -69,6 +80,28 @@ _NUMERIC_PATTERNS = (
     r"\b(emisiones|consumo|huella|capex|opex|ebitda|ingresos?|revenue|margen|roe|roi)\b",
 )
 
+# Per-entity extraction: "X de/para cada documento/uno". Detected only when a
+# per-each marker co-occurs with an extraction signal — this is the "extraé la
+# meta de cada NDC" shape that needs a per-document map, not a single shared pass.
+_PER_ENTITY_PATTERNS = (
+    r"\bde cada\b",
+    r"\bpara cada\b",
+    r"\bpor cada\b",
+    r"\bcada (uno|una|documento|fuente|archivo|ndc|pa[ií]s|informe|reporte)\b",
+    r"\b(uno|una) por (documento|cada|archivo|fuente)\b",
+    r"\bde (todas|todos) (las|los)\b",
+    r"\bfor each\b",
+    r"\beach (of|document|one|file)\b",
+)
+_EXTRACTION_VERB_PATTERNS = (
+    r"\b(extrae|extra[eé]|lista|list[aá]|listame|enumera|enumer[aá]|"
+    r"identifica|identific[aá]|indica|indic[aá]|menciona|mencion[aá]|"
+    r"obten|obt[eé]n|saca|sac[aá]|dame|resume|resum[ií])\b",
+    r"\b(cu[aá]l(es)? (es|son|fue|fueron|ser[ií]a))\b",
+    r"\b(meta|metas|objetivo|objetivos|valor|valores|cifra|cifras|monto|"
+    r"porcentaje|dato|datos|indicador|indicadores)\b",
+)
+
 
 CLASSIFIER_SOURCE_REGEX = "regex"
 CLASSIFIER_SOURCE_LLM = "llm_router"
@@ -88,6 +121,8 @@ class QueryAnalysis:
     query_type: str = QUERY_TYPE_FACTUAL
     is_general: bool = False
     coverage_mode: str = COVERAGE_MODE_FOCUSED
+    locality: str = LOCALITY_LOCALIZED
+    operation: str = OPERATION_LOOKUP
     keywords: List[str] = field(default_factory=list)
     numeric_tokens: List[str] = field(default_factory=list)
     sub_queries: List[str] = field(default_factory=list)
@@ -102,10 +137,26 @@ class QueryAnalysis:
             "query_type": self.query_type,
             "is_general": self.is_general,
             "coverage_mode": self.coverage_mode,
+            "locality": self.locality,
+            "operation": self.operation,
             "keywords": self.keywords,
             "numeric_tokens": self.numeric_tokens,
             "sub_queries": self.sub_queries,
         }
+
+
+# Locality / operation derived from the coarse query type.
+_LOCALITY_OPERATION = {
+    QUERY_TYPE_FACTUAL: (LOCALITY_LOCALIZED, OPERATION_LOOKUP),
+    QUERY_TYPE_NUMERIC: (LOCALITY_LOCALIZED, OPERATION_EXTRACT),
+    QUERY_TYPE_EXTRACTION_PER_ENTITY: (LOCALITY_DISTRIBUTED, OPERATION_EXTRACT),
+    QUERY_TYPE_COMPARATIVE: (LOCALITY_DISTRIBUTED, OPERATION_COMPARE),
+    QUERY_TYPE_PANORAMA: (LOCALITY_DISTRIBUTED, OPERATION_SYNTHESIZE),
+}
+
+
+def _locality_operation(query_type: str) -> tuple[str, str]:
+    return _LOCALITY_OPERATION.get(query_type, (LOCALITY_LOCALIZED, OPERATION_LOOKUP))
 
 
 def _normalize(text: str) -> str:
@@ -215,11 +266,18 @@ def classify_query(text: str) -> QueryAnalysis:
     is_numeric = any(re.search(p, norm) for p in _NUMERIC_PATTERNS) or bool(
         analysis.numeric_tokens
     )
+    # Per-entity extraction needs BOTH a per-each marker and an extraction signal
+    # ("extraé la meta de cada NDC"): a per-document map, not one shared pass.
+    is_per_entity = any(
+        re.search(p, norm) for p in _PER_ENTITY_PATTERNS
+    ) and any(re.search(p, norm) for p in _EXTRACTION_VERB_PATTERNS)
 
     word_count = len(norm.split())
     long_question = word_count >= 18
 
-    if is_comparative:
+    if is_per_entity:
+        analysis.query_type = QUERY_TYPE_EXTRACTION_PER_ENTITY
+    elif is_comparative:
         analysis.query_type = QUERY_TYPE_COMPARATIVE
     elif is_panorama or long_question:
         analysis.query_type = QUERY_TYPE_PANORAMA
@@ -231,15 +289,19 @@ def classify_query(text: str) -> QueryAnalysis:
     analysis.is_general = analysis.query_type in {
         QUERY_TYPE_PANORAMA,
         QUERY_TYPE_COMPARATIVE,
+        QUERY_TYPE_EXTRACTION_PER_ENTITY,
     } or long_question
 
-    if all_coverage_hits >= 2:
+    # Per-entity extraction must cover EVERY document (one answer per entity),
+    # so it forces ALL coverage even with a single per-each marker.
+    if is_per_entity or all_coverage_hits >= 2:
         analysis.coverage_mode = COVERAGE_MODE_ALL
     elif analysis.query_type in {QUERY_TYPE_PANORAMA, QUERY_TYPE_COMPARATIVE}:
         analysis.coverage_mode = COVERAGE_MODE_BALANCED
     else:
         analysis.coverage_mode = COVERAGE_MODE_FOCUSED
 
+    analysis.locality, analysis.operation = _locality_operation(analysis.query_type)
     analysis.sub_queries = _heuristic_sub_queries(analysis)
     analysis.classifier_source = CLASSIFIER_SOURCE_REGEX
     analysis.classifier_confidence = _classifier_confidence(
@@ -250,6 +312,9 @@ def classify_query(text: str) -> QueryAnalysis:
         long_question=long_question,
         word_count=word_count,
     )
+    # A co-occurring per-each marker + extraction verb is an unambiguous signal.
+    if is_per_entity:
+        analysis.classifier_confidence = CLASSIFIER_CONFIDENCE_HIGH
     return analysis
 
 
@@ -258,7 +323,7 @@ _LLM_ROUTER_SYSTEM_PROMPT = (
     "decide cómo se debe orientar la recuperación. "
     "Responde EXCLUSIVAMENTE con un JSON con la forma:\n"
     "{\n"
-    '  "query_type": "factual" | "numeric" | "comparative" | "panorama",\n'
+    '  "query_type": "factual" | "numeric" | "extract_per_entity" | "comparative" | "panorama",\n'
     '  "coverage_mode": "focused" | "balanced" | "all",\n'
     '  "is_general": true | false,\n'
     '  "confidence": "high" | "medium" | "low"\n'
@@ -266,6 +331,8 @@ _LLM_ROUTER_SYSTEM_PROMPT = (
     "Lineamientos:\n"
     "- factual: pregunta específica con respuesta puntual.\n"
     "- numeric: pide cifras, métricas, montos, porcentajes o cantidades.\n"
+    "- extract_per_entity: pide extraer un dato/campo para CADA documento o "
+    "entidad (p.ej. 'la meta de cada NDC'). Requiere coverage_mode 'all'.\n"
     "- comparative: contrasta dos o más cosas, o pide ranking.\n"
     "- panorama: pide visión general, síntesis o resumen amplio.\n"
     "- coverage_mode all: cuando se necesita cubrir cada documento; "
@@ -299,6 +366,7 @@ def classify_query_llm(text: str) -> QueryAnalysis | None:
         return None
     try:
         from apps.document.utils.client_openia import generate_chat_completion
+        from apps.document.utils.llm import ROLE_FAST, resolve_model
 
         messages = [
             {"role": "system", "content": _LLM_ROUTER_SYSTEM_PROMPT},
@@ -306,7 +374,7 @@ def classify_query_llm(text: str) -> QueryAnalysis | None:
         ]
         body, _usage = generate_chat_completion(
             messages,
-            model=os.environ.get("RAG_ROUTER_MODEL", "gpt-4o-mini"),
+            model=os.environ.get("RAG_ROUTER_MODEL") or resolve_model(ROLE_FAST),
             temperature=0.0,
             max_tokens=80,
             timeout=8,
@@ -326,6 +394,7 @@ def classify_query_llm(text: str) -> QueryAnalysis | None:
     confidence = str(data.get("confidence", "medium")).strip().lower()
 
     valid_types = {QUERY_TYPE_FACTUAL, QUERY_TYPE_NUMERIC,
+                   QUERY_TYPE_EXTRACTION_PER_ENTITY,
                    QUERY_TYPE_COMPARATIVE, QUERY_TYPE_PANORAMA}
     valid_coverage = {COVERAGE_MODE_FOCUSED, COVERAGE_MODE_BALANCED, COVERAGE_MODE_ALL}
     valid_confidence = {CLASSIFIER_CONFIDENCE_HIGH, CLASSIFIER_CONFIDENCE_MEDIUM,
@@ -334,7 +403,10 @@ def classify_query_llm(text: str) -> QueryAnalysis | None:
     if query_type not in valid_types:
         logger.warning("LLM router returned invalid query_type=%r", query_type)
         return None
-    if coverage_mode not in valid_coverage:
+    if query_type == QUERY_TYPE_EXTRACTION_PER_ENTITY:
+        # Per-entity extraction must cover every document.
+        coverage_mode = COVERAGE_MODE_ALL
+    elif coverage_mode not in valid_coverage:
         # Backfill coverage from query_type if missing/invalid.
         coverage_mode = (
             COVERAGE_MODE_BALANCED
@@ -348,11 +420,14 @@ def classify_query_llm(text: str) -> QueryAnalysis | None:
     out.numeric_tokens = _extract_numeric_tokens(norm)
     out.query_type = query_type
     out.coverage_mode = coverage_mode
+    out.locality, out.operation = _locality_operation(query_type)
     if isinstance(is_general_raw, bool):
         out.is_general = is_general_raw
     else:
         out.is_general = query_type in {
-            QUERY_TYPE_PANORAMA, QUERY_TYPE_COMPARATIVE,
+            QUERY_TYPE_PANORAMA,
+            QUERY_TYPE_COMPARATIVE,
+            QUERY_TYPE_EXTRACTION_PER_ENTITY,
         }
     out.sub_queries = _heuristic_sub_queries(out)
     out.classifier_source = CLASSIFIER_SOURCE_LLM
@@ -461,7 +536,11 @@ def _heuristic_sub_queries(analysis: QueryAnalysis) -> List[str]:
     For panorama/comparative questions we synthesize a couple of focused
     sub-queries from extracted keywords so the retriever has multiple anchors.
     """
-    if analysis.query_type not in {QUERY_TYPE_PANORAMA, QUERY_TYPE_COMPARATIVE}:
+    if analysis.query_type not in {
+        QUERY_TYPE_PANORAMA,
+        QUERY_TYPE_COMPARATIVE,
+        QUERY_TYPE_EXTRACTION_PER_ENTITY,
+    }:
         return []
     if not analysis.keywords:
         return []
@@ -615,3 +694,113 @@ def build_query_set(analysis: QueryAnalysis) -> List[str]:
         seen.add(key)
         deduped.append(q)
     return deduped or ([analysis.raw_text] if analysis.raw_text else [])
+
+
+# ---------------------------------------------------------------------------
+# Retrieval plan — the shared "brain" contract (Phase 3)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class RetrievalPlan:
+    """Concrete retrieval directives derived from a QueryAnalysis.
+
+    This is the contract the executors consume (chat today; skills / evaluations
+    as they adopt it) so retrieval strategy is decided in ONE place instead of
+    being re-derived per stack.
+    """
+
+    strategy: str              # "global" | "hybrid_per_document"
+    coverage_mode: str         # focused | balanced | all
+    per_doc: int               # chunks to pull per document
+    expand: bool               # apply small-to-big parent expansion
+    model_role: str            # fast | balanced | deep (answer-model tier hint)
+    per_document_answer: bool   # map-reduce: answer per document, then consolidate
+
+    def to_dict(self) -> dict:
+        return {
+            "strategy": self.strategy,
+            "coverage_mode": self.coverage_mode,
+            "per_doc": self.per_doc,
+            "expand": self.expand,
+            "model_role": self.model_role,
+            "per_document_answer": self.per_document_answer,
+        }
+
+
+def build_retrieval_plan(analysis: QueryAnalysis, *, doc_count: int = 1) -> RetrievalPlan:
+    """Translate a QueryAnalysis (+ corpus size) into retrieval directives."""
+    from apps.document.utils.llm import ROLE_BALANCED, ROLE_DEEP
+
+    qt = analysis.query_type
+    multi = doc_count > 1
+
+    if (
+        qt in {QUERY_TYPE_EXTRACTION_PER_ENTITY, QUERY_TYPE_PANORAMA, QUERY_TYPE_COMPARATIVE}
+        or analysis.coverage_mode in {COVERAGE_MODE_ALL, COVERAGE_MODE_BALANCED}
+    ):
+        strategy = "hybrid_per_document"
+    else:
+        strategy = "global"
+
+    per_doc = 2 if qt in {QUERY_TYPE_EXTRACTION_PER_ENTITY, QUERY_TYPE_COMPARATIVE} else 1
+
+    # Deeper tier for distributed reasoning across many documents.
+    if qt == QUERY_TYPE_COMPARATIVE or (
+        qt in {QUERY_TYPE_EXTRACTION_PER_ENTITY, QUERY_TYPE_PANORAMA}
+        and multi
+        and doc_count >= 5
+    ):
+        model_role = ROLE_DEEP
+    else:
+        model_role = ROLE_BALANCED
+
+    per_document_answer = qt == QUERY_TYPE_EXTRACTION_PER_ENTITY and multi
+
+    return RetrievalPlan(
+        strategy=strategy,
+        coverage_mode=analysis.coverage_mode,
+        per_doc=per_doc,
+        expand=True,
+        model_role=model_role,
+        per_document_answer=per_document_answer,
+    )
+
+
+def plan_for_query(
+    text: str,
+    *,
+    response_mode: str | None = None,
+    doc_count: int = 1,
+) -> tuple[QueryAnalysis, RetrievalPlan]:
+    """Single shared entry point: classify a query and produce its retrieval plan.
+
+    Use this from chat, skills and evaluations so the routing decision is made in
+    one place. ``response_mode`` (an explicit frontend selector) deterministically
+    overrides the classifier.
+    """
+    analysis = classify_query_hybrid(text)
+    analysis = apply_response_mode_override(analysis, response_mode)
+    plan = build_retrieval_plan(analysis, doc_count=doc_count)
+    return analysis, plan
+
+
+def _auto_strategy_enabled() -> bool:
+    return os.environ.get("RAG_AUTO_STRATEGY", "1").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
+def recommend_strategy(query_text: str, *, default: str = "global") -> str:
+    """Cheap (regex-only, no LLM) retrieval-strategy recommendation for the
+    skills and evaluations stacks.
+
+    Returns ``"hybrid_per_document"`` when the query is *distributed* (per-entity
+    / comparative / panorama / all-coverage) — i.e. it benefits from per-document
+    recall — otherwise ``default``. The strategy decision is independent of the
+    corpus size, so callers don't need to pass a document count.
+    """
+    if not _auto_strategy_enabled():
+        return default
+    plan = build_retrieval_plan(classify_query(query_text or ""), doc_count=2)
+    return "hybrid_per_document" if plan.strategy == "hybrid_per_document" else default

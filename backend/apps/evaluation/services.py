@@ -13,7 +13,9 @@ from apps.chat.services.rag import (
     _chunk_similarity,
     build_context_block,
     fetch_relevant_chunks,
+    retrieve_for_chat,
 )
+from apps.chat.services.query_analysis import recommend_strategy
 from apps.chat.services.retrieval import lexical_search, rrf_fuse
 from apps.document.models import Document, SmartChunk
 from apps.document.utils.client_openia import generate_chat_completion
@@ -183,48 +185,46 @@ class EvaluationRunner:
         # ── Phase 2: hybrid retrieval + RRF cross-query ───────────────────────
         doc_ids = list(documents_qs.values_list("id", flat=True))
         doc_count = len(doc_ids)
-        retrieval_strategy = "hybrid_per_document" if doc_count > 1 else "global"
+        # Phase 3 brain adoption: multi-doc defaults to per-document; a distributed
+        # metric query (comparative / per-entity) upgrades a single-doc run too.
+        retrieval_strategy = recommend_strategy(
+            retrieval_queries[0] if retrieval_queries else "",
+            default="hybrid_per_document" if doc_count > 1 else "global",
+        )
         base_qs = SmartChunk.objects.filter(
             document_id__in=doc_ids
         ).exclude(embedding__isnull=True)
 
-        all_ranked_lists: list[list] = []
-        for query in retrieval_queries:
-            try:
-                v_chunks = fetch_relevant_chunks(
-                    user=run.owner,
-                    query_text=query,
-                    allowed_documents=documents_qs,
-                    top_n=self.chunks_per_metric,
-                    retrieval_strategy=retrieval_strategy,
-                    k_per_doc=3,
-                    total_limit=self.chunks_per_metric,
-                )
-            except Exception as exc:
-                logger.warning("Metric %s vector retrieval failed for query %r: %s", metric.id, query, exc)
-                v_chunks = []
-            try:
-                lex_chunks = lexical_search(base_qs, query, top_n=self.chunks_per_metric)
-            except Exception as exc:
-                logger.warning("Metric %s lexical retrieval failed for query %r: %s", metric.id, query, exc)
-                lex_chunks = []
-            for lst in [v_chunks, lex_chunks]:
-                if lst:
-                    all_ranked_lists.append(lst)
+        # Phase 5: unified retrieval — one call to the shared engine
+        # (retrieve_for_chat) instead of a bespoke per-query vector+lexical+RRF
+        # loop. The decomposed metric queries are joined so the engine's own
+        # expansion still pulls multiple anchors.
+        combined_query = " ".join(q for q in retrieval_queries if q).strip()
+        if not combined_query and retrieval_queries:
+            combined_query = retrieval_queries[0]
+        try:
+            retrieval = retrieve_for_chat(
+                user=run.owner,
+                query_text=combined_query,
+                allowed_documents=documents_qs,
+                top_n=self.chunks_per_metric,
+                total_limit=self.chunks_per_metric,
+                k_per_doc=3,
+                retrieval_strategy=retrieval_strategy,
+            )
+            final_chunks = list(retrieval.chunks)
+        except Exception as exc:
+            logger.warning("Metric %s retrieval failed: %s", metric.id, exc)
+            final_chunks = []
 
-        fused = rrf_fuse(all_ranked_lists, top_n=self.chunks_per_metric) if all_ranked_lists else []
-
-        # Threshold filter + evidence quality score
-        chunks_with_score = [(c, _chunk_similarity(c)) for c in fused]
-        final_chunks = [
-            c for c, sim in chunks_with_score
-            if sim is None or sim >= RAG_MIN_SIMILARITY
-        ]
-        sims = [sim for _, sim in chunks_with_score if sim is not None]
+        # Evidence quality from chunk similarity (anchors carry distance/lex_sim;
+        # parent-expansion neighbours are unscored and simply omitted from sims).
+        sims = [s for s in (_chunk_similarity(c) for c in final_chunks) if s is not None]
         max_sim = max(sims) if sims else None
+        above = sum(1 for s in sims if s >= RAG_MIN_SIMILARITY)
         evidence_quality: dict = {
             "chunks_retrieved": len(final_chunks),
-            "chunks_above_threshold": len(final_chunks),
+            "chunks_above_threshold": above,
             "avg_similarity": round(sum(sims) / len(sims), 4) if sims else None,
             "max_similarity": round(max_sim, 4) if max_sim is not None else None,
             "evidence_level": (

@@ -92,7 +92,14 @@ class ChatSessionCreateSerializer(serializers.ModelSerializer):
         return unique_slugs
 
     def create(self, validated_data):
+        from apps.document.utils.llm import ROLE_BALANCED, resolve_model
+
         slugs = validated_data.pop("document_slugs", [])
+        # Phase 2: new sessions default to the configured "balanced" model tier
+        # (Sonnet under LLM_PROVIDER=anthropic; MODEL_COMPLETION otherwise).
+        # Done here — not via the model field default — so the field stays
+        # migration-stable regardless of the provider env.
+        validated_data.setdefault("model", resolve_model(ROLE_BALANCED))
         session = ChatSession.objects.create(**validated_data)
         if slugs:
             docs = Document.objects.filter(slug__in=slugs)

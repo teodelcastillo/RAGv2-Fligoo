@@ -114,6 +114,11 @@ env.bak/
 venv.bak/
 .env*
 
+# Local-only Docker run scaffolding (sandbox/proxy-specific, not for CI/prod)
+backend/docker/proxy-ca.crt
+backend/docker/Dockerfile.local
+backend/docker-compose.run.yml
+
 # Spyder project settings
 .spyderproject
 .spyproject

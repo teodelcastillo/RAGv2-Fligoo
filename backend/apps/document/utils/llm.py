@@ -81,6 +81,37 @@ def is_anthropic_model(model: str | None) -> bool:
     return bool(model) and str(model).lower().startswith(("claude", "anthropic."))
 
 
+def effective_chat_model(stored: str | None) -> str:
+    """Model to actually use for plain chat/answer generation.
+
+    Sessions freeze ``model`` at creation time, so flipping ``LLM_PROVIDER``
+    would otherwise never reach sessions that already exist. Resolution rules:
+    - an explicit Claude id is honored (deliberate per-session override);
+    - under ``LLM_PROVIDER=anthropic`` a legacy OpenAI id is upgraded to the
+      balanced tier, so existing sessions follow the provider switch;
+    - under the OpenAI provider the stored id is preserved (no behaviour change).
+    """
+    if is_anthropic_model(stored):
+        return stored
+    if _provider() == "anthropic":
+        return resolve_model(ROLE_BALANCED)
+    return stored or resolve_model(ROLE_BALANCED)
+
+
+def tool_capable_model(stored: str | None) -> str:
+    """Model for tool-use paths (copilot / agentic skills).
+
+    Anthropic's tool-use protocol is not ported yet (``generate_with_tools``
+    rejects Claude ids), so always resolve to an OpenAI tool-capable model —
+    regardless of the stored id or the configured provider. This keeps copilot
+    working even when a session was created with a Claude model under
+    ``LLM_PROVIDER=anthropic``.
+    """
+    if not stored or is_anthropic_model(stored):
+        return os.environ.get("MODEL_COMPLETION", "gpt-4o-mini")
+    return stored
+
+
 # --- Anthropic client + request shaping -------------------------------------
 
 _anthropic_singleton = None

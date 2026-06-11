@@ -15,6 +15,7 @@ from apps.chat.services.rag import (
     retrieve_for_chat,
 )
 from apps.document.utils.client_openia import generate_chat_completion
+from apps.document.utils.llm import effective_chat_model
 
 logger = logging.getLogger(__name__)
 
@@ -272,7 +273,7 @@ def run_plan(
 
         answer_text, usage = generate_chat_completion(
             messages,
-            model=session.model,
+            model=effective_chat_model(session.model),
             temperature=session.temperature,
         )
 

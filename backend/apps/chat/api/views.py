@@ -37,6 +37,7 @@ from apps.chat.services.rag import RetrievalResult, retrieve_for_chat, retrieve_
 from apps.chat.services.fanout import apply_fanout, maybe_fanout
 from apps.document.models import Document
 from apps.document.utils import client_openia
+from apps.document.utils.llm import effective_chat_model
 
 logger = logging.getLogger(__name__)
 
@@ -680,7 +681,7 @@ def _generate_answer_or_raise(messages, session):
     try:
         return client_openia.generate_chat_completion(
             messages,
-            model=session.model,
+            model=effective_chat_model(session.model),
             temperature=session.temperature,
             timeout=90,
         )
@@ -798,7 +799,7 @@ class ChatMessageStreamView(APIView):
                 else:
                     for text_chunk in client_openia.generate_chat_completion_stream(
                         messages,
-                        model=session.model,
+                        model=effective_chat_model(session.model),
                         temperature=session.temperature,
                         timeout=90,
                     ):

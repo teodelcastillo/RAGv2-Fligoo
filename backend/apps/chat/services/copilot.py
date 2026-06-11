@@ -17,6 +17,7 @@ from apps.chat.services.copilot_tools import (
 from apps.chat.services.rag import suggest_related_library_documents
 from apps.document.models import Document
 from apps.document.utils.client_openia import generate_chat_completion, generate_with_tools
+from apps.document.utils.llm import tool_capable_model
 from apps.project.models import Project, ProjectSection
 
 logger = logging.getLogger(__name__)
@@ -368,7 +369,9 @@ def process_copilot_message(
     def _tool_executor(name: str, args_json: str) -> str:
         return execute_copilot_tool(name, args_json, tool_ctx)
 
-    model = session.model
+    # Copilot drives OpenAI tool-use; Anthropic's tool protocol isn't ported
+    # yet, so pin to a tool-capable OpenAI model even under LLM_PROVIDER=anthropic.
+    model = tool_capable_model(session.model)
     temperature = session.temperature
 
     response_text, usage = generate_with_tools(

@@ -19,6 +19,7 @@ from apps.chat.services.query_analysis import recommend_strategy
 from apps.chat.services.retrieval import lexical_search, rrf_fuse
 from apps.document.models import Document, SmartChunk
 from apps.document.utils.client_openia import generate_chat_completion, generate_with_tools
+from apps.document.utils.llm import effective_chat_model, tool_capable_model
 from apps.skill.models import (
     ExecutionOutputMode,
     ExecutionStatus,
@@ -375,15 +376,16 @@ def _call_model(
         def _executor(name: str, args_json: str) -> str:
             return execute_tool(name, args_json, tool_ctx)
 
+        # Tool-use stays on OpenAI (Anthropic tool protocol not ported yet).
         return generate_with_tools(
             messages,
             tools=ALL_TOOLS,
             tool_executor=_executor,
-            model=skill.model,
+            model=tool_capable_model(skill.model),
             temperature=skill.temperature,
         )
     return generate_chat_completion(
-        messages, model=skill.model, temperature=skill.temperature
+        messages, model=effective_chat_model(skill.model), temperature=skill.temperature
     )
 
 

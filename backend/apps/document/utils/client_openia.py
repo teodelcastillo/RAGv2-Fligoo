@@ -26,6 +26,7 @@ from openai import OpenAI
 from apps.document.utils.llm import (
     anthropic_chat_completion,
     anthropic_chat_completion_stream,
+    anthropic_chat_with_tools,
     is_anthropic_model,
 )
 
@@ -343,12 +344,16 @@ def generate_with_tools(
     """
     effective_model = model or MODEL_COMPLETION
     if is_anthropic_model(effective_model):
-        # Anthropic's tool-use protocol differs from OpenAI's; the agentic
-        # tool-loop is not ported yet (Phase 2 follow-up). Tool-enabled skills
-        # must use an OpenAI model for now.
-        raise NotImplementedError(
-            "generate_with_tools does not support Anthropic models yet; "
-            "use an OpenAI model for tool-enabled skills or disable tools."
+        # Anthropic's tool-use protocol differs from OpenAI's; the native
+        # agentic loop lives in llm.py and maps results back to the same
+        # (text, usage) contract callers expect.
+        return anthropic_chat_with_tools(
+            messages,
+            tools=tools,
+            tool_executor=tool_executor,
+            model=effective_model,
+            temperature=temperature,
+            max_iterations=max_iterations,
         )
     client = get_openai_client()
     conversation = [{"role": m["role"], "content": m["content"]} for m in messages]

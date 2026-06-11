@@ -623,6 +623,14 @@ class ChatMessageViewSet(
                 answer_text, usage = _generate_answer_or_raise(messages, session)
 
             metadata: dict = {"usage": usage}
+            # Traceability: which model actually produced this answer. Fan-out
+            # answers come from the map tier; otherwise the resolved chat model.
+            if fanout_result is not None:
+                metadata["model"] = (fanout_result.diagnostics or {}).get(
+                    "fanout_map_model"
+                ) or effective_chat_model(session.model)
+            else:
+                metadata["model"] = effective_chat_model(session.model)
             if retrieval.diagnostics:
                 metadata["rag_diagnostics"] = retrieval.diagnostics
             if retrieval.analysis is not None:
@@ -808,6 +816,12 @@ class ChatMessageStreamView(APIView):
 
                     answer_text = "".join(collected)
                 metadata: dict = {}
+                if fanout_result is not None:
+                    metadata["model"] = (fanout_result.diagnostics or {}).get(
+                        "fanout_map_model"
+                    ) or effective_chat_model(session.model)
+                else:
+                    metadata["model"] = effective_chat_model(session.model)
                 if retrieval.diagnostics:
                     metadata["rag_diagnostics"] = retrieval.diagnostics
                 if retrieval.analysis is not None:

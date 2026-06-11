@@ -98,15 +98,22 @@ def effective_chat_model(stored: str | None) -> str:
     return stored or resolve_model(ROLE_BALANCED)
 
 
+def _anthropic_tools_enabled() -> bool:
+    return os.environ.get("LLM_TOOLS_ANTHROPIC", "1").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
 def tool_capable_model(stored: str | None) -> str:
     """Model for tool-use paths (copilot / agentic skills).
 
-    Anthropic's tool-use protocol is not ported yet (``generate_with_tools``
-    rejects Claude ids), so always resolve to an OpenAI tool-capable model —
-    regardless of the stored id or the configured provider. This keeps copilot
-    working even when a session was created with a Claude model under
-    ``LLM_PROVIDER=anthropic``.
+    The Anthropic tool loop is implemented (``anthropic_chat_with_tools``), so
+    by default this resolves exactly like ``effective_chat_model`` — tool paths
+    follow the provider switch too. Set ``LLM_TOOLS_ANTHROPIC=0`` to pin tool
+    paths back to an OpenAI model (escape hatch if the ported loop misbehaves).
     """
+    if _anthropic_tools_enabled():
+        return effective_chat_model(stored)
     if not stored or is_anthropic_model(stored):
         return os.environ.get("MODEL_COMPLETION", "gpt-4o-mini")
     return stored
@@ -266,3 +273,120 @@ def _usage_dict(usage_obj) -> dict:
         "output_tokens": out_tok,
         "total_tokens": in_tok + out_tok,
     }
+
+
+# --- Tool use (agentic loop) --------------------------------------------------
+
+
+def _to_anthropic_tools(tools: List[dict]) -> List[dict]:
+    """Convert OpenAI function-calling tool defs to the Anthropic shape.
+
+    OpenAI: ``{"type": "function", "function": {"name", "description", "parameters"}}``
+    Anthropic: ``{"name", "description", "input_schema"}``
+    Already-Anthropic-shaped dicts pass through unchanged.
+    """
+    converted: List[dict] = []
+    for tool in tools or []:
+        fn = tool.get("function") or {}
+        converted.append(
+            {
+                "name": fn.get("name") or tool.get("name"),
+                "description": fn.get("description") or tool.get("description", ""),
+                "input_schema": (
+                    fn.get("parameters")
+                    or tool.get("input_schema")
+                    or {"type": "object", "properties": {}}
+                ),
+            }
+        )
+    return converted
+
+
+def _response_text(response) -> str:
+    return "".join(
+        getattr(b, "text", "")
+        for b in response.content
+        if getattr(b, "type", None) == "text"
+    ).strip()
+
+
+def anthropic_chat_with_tools(
+    messages: List[dict],
+    *,
+    tools: List[dict],
+    tool_executor,  # Callable[[str, str], str]
+    model: str,
+    temperature: float = 0.1,
+    max_tokens: int | None = None,
+    max_iterations: int = 6,
+    timeout: float | None = None,
+) -> Tuple[str, dict]:
+    """Anthropic-native agentic tool loop, mirroring ``generate_with_tools``.
+
+    Accepts OpenAI-format tool definitions (converted on the fly) and the same
+    ``tool_executor(name, args_json) -> str`` contract, so skill/copilot
+    call-sites stay provider-agnostic.
+
+    Loop: call → if ``stop_reason == "tool_use"`` execute every tool_use block,
+    append the assistant turn verbatim plus one tool_result per tool_use, and
+    call again — until the model stops or ``max_iterations`` is reached. The
+    forced final call keeps ``tools`` (required when the conversation contains
+    tool_use blocks) but sets ``tool_choice: none``.
+    """
+    import json as _json
+
+    client = _anthropic_client()
+    params = _build_request(
+        messages, model=model, temperature=temperature, max_tokens=max_tokens
+    )
+    params["tools"] = _to_anthropic_tools(tools)
+    convo = params["messages"]
+
+    total_usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+    caller = client.with_options(timeout=timeout) if timeout else client
+
+    def _call():
+        response = caller.messages.create(**params)
+        usage = _usage_dict(getattr(response, "usage", None))
+        for key in total_usage:
+            total_usage[key] += usage.get(key, 0)
+        return response
+
+    for _ in range(max_iterations):
+        response = _call()
+
+        if response.stop_reason != "tool_use":
+            text = _response_text(response)
+            if not text:
+                raise ValueError("Anthropic API returned an empty response during tool loop.")
+            return text, total_usage
+
+        # Echo the assistant turn verbatim (preserves tool_use/thinking blocks),
+        # then answer every tool_use with exactly one tool_result.
+        convo.append({"role": "assistant", "content": response.content})
+        results = []
+        for block in response.content:
+            if getattr(block, "type", None) != "tool_use":
+                continue
+            try:
+                result = tool_executor(block.name, _json.dumps(block.input or {}))
+            except Exception as exc:  # tool bugs shouldn't kill the loop
+                logger.warning("Tool '%s' failed: %s", block.name, exc)
+                result = f"Error executing tool: {exc}"
+            results.append(
+                {
+                    "type": "tool_result",
+                    "tool_use_id": block.id,
+                    "content": str(result),
+                }
+            )
+        convo.append({"role": "user", "content": results})
+
+    # Max iterations — force a final text answer. tools must stay (the convo
+    # contains tool_use blocks); tool_choice none blocks further tool calls.
+    params["tool_choice"] = {"type": "none"}
+    response = _call()
+    text = _response_text(response)
+    if not text:
+        raise ValueError("Anthropic API returned an empty response after max tool iterations.")
+    return text, total_usage
